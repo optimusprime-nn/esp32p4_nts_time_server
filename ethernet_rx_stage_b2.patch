@@ -1,0 +1,268 @@
+diff --git a/components/esp_eth/include/esp_eth_rx_diag.h b/components/esp_eth/include/esp_eth_rx_diag.h
+new file mode 100644
+index 0000000..238fd83
+--- /dev/null
++++ b/components/esp_eth/include/esp_eth_rx_diag.h
+@@ -0,0 +1,24 @@
++/* Project-local, observation-only EMAC RX instrumentation. */
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++#include "esp_eth_mac.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct {
++    uint32_t rx_irq;
++    uint32_t rx_wakeup;
++    uint32_t rx_frame;
++    uint32_t rx_alloc_fail;
++    uint32_t rx_copy_fail;
++    uint32_t rx_truncated;
++    uint32_t rx_callback_attempt;
++    uint32_t rx_frames_remain;
++    uint32_t rx_desc_free;
++} esp_eth_rx_diag_t;
++/* Reads software counters only. MAC must be a live ESP32 EMAC instance. */
++bool esp_eth_rx_diag_snapshot(esp_eth_mac_t *mac, esp_eth_rx_diag_t *out);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/components/esp_eth/src/mac/esp_eth_mac_esp.c b/components/esp_eth/src/mac/esp_eth_mac_esp.c
+index 63c5594..5b5b83e 100644
+--- a/components/esp_eth/src/mac/esp_eth_mac_esp.c
++++ b/components/esp_eth/src/mac/esp_eth_mac_esp.c
+@@ -35,6 +35,7 @@
+ #include "esp_rom_sys.h"
+ #include "esp_private/eth_mac_esp_dma.h"
+ #include "esp_private/eth_mac_esp_gpio.h"
++#include "esp_eth_rx_diag.h"
+ 
+ static const char *TAG = "esp.emac";
+ 
+@@ -102,6 +103,7 @@ typedef struct {
+     uint32_t sw_reset_timeout_ms;
+     uint32_t frames_remain;
+     uint32_t free_rx_descriptor;
++    esp_eth_rx_diag_t rx_diag;
+     uint32_t flow_control_high_water_mark;
+     uint32_t flow_control_low_water_mark;
+     bool flow_ctrl_enabled; // indicates whether the user want to do flow control
+@@ -580,6 +582,27 @@ static esp_err_t emac_esp32_transmit_ctrl_vargs(esp_eth_mac_t *mac, void *ctrl,
+     return ESP_OK;
+ }
+ 
++bool esp_eth_rx_diag_snapshot(esp_eth_mac_t *mac, esp_eth_rx_diag_t *out)
++{
++    if (mac == NULL || out == NULL) {
++        return false;
++    }
++    emac_esp32_t *emac = __containerof(mac, emac_esp32_t, parent);
++    /* Independent 32-bit atomic loads: approximate snapshot, no DMA traversal. */
++#define RX_DIAG_LOAD(field) out->field = __atomic_load_n(&emac->rx_diag.field, __ATOMIC_RELAXED)
++    RX_DIAG_LOAD(rx_irq);
++    RX_DIAG_LOAD(rx_wakeup);
++    RX_DIAG_LOAD(rx_frame);
++    RX_DIAG_LOAD(rx_alloc_fail);
++    RX_DIAG_LOAD(rx_copy_fail);
++    RX_DIAG_LOAD(rx_truncated);
++    RX_DIAG_LOAD(rx_callback_attempt);
++    RX_DIAG_LOAD(rx_frames_remain);
++    RX_DIAG_LOAD(rx_desc_free);
++#undef RX_DIAG_LOAD
++    return true;
++}
++
+ static esp_err_t emac_esp32_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
+ {
+     esp_err_t ret = ESP_OK;
+@@ -604,6 +627,7 @@ static void emac_esp32_rx_task(void *arg)
+     while (1) {
+         // block indefinitely until got notification from underlay event
+         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++        __atomic_fetch_add(&emac->rx_diag.rx_wakeup, 1U, __ATOMIC_RELAXED);
+         do {
+             /* set max expected frame len */
+             uint32_t frame_len = ETH_MAX_PACKET_SIZE;
+@@ -618,24 +642,31 @@ static void emac_esp32_rx_task(void *arg)
+ #endif
+                 uint32_t recv_len = emac_esp_dma_receive_frame(emac->emac_dma_hndl, buffer, EMAC_DMA_BUF_SIZE_AUTO, p_ts);
+                 if (recv_len == 0) {
++                    __atomic_fetch_add(&emac->rx_diag.rx_copy_fail, 1U, __ATOMIC_RELAXED);
+                     ESP_LOGE(TAG, "frame copy error");
+                     free(buffer);
+                     /* ensures that interface to EMAC does not get stuck with unprocessed frames */
+                     emac_esp_dma_flush_recv_frame(emac->emac_dma_hndl);
+                 } else if (frame_len > recv_len) {
++                    __atomic_fetch_add(&emac->rx_diag.rx_truncated, 1U, __ATOMIC_RELAXED);
+                     ESP_LOGE(TAG, "received frame was truncated");
+                     free(buffer);
+                 } else {
++                    __atomic_fetch_add(&emac->rx_diag.rx_frame, 1U, __ATOMIC_RELAXED);
+                     ESP_LOGD(TAG, "receive len= %" PRIu32, recv_len);
++                    __atomic_fetch_add(&emac->rx_diag.rx_callback_attempt, 1U, __ATOMIC_RELAXED);
+                     emac->eth->stack_input_info(emac->eth, buffer, recv_len, (void *)p_ts);
+                 }
+             /* if allocation failed and there is a waiting frame */
+             } else if (frame_len) {
++                __atomic_fetch_add(&emac->rx_diag.rx_alloc_fail, 1U, __ATOMIC_RELAXED);
+                 ESP_LOGE(TAG, "no mem for receive buffer");
+                 /* ensures that interface to EMAC does not get stuck with unprocessed frames */
+                 emac_esp_dma_flush_recv_frame(emac->emac_dma_hndl);
+             }
+             emac_esp_dma_get_remain_frames(emac->emac_dma_hndl, &emac->frames_remain, &emac->free_rx_descriptor);
++            __atomic_store_n(&emac->rx_diag.rx_frames_remain, emac->frames_remain, __ATOMIC_RELAXED);
++            __atomic_store_n(&emac->rx_diag.rx_desc_free, emac->free_rx_descriptor, __ATOMIC_RELAXED);
+ #if CONFIG_ETH_SOFT_FLOW_CONTROL
+             // we need to do extra checking of remained frames in case there are no unhandled frames left, but pause frame is still undergoing
+             if ((emac->free_rx_descriptor < emac->flow_control_low_water_mark) && emac->do_flow_ctrl && emac->frames_remain) {
+@@ -777,6 +808,7 @@ IRAM_ATTR void emac_isr_default_handler(void *args)
+ 
+ #if EMAC_LL_CONFIG_ENABLE_INTR_MASK & EMAC_LL_INTR_RECEIVE_ENABLE
+     if (intr_stat & EMAC_LL_DMA_RECEIVE_FINISH_INTR) {
++        __atomic_fetch_add(&emac->rx_diag.rx_irq, 1U, __ATOMIC_RELAXED);
+         BaseType_t rx_high_task_woken = pdFALSE;
+         /* notify receive task */
+         vTaskNotifyGiveFromISR(emac->rx_task_hdl, &rx_high_task_woken);
+diff --git a/main/diagnostics.c b/main/diagnostics.c
+index 3cef024..53ea8d5 100644
+--- a/main/diagnostics.c
++++ b/main/diagnostics.c
+@@ -182,6 +182,7 @@ static void diagnostics_task(void *arg)
+                      eth_status.diag_tx_other_attempt,
+                      eth_status.diag_tx_other_fail,
+                      eth_status.diag_rx_forward_fail);
++            eth_service_diag_log_emac_snapshot();
+             eth_service_diag_log_phy_snapshot();
+         }
+ 
+diff --git a/main/eth_service.c b/main/eth_service.c
+index 194f354..8d2fdbe 100644
+--- a/main/eth_service.c
++++ b/main/eth_service.c
+@@ -11,6 +11,7 @@
+ 
+ #include "esp_check.h"
+ #include "esp_eth.h"
++#include "esp_eth_rx_diag.h"
+ #include "esp_eth_mac_esp.h"
+ #include "esp_eth_phy_ip101.h"
+ #include "esp_event.h"
+@@ -1502,41 +1503,62 @@ bool eth_service_get_status(eth_service_status_t *out_status)
+     portEXIT_CRITICAL(&s_eth_lock);
+ 
+     return true;
+-}
+-
+-
+-/* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
+- * Read BMSR twice because the first read may report latched link loss. */
+-void eth_service_diag_log_phy_snapshot(void)
+-{
+-    if (s_eth_handle == NULL) {
+-        ESP_LOGW(TAG, "eth-phy-snapshot: driver unavailable");
+-        return;
+-    }
+-    uint32_t phy_addr = 0U;
+-    esp_err_t err = esp_eth_ioctl(s_eth_handle, ETH_CMD_G_PHY_ADDR, &phy_addr);
+-    if (err != ESP_OK) {
+-        ESP_LOGW(TAG, "eth-phy-snapshot: addr error=%s", esp_err_to_name(err));
+-        return;
+-    }
+-    static const uint32_t regs[] = {0U, 1U, 1U, 2U, 3U, 4U, 5U, 6U};
+-    static const char *names[] = {
+-        "BMCR", "BMSR_first", "BMSR_second", "PHYID1",
+-        "PHYID2", "ANAR", "ANLPAR", "ANER"
+-    };
+-    ESP_LOGW(TAG, "eth-phy-snapshot: addr=%" PRIu32, phy_addr);
+-    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+-        uint32_t value = 0U;
+-        esp_eth_phy_reg_rw_data_t rw = {
+-            .reg_addr = regs[i], .reg_value_p = &value
+-        };
+-        err = esp_eth_ioctl(s_eth_handle, ETH_CMD_READ_PHY_REG, &rw);
+-        if (err == ESP_OK) {
+-            ESP_LOGW(TAG, "eth-phy-snapshot: %s[%" PRIu32 "]=0x%04" PRIx32,
+-                     names[i], regs[i], value & 0xffffU);
+-        } else {
+-            ESP_LOGW(TAG, "eth-phy-snapshot: %s error=%s",
+-                     names[i], esp_err_to_name(err));
+-        }
+-    }
+-}
++}
++
++
++/* Software-only EMAC snapshot; safe to call after RX has stalled. */
++void eth_service_diag_log_emac_snapshot(void)
++{
++    if (s_eth_mac == NULL) {
++        ESP_LOGW(TAG, "eth-emac-snapshot: MAC unavailable");
++        return;
++    }
++    esp_eth_rx_diag_t d = {0};
++    if (!esp_eth_rx_diag_snapshot(s_eth_mac, &d)) {
++        ESP_LOGW(TAG, "eth-emac-snapshot: unavailable");
++        return;
++    }
++    ESP_LOGW(TAG, "eth-emac-snapshot: irq=%" PRIu32 " wake=%" PRIu32
++             " frame=%" PRIu32 " callback=%" PRIu32 " alloc_fail=%" PRIu32
++             " copy_fail=%" PRIu32 " truncated=%" PRIu32
++             " remain=%" PRIu32 " free_desc=%" PRIu32,
++             d.rx_irq, d.rx_wakeup, d.rx_frame, d.rx_callback_attempt,
++             d.rx_alloc_fail, d.rx_copy_fail, d.rx_truncated,
++             d.rx_frames_remain, d.rx_desc_free);
++}
++
++/* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
++ * Read BMSR twice because the first read may report latched link loss. */
++void eth_service_diag_log_phy_snapshot(void)
++{
++    if (s_eth_handle == NULL) {
++        ESP_LOGW(TAG, "eth-phy-snapshot: driver unavailable");
++        return;
++    }
++    uint32_t phy_addr = 0U;
++    esp_err_t err = esp_eth_ioctl(s_eth_handle, ETH_CMD_G_PHY_ADDR, &phy_addr);
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "eth-phy-snapshot: addr error=%s", esp_err_to_name(err));
++        return;
++    }
++    static const uint32_t regs[] = {0U, 1U, 1U, 2U, 3U, 4U, 5U, 6U};
++    static const char *names[] = {
++        "BMCR", "BMSR_first", "BMSR_second", "PHYID1",
++        "PHYID2", "ANAR", "ANLPAR", "ANER"
++    };
++    ESP_LOGW(TAG, "eth-phy-snapshot: addr=%" PRIu32, phy_addr);
++    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++        uint32_t value = 0U;
++        esp_eth_phy_reg_rw_data_t rw = {
++            .reg_addr = regs[i], .reg_value_p = &value
++        };
++        err = esp_eth_ioctl(s_eth_handle, ETH_CMD_READ_PHY_REG, &rw);
++        if (err == ESP_OK) {
++            ESP_LOGW(TAG, "eth-phy-snapshot: %s[%" PRIu32 "]=0x%04" PRIx32,
++                     names[i], regs[i], value & 0xffffU);
++        } else {
++            ESP_LOGW(TAG, "eth-phy-snapshot: %s error=%s",
++                     names[i], esp_err_to_name(err));
++        }
++    }
++}
+diff --git a/main/eth_service.h b/main/eth_service.h
+index 019685e..b5ed195 100644
+--- a/main/eth_service.h
++++ b/main/eth_service.h
+@@ -75,9 +75,10 @@ esp_err_t eth_service_start(void);
+  */
+ void eth_service_wait_for_ip(void);
+ 
+-bool eth_service_get_status(eth_service_status_t *out_status);
+-
++bool eth_service_get_status(eth_service_status_t *out_status);
++
+ void eth_service_diag_log_phy_snapshot(void);
++void eth_service_diag_log_emac_snapshot(void);
+ 
+ typedef struct {
+     uint32_t seconds;

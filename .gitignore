@@ -21,3 +21,7 @@ serial_output1.log
 .gitignore
 serial_output2.log
 serial_output.log
+
+# Phase 9A local provisioning outputs (board-specific directories are recommended).
+/management-credentials/
+/management-credentials-*/

@@ -26,10 +26,12 @@ static const char *TAG = "DEVICE_CFG";
 #define KEY_PEER_ENABLED    "peer_en"
 #define KEY_PEER_POLL       "peer_poll"
 #define KEY_PEER_TIMEOUT    "peer_to"
+#define KEY_PEER_WARN       "peer_warn"
+#define KEY_PEER_CRIT       "peer_crit"
 #define KEY_PEER0           "peer0"
 #define KEY_PEER1           "peer1"
 #define KEY_PEER2           "peer2"
-#define KEY_PEER3           "peer3"
+#define KEY_PEER3           "redundant"
 
 typedef struct {
     device_config_snapshot_t public_config;
@@ -145,6 +147,8 @@ static void make_default_config(stored_config_t *config)
     config->public_config.ntp_peer_monitor_enabled = false;
     config->public_config.ntp_peer_poll_interval_seconds = APP_NTP_PEER_POLL_DEFAULT_SECONDS;
     config->public_config.ntp_peer_response_timeout_ms = APP_NTP_PEER_TIMEOUT_DEFAULT_MS;
+    config->public_config.redundant_peer_warning_ns = APP_REDUNDANT_PEER_WARN_DEFAULT_NS;
+    config->public_config.redundant_peer_critical_ns = APP_REDUNDANT_PEER_CRITICAL_DEFAULT_NS;
 }
 
 static esp_err_t persist_config(const stored_config_t *config)
@@ -176,6 +180,8 @@ static esp_err_t persist_config(const stored_config_t *config)
                                          config->public_config.ntp_peer_poll_interval_seconds);
     if (err == ESP_OK) err = nvs_set_u32(handle, KEY_PEER_TIMEOUT,
                                          config->public_config.ntp_peer_response_timeout_ms);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_PEER_WARN, config->public_config.redundant_peer_warning_ns);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_PEER_CRIT, config->public_config.redundant_peer_critical_ns);
     static const char *const peer_keys[APP_NTP_PEER_MAX_COUNT] = {
         KEY_PEER0, KEY_PEER1, KEY_PEER2, KEY_PEER3
     };
@@ -231,7 +237,9 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
         config->public_config.ntp_peer_monitor_enabled = false;
         config->public_config.ntp_peer_poll_interval_seconds = APP_NTP_PEER_POLL_DEFAULT_SECONDS;
         config->public_config.ntp_peer_response_timeout_ms = APP_NTP_PEER_TIMEOUT_DEFAULT_MS;
-        ESP_LOGI(TAG, "Migrating legacy device configuration to schema 3");
+        config->public_config.redundant_peer_warning_ns = APP_REDUNDANT_PEER_WARN_DEFAULT_NS;
+        config->public_config.redundant_peer_critical_ns = APP_REDUNDANT_PEER_CRITICAL_DEFAULT_NS;
+        ESP_LOGI(TAG, "Migrating legacy device configuration to schema 4");
         return persist_config(config);
     }
     if (err != ESP_OK) {
@@ -239,7 +247,7 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
         return err;
     }
 
-    if (schema != 1U && schema != 2U && schema != APP_DEVICE_CONFIG_SCHEMA_VERSION) {
+    if (schema != 1U && schema != 2U && schema != 3U && schema != APP_DEVICE_CONFIG_SCHEMA_VERSION) {
         nvs_close(handle);
         ESP_LOGE(TAG, "Unsupported device-config schema %" PRIu32, schema);
         return ESP_ERR_INVALID_VERSION;
@@ -261,10 +269,12 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
     config->public_config.ntp_peer_monitor_enabled = false;
     config->public_config.ntp_peer_poll_interval_seconds = APP_NTP_PEER_POLL_DEFAULT_SECONDS;
     config->public_config.ntp_peer_response_timeout_ms = APP_NTP_PEER_TIMEOUT_DEFAULT_MS;
+    config->public_config.redundant_peer_warning_ns = APP_REDUNDANT_PEER_WARN_DEFAULT_NS;
+    config->public_config.redundant_peer_critical_ns = APP_REDUNDANT_PEER_CRITICAL_DEFAULT_NS;
 
     if (schema == 1U) {
         nvs_close(handle);
-        ESP_LOGI(TAG, "Migrating device configuration schema 1 -> 3");
+        ESP_LOGI(TAG, "Migrating device configuration schema 1 -> 4");
         return persist_config(config);
     }
 
@@ -290,17 +300,21 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
     }
 
     if (schema == 2U) {
-        ESP_LOGI(TAG, "Migrating device configuration schema 2 -> 3");
+        ESP_LOGI(TAG, "Migrating device configuration schema 2 -> 4");
         return persist_config(config);
     }
 
     uint8_t peer_enabled = 0U;
     uint32_t peer_poll = APP_NTP_PEER_POLL_DEFAULT_SECONDS;
     uint32_t peer_timeout = APP_NTP_PEER_TIMEOUT_DEFAULT_MS;
+    uint32_t peer_warn = APP_REDUNDANT_PEER_WARN_DEFAULT_NS;
+    uint32_t peer_crit = APP_REDUNDANT_PEER_CRITICAL_DEFAULT_NS;
     if (nvs_open(CFG_NS, NVS_READONLY, &handle) == ESP_OK) {
         (void)nvs_get_u8(handle, KEY_PEER_ENABLED, &peer_enabled);
         (void)nvs_get_u32(handle, KEY_PEER_POLL, &peer_poll);
         (void)nvs_get_u32(handle, KEY_PEER_TIMEOUT, &peer_timeout);
+        (void)nvs_get_u32(handle, KEY_PEER_WARN, &peer_warn);
+        (void)nvs_get_u32(handle, KEY_PEER_CRIT, &peer_crit);
         static const char *const peer_keys[APP_NTP_PEER_MAX_COUNT] = {
             KEY_PEER0, KEY_PEER1, KEY_PEER2, KEY_PEER3
         };
@@ -322,6 +336,9 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
         config->public_config.ntp_peer_poll_interval_seconds = peer_poll;
     if (peer_timeout >= APP_NTP_PEER_TIMEOUT_MIN_MS && peer_timeout <= APP_NTP_PEER_TIMEOUT_MAX_MS)
         config->public_config.ntp_peer_response_timeout_ms = peer_timeout;
+    if (peer_warn > 0U && peer_warn <= APP_REDUNDANT_PEER_THRESHOLD_MAX_NS) config->public_config.redundant_peer_warning_ns = peer_warn;
+    if (peer_crit >= config->public_config.redundant_peer_warning_ns && peer_crit <= APP_REDUNDANT_PEER_THRESHOLD_MAX_NS) config->public_config.redundant_peer_critical_ns = peer_crit;
+    if (schema == 3U) { ESP_LOGI(TAG, "Migrating device configuration schema 3 -> 4"); return persist_config(config); }
     return ESP_OK;
 }
 
@@ -490,6 +507,8 @@ esp_err_t device_config_clear_cloudflare(void)
 esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
                                              uint32_t poll_interval_seconds,
                                              uint32_t response_timeout_ms,
+                                             uint32_t warning_ns,
+                                             uint32_t critical_ns,
                                              const device_config_ntp_peer_t peers[APP_NTP_PEER_MAX_COUNT])
 {
     if (!s_initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
@@ -497,7 +516,9 @@ esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
     if (poll_interval_seconds < APP_NTP_PEER_POLL_MIN_SECONDS ||
         poll_interval_seconds > APP_NTP_PEER_POLL_MAX_SECONDS ||
         response_timeout_ms < APP_NTP_PEER_TIMEOUT_MIN_MS ||
-        response_timeout_ms > APP_NTP_PEER_TIMEOUT_MAX_MS) return ESP_ERR_INVALID_ARG;
+        response_timeout_ms > APP_NTP_PEER_TIMEOUT_MAX_MS || warning_ns == 0U ||
+        warning_ns > APP_REDUNDANT_PEER_THRESHOLD_MAX_NS || critical_ns < warning_ns ||
+        critical_ns > APP_REDUNDANT_PEER_THRESHOLD_MAX_NS) return ESP_ERR_INVALID_ARG;
     for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
         if (peers[i].enabled && !device_config_ntp_peer_server_is_valid(peers[i].server))
             return ESP_ERR_INVALID_ARG;
@@ -507,6 +528,8 @@ esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
     candidate.public_config.ntp_peer_monitor_enabled = enabled;
     candidate.public_config.ntp_peer_poll_interval_seconds = poll_interval_seconds;
     candidate.public_config.ntp_peer_response_timeout_ms = response_timeout_ms;
+    candidate.public_config.redundant_peer_warning_ns = warning_ns;
+    candidate.public_config.redundant_peer_critical_ns = critical_ns;
     for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
         candidate.public_config.ntp_peers[i].enabled = peers[i].enabled;
         if (peers[i].enabled) {
@@ -526,3 +549,72 @@ esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
                  candidate.public_config.generation, enabled ? "yes" : "no");
     return err;
 }
+
+esp_err_t device_config_export_backup(device_config_backup_t *out_backup)
+{
+    if (out_backup == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
+    if (!lock_config()) return ESP_FAIL;
+    memset(out_backup, 0, sizeof(*out_backup));
+    out_backup->backup_schema_version = APP_DEVICE_CONFIG_BACKUP_SCHEMA_VERSION;
+    out_backup->config = s_config.public_config;
+    if (s_config.public_config.cloudflare_configured) {
+        (void)snprintf(out_backup->cloudflare_api_token,
+                       sizeof(out_backup->cloudflare_api_token), "%s",
+                       s_config.cloudflare_api_token);
+    }
+    unlock_config();
+    return ESP_OK;
+}
+
+esp_err_t device_config_restore_backup(const device_config_backup_t *backup)
+{
+    if (backup == NULL || backup->backup_schema_version != APP_DEVICE_CONFIG_BACKUP_SCHEMA_VERSION) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
+    if (!device_config_hostname_is_valid(backup->config.hostname)) return ESP_ERR_INVALID_ARG;
+    if (backup->config.ntp_peer_poll_interval_seconds < APP_NTP_PEER_POLL_MIN_SECONDS ||
+        backup->config.ntp_peer_poll_interval_seconds > APP_NTP_PEER_POLL_MAX_SECONDS ||
+        backup->config.ntp_peer_response_timeout_ms < APP_NTP_PEER_TIMEOUT_MIN_MS ||
+        backup->config.ntp_peer_response_timeout_ms > APP_NTP_PEER_TIMEOUT_MAX_MS ||
+        backup->config.redundant_peer_warning_ns == 0U ||
+        backup->config.redundant_peer_warning_ns > APP_REDUNDANT_PEER_THRESHOLD_MAX_NS ||
+        backup->config.redundant_peer_critical_ns < backup->config.redundant_peer_warning_ns ||
+        backup->config.redundant_peer_critical_ns > APP_REDUNDANT_PEER_THRESHOLD_MAX_NS) return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
+        if (backup->config.ntp_peers[i].enabled &&
+            !device_config_ntp_peer_server_is_valid(backup->config.ntp_peers[i].server)) return ESP_ERR_INVALID_ARG;
+    }
+    if (backup->config.cloudflare_configured &&
+        (!device_config_cloudflare_zone_is_valid(backup->config.cloudflare_zone_name) ||
+         !zone_id_is_valid(backup->config.cloudflare_zone_id) ||
+         !api_token_is_valid(backup->cloudflare_api_token))) return ESP_ERR_INVALID_ARG;
+
+    if (!lock_config()) return ESP_FAIL;
+    stored_config_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.public_config = backup->config;
+    candidate.public_config.schema_version = APP_DEVICE_CONFIG_SCHEMA_VERSION;
+    candidate.public_config.generation = next_generation(s_config.public_config.generation);
+    lowercase(candidate.public_config.hostname);
+    if (candidate.public_config.cloudflare_configured) {
+        lowercase(candidate.public_config.cloudflare_zone_name);
+        (void)snprintf(candidate.cloudflare_api_token, sizeof(candidate.cloudflare_api_token), "%s",
+                       backup->cloudflare_api_token);
+    } else {
+        candidate.public_config.cloudflare_zone_name[0] = '\0';
+        candidate.public_config.cloudflare_zone_id[0] = '\0';
+    }
+    for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
+        if (candidate.public_config.ntp_peers[i].enabled) lowercase(candidate.public_config.ntp_peers[i].server);
+        else candidate.public_config.ntp_peers[i].server[0] = '\0';
+    }
+    const esp_err_t err = persist_config(&candidate);
+    if (err == ESP_OK) s_config = candidate;
+    unlock_config();
+    if (err == ESP_OK) ESP_LOGI(TAG, "Configuration backup restored transactionally: generation=%" PRIu32,
+                                candidate.public_config.generation);
+    return err;
+}
+

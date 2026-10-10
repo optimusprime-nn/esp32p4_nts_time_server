@@ -15,6 +15,8 @@ typedef enum {
     NTP_PEER_HEALTH_DISABLED = 0,
     NTP_PEER_HEALTH_UNKNOWN,
     NTP_PEER_HEALTH_HEALTHY,
+    NTP_PEER_HEALTH_WARNING,
+    NTP_PEER_HEALTH_CRITICAL,
     NTP_PEER_HEALTH_DEGRADED,
     NTP_PEER_HEALTH_UNREACHABLE,
     NTP_PEER_HEALTH_DIVERGENT,
@@ -25,6 +27,7 @@ typedef enum {
 typedef struct {
     bool configured;
     char server[APP_NTP_PEER_SERVER_MAX_LENGTH + 1U];
+    char resolved_address[16];
     ntp_peer_health_t health;
     uint8_t reachability;
     uint8_t stratum;

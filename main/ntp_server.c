@@ -429,6 +429,24 @@ static void build_rate_kod(const ntp_packet_fields_t *request,
     ntp_packet_build(response, &packet);
 }
 
+/* Status-only response for an unavailable local timing reference.
+ * Never returns valid NTP time or grants this node timing authority. */
+static void build_unsynchronized_status(const ntp_packet_fields_t *request,
+                                        uint8_t response[NTP_PACKET_SIZE])
+{
+    ntp_packet_fields_t packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.leap_indicator = NTP_LI_UNSYNCED;
+    packet.version = request->version;
+    packet.mode = NTP_MODE_SERVER;
+    packet.stratum = NTP_STRATUM_UNSYNCED;
+    packet.precision = -20;
+    packet.reference_id = ntp_packet_refid_from_text("INIT");
+    packet.origin_timestamp = request->transmit_timestamp;
+    /* Reference, receive and transmit timestamps remain zero by design. */
+    ntp_packet_build(response, &packet);
+}
+
 static bool build_server_response(const ntp_packet_fields_t *request,
                                   ntp_timestamp_t receive_timestamp,
                                   uint8_t response[NTP_PACKET_SIZE],
@@ -657,6 +675,34 @@ static void ntp_server_task(void *arg)
                     ntp_status_record_invalid_request();
                     continue;
                 }
+            }
+
+            /* GNSS-loss visibility: ordinary NTP clients can distinguish a
+             * live unsynchronised appliance from a network timeout. NTS is
+             * intentionally not served without an authoritative clock. */
+            uint8_t quality_stratum = NTP_STRATUM_UNSYNCED;
+            uint8_t quality_leap = NTP_LI_UNSYNCED;
+            uint32_t quality_refid = 0U;
+            uint32_t quality_dispersion = 0U;
+            if (!get_server_quality(&quality_stratum, &quality_leap,
+                                    &quality_refid, &quality_dispersion)) {
+                if (!nts_request) {
+                    build_unsynchronized_status(&request, s_response_buffer);
+                    const int sent = sendto(socket_fd, s_response_buffer,
+                                            NTP_PACKET_SIZE, 0,
+                                            (const struct sockaddr *)&client_address,
+                                            client_length);
+                    if (sent == (int)NTP_PACKET_SIZE) {
+                        ntp_status_record_response(NTP_STRATUM_UNSYNCED,
+                                                   NTP_LI_UNSYNCED, 0U);
+                    } else {
+                        ntp_status_record_send_failure();
+                    }
+                } else {
+                    nts_ntp_auth_clear_context(&nts_context);
+                    ntp_status_record_unsynchronized_drop();
+                }
+                continue;
             }
 
             ntp_timestamp_t software_receive_timestamp;

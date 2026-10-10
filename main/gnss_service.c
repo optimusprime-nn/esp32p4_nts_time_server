@@ -1,4 +1,5 @@
 #include "gnss_service.h"
+#include "hardware_profile.h"
 
 #include <ctype.h>
 #include <inttypes.h>
@@ -866,7 +867,7 @@ static esp_err_t ubx_write_frame(uint8_t message_class,
         ck_b,
     };
 
-    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const uart_port_t uart_num = (uart_port_t)hardware_profile_gnss_uart_num();
 
     if (uart_write_bytes(uart_num, header, sizeof(header)) !=
         (int)sizeof(header)) {
@@ -937,7 +938,7 @@ static esp_err_t ubx_send_and_wait_ack(uint8_t message_class,
                                        const uint8_t *payload,
                                        uint16_t payload_length)
 {
-    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const uart_port_t uart_num = (uart_port_t)hardware_profile_gnss_uart_num();
     esp_err_t result = ESP_FAIL;
 
     for (uint32_t attempt = 0U;
@@ -1047,7 +1048,7 @@ static esp_err_t ubx_configure_tp1(void)
 
 static void ubx_poll_mon_ver(void)
 {
-    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const uart_port_t uart_num = (uart_port_t)hardware_profile_gnss_uart_num();
 
     if (ubx_write_frame(UBX_CLASS_MON, UBX_ID_MON_VER, NULL, 0U) != ESP_OK) {
         ESP_LOGW(TAG, "UBX-MON-VER poll transmit failed");
@@ -1218,7 +1219,7 @@ static void gnss_task(void *arg)
     (void)arg;
 
     uint8_t receive_buffer[GNSS_READ_BUFFER_SIZE];
-    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const uart_port_t uart_num = (uart_port_t)hardware_profile_gnss_uart_num();
 
     while (true) {
         const int received = uart_read_bytes(uart_num,
@@ -1246,7 +1247,7 @@ esp_err_t gnss_service_init(void)
         return ESP_OK;
     }
 
-    const uart_port_t uart_num = (uart_port_t)APP_GNSS_UART_NUM;
+    const uart_port_t uart_num = (uart_port_t)hardware_profile_gnss_uart_num();
 
     const uart_config_t uart_config = {
         .baud_rate = APP_GNSS_UART_BAUD,
@@ -1259,9 +1260,9 @@ esp_err_t gnss_service_init(void)
 
     ESP_LOGI(TAG,
              "GNSS UART configuration: UART%d TX=%d RX=%d baud=%d",
-             APP_GNSS_UART_NUM,
-             APP_GNSS_UART_TX_GPIO,
-             APP_GNSS_UART_RX_GPIO,
+             hardware_profile_gnss_uart_num(),
+             hardware_profile_gnss_tx_gpio(),
+             hardware_profile_gnss_rx_gpio(),
              APP_GNSS_UART_BAUD);
 
     ESP_RETURN_ON_ERROR(
@@ -1281,8 +1282,8 @@ esp_err_t gnss_service_init(void)
 
     ESP_RETURN_ON_ERROR(
         uart_set_pin(uart_num,
-                     APP_GNSS_UART_TX_GPIO,
-                     APP_GNSS_UART_RX_GPIO,
+                     hardware_profile_gnss_tx_gpio(),
+                     hardware_profile_gnss_rx_gpio(),
                      UART_PIN_NO_CHANGE,
                      UART_PIN_NO_CHANGE),
         TAG,
@@ -1331,9 +1332,9 @@ esp_err_t gnss_service_init(void)
 
     ESP_LOGI(TAG,
              "LEA-M8T GNSS parser active: UART%d RX=%d TX=%d",
-             APP_GNSS_UART_NUM,
-             APP_GNSS_UART_RX_GPIO,
-             APP_GNSS_UART_TX_GPIO);
+             hardware_profile_gnss_uart_num(),
+             hardware_profile_gnss_rx_gpio(),
+             hardware_profile_gnss_tx_gpio());
 
     return ESP_OK;
 }

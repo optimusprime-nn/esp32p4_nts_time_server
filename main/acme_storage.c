@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "esp_flash_encrypt.h"
+#include "esp_efuse.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -42,7 +42,7 @@ static esp_err_t init_locked(void)
      * Without hardware flash encryption those keys would not be protected.
      * Fail closed instead of silently creating plaintext long-term secrets.
      */
-    if (!esp_flash_encryption_enabled()) {
+    if (!esp_efuse_is_flash_encryption_enabled()) {
         ESP_LOGE(TAG,
                  "Refusing ACME key-store initialization: flash encryption is not active");
         return ESP_ERR_INVALID_STATE;

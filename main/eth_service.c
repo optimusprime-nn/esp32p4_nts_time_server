@@ -7,9 +7,11 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "device_config.h"
 
 #include "esp_check.h"
 #include "esp_eth.h"
+#include "esp_eth_rx_diag.h"
 #include "esp_eth_mac_esp.h"
 #include "esp_eth_phy_ip101.h"
 #include "esp_event.h"
@@ -474,6 +476,33 @@ static esp_err_t eth_tx_probe_set_mac_filter(void *h,
                          (void *)eth_mac);
 }
 
+/* Read-only classification; never changes or retains the frame buffer. */
+static void eth_diag_classify_rx(const uint8_t *buffer, uint32_t length,
+                                 bool *arp, bool *dhcp)
+{
+    *arp = false;
+    *dhcp = false;
+    if (buffer == NULL || length < 14U) return;
+    uint32_t l3 = 14U;
+    uint16_t type = read_be16(buffer + 12U);
+    for (unsigned i = 0; i < 2U &&
+         (type == ETHERTYPE_VLAN || type == ETHERTYPE_QINQ); ++i) {
+        if (length < l3 + 4U) return;
+        type = read_be16(buffer + l3 + 2U);
+        l3 += 4U;
+    }
+    if (type == 0x0806U) { *arp = true; return; }
+    if (type != ETHERTYPE_IPV4 || length < l3 + 20U) return;
+    const uint32_t ihl = (buffer[l3] & 0x0FU) * 4U;
+    if (ihl < 20U || length < l3 + ihl + 8U || buffer[l3 + 9U] != IP_PROTOCOL_UDP) return;
+    const uint16_t fragment = read_be16(buffer + l3 + 6U);
+    if ((fragment & 0x3FFFU) != 0U) return;
+    const uint32_t udp = l3 + ihl;
+    const uint16_t src = read_be16(buffer + udp);
+    const uint16_t dst = read_be16(buffer + udp + 2U);
+    *dhcp = (src == 67U && dst == 68U) || (src == 68U && dst == 67U);
+}
+
 static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
 {
     esp_eth_handle_t eth_handle = (esp_eth_handle_t)h;
@@ -481,7 +510,12 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
     /* Fail open to the stock path unless this is positively identified as an
      * IPv4 UDP NTP server response. */
     if (!eth_frame_is_ipv4_udp_ntp_response((const uint8_t *)buffer, length)) {
-        return esp_eth_transmit(eth_handle, buffer, length);
+        const esp_err_t err = esp_eth_transmit(eth_handle, buffer, length);
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_tx_other_attempt++;
+        if (err != ESP_OK) s_status.diag_tx_other_fail++;
+        portEXIT_CRITICAL(&s_eth_lock);
+        return err;
     }
 
 #ifndef SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -672,6 +706,15 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
 {
     (void)eth_handle;
 
+    bool diag_arp = false;
+    bool diag_dhcp = false;
+    eth_diag_classify_rx(buffer, length, &diag_arp, &diag_dhcp);
+    portENTER_CRITICAL(&s_eth_lock);
+    s_status.diag_rx_frames++;
+    if (diag_arp) s_status.diag_rx_arp++;
+    if (diag_dhcp) s_status.diag_rx_dhcp++;
+    portEXIT_CRITICAL(&s_eth_lock);
+
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     const eth_mac_time_t *timestamp = (const eth_mac_time_t *)info;
     const bool timestamp_valid =
@@ -739,7 +782,13 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
 
     /* Preserve the stock Ethernet glue behavior: it forwards the received
      * Ethernet buffer to esp-netif and does not pass MAC-specific info on. */
-    return esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+    const esp_err_t forward_err = esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+    if (forward_err != ESP_OK) {
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_rx_forward_fail++;
+        portEXIT_CRITICAL(&s_eth_lock);
+    }
+    return forward_err;
 }
 
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -956,6 +1005,7 @@ static void eth_event_handler(void *arg,
     if (event_id == ETHERNET_EVENT_CONNECTED) {
         portENTER_CRITICAL(&s_eth_lock);
         s_status.link_up = true;
+        s_status.diag_link_up_events++;
         portEXIT_CRITICAL(&s_eth_lock);
 
         ESP_LOGI(TAG, "Ethernet link up");
@@ -967,6 +1017,7 @@ static void eth_event_handler(void *arg,
 
         s_status.link_up = false;
         s_status.ipv4_ready = false;
+        s_status.diag_link_down_events++;
         s_status.ipv4_address = 0U;
         s_status.ipv4_netmask = 0U;
         s_status.ipv4_gateway = 0U;
@@ -1024,6 +1075,7 @@ static void got_ip_event_handler(void *arg,
     portENTER_CRITICAL(&s_eth_lock);
 
     s_status.ipv4_ready = true;
+    s_status.diag_got_ip_events++;
     s_status.ipv4_address = got_ip->ip_info.ip.addr;
     s_status.ipv4_netmask = got_ip->ip_info.netmask.addr;
     s_status.ipv4_gateway = got_ip->ip_info.gw.addr;
@@ -1101,6 +1153,24 @@ esp_err_t eth_service_init(void)
     if (s_eth_netif == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    /* Advertise the persisted device host label in DHCP Option 12 instead of
+     * ESP-IDF's default "espressif" hostname. The configured hostname is a
+     * single DNS label (for example "ts2"); the local DHCP/DNS server may
+     * append its domain suffix (for example nicknewman.au). This affects only
+     * management/network identity and has no timing authority. */
+    char dhcp_hostname[APP_DEVICE_HOSTNAME_MAX_LENGTH + 1U] = {0};
+    ESP_RETURN_ON_ERROR(
+        device_config_get_hostname(dhcp_hostname, sizeof(dhcp_hostname)),
+        TAG,
+        "read configured DHCP hostname");
+
+    ESP_RETURN_ON_ERROR(
+        esp_netif_set_hostname(s_eth_netif, dhcp_hostname),
+        TAG,
+        "set Ethernet DHCP hostname");
+
+    ESP_LOGI(TAG, "DHCP hostname configured: %s", dhcp_hostname);
 
     const esp_eth_netif_glue_handle_t glue =
         esp_eth_new_netif_glue(s_eth_handle);
@@ -1433,4 +1503,74 @@ bool eth_service_get_status(eth_service_status_t *out_status)
     portEXIT_CRITICAL(&s_eth_lock);
 
     return true;
+}
+
+
+/* Software-only EMAC snapshot; safe to call after RX has stalled. */
+void eth_service_diag_log_emac_snapshot(void)
+{
+    if (s_eth_mac == NULL) {
+        ESP_LOGW(TAG, "eth-emac-snapshot: MAC unavailable");
+        return;
+    }
+    esp_eth_rx_diag_t d = {0};
+    if (!esp_eth_rx_diag_snapshot(s_eth_mac, &d)) {
+        ESP_LOGW(TAG, "eth-emac-snapshot: unavailable");
+        return;
+    }
+    ESP_LOGW(TAG, "eth-emac-snapshot: irq=%" PRIu32 " wake=%" PRIu32
+             " frame=%" PRIu32 " callback=%" PRIu32 " alloc_fail=%" PRIu32
+             " copy_fail=%" PRIu32 " truncated=%" PRIu32
+             " remain=%" PRIu32 " free_desc=%" PRIu32,
+             d.rx_irq, d.rx_wakeup, d.rx_frame, d.rx_callback_attempt,
+             d.rx_alloc_fail, d.rx_copy_fail, d.rx_truncated,
+             d.rx_frames_remain, d.rx_desc_free);
+    esp_eth_rx_hw_diag_t hw = {0};
+    if (esp_eth_rx_hw_diag_snapshot(s_eth_mac, &hw)) {
+        ESP_LOGW(TAG, "eth-emac-hw: mac_cfg=0x%08" PRIx32
+                 " dma_status=0x%08" PRIx32 " dma_op=0x%08" PRIx32
+                 " dma_irq_en=0x%08" PRIx32,
+                 hw.mac_config, hw.dma_status, hw.dma_operation_mode,
+                 hw.dma_interrupt_enable);
+        ESP_LOGW(TAG, "eth-emac-hw: rx_list=0x%08" PRIx32
+                 " rx_current_desc=0x%08" PRIx32 " rx_current_buf=0x%08" PRIx32,
+                 hw.rx_descriptor_list, hw.rx_current_descriptor,
+                 hw.rx_current_buffer);
+    }
+}
+
+/* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
+ * Read BMSR twice because the first read may report latched link loss. */
+void eth_service_diag_log_phy_snapshot(void)
+{
+    if (s_eth_handle == NULL) {
+        ESP_LOGW(TAG, "eth-phy-snapshot: driver unavailable");
+        return;
+    }
+    uint32_t phy_addr = 0U;
+    esp_err_t err = esp_eth_ioctl(s_eth_handle, ETH_CMD_G_PHY_ADDR, &phy_addr);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "eth-phy-snapshot: addr error=%s", esp_err_to_name(err));
+        return;
+    }
+    static const uint32_t regs[] = {0U, 1U, 1U, 2U, 3U, 4U, 5U, 6U};
+    static const char *names[] = {
+        "BMCR", "BMSR_first", "BMSR_second", "PHYID1",
+        "PHYID2", "ANAR", "ANLPAR", "ANER"
+    };
+    ESP_LOGW(TAG, "eth-phy-snapshot: addr=%" PRIu32, phy_addr);
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+        uint32_t value = 0U;
+        esp_eth_phy_reg_rw_data_t rw = {
+            .reg_addr = regs[i], .reg_value_p = &value
+        };
+        err = esp_eth_ioctl(s_eth_handle, ETH_CMD_READ_PHY_REG, &rw);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "eth-phy-snapshot: %s[%" PRIu32 "]=0x%04" PRIx32,
+                     names[i], regs[i], value & 0xffffU);
+        } else {
+            ESP_LOGW(TAG, "eth-phy-snapshot: %s error=%s",
+                     names[i], esp_err_to_name(err));
+        }
+    }
 }

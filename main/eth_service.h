@@ -29,6 +29,16 @@ typedef struct {
     uint32_t ptp_utc_bracket_ns;
 
     bool rx_hw_timestamp_all_enabled;
+    /* Observe-only Ethernet datapath counters (monotonic since init). */
+    uint32_t diag_rx_frames;
+    uint32_t diag_rx_arp;
+    uint32_t diag_rx_dhcp;
+    uint32_t diag_rx_forward_fail;
+    uint32_t diag_tx_other_attempt;
+    uint32_t diag_tx_other_fail;
+    uint32_t diag_link_up_events;
+    uint32_t diag_link_down_events;
+    uint32_t diag_got_ip_events;
     uint32_t rx_hw_frames;
     uint32_t rx_hw_timestamp_valid;
     uint32_t rx_hw_timestamp_invalid;
@@ -66,6 +76,9 @@ esp_err_t eth_service_start(void);
 void eth_service_wait_for_ip(void);
 
 bool eth_service_get_status(eth_service_status_t *out_status);
+
+void eth_service_diag_log_phy_snapshot(void);
+void eth_service_diag_log_emac_snapshot(void);
 
 typedef struct {
     uint32_t seconds;

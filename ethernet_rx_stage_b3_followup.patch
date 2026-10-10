@@ -1,0 +1,48 @@
+--- a/main/diagnostics.c
++++ b/main/diagnostics.c
+@@ -70,6 +70,7 @@
+     int64_t last_rx_progress_us = 0;
+     bool rx_seen = false;
+     bool stall_reported = false;
++    int64_t last_stall_snapshot_us = 0;
+ 
+     while (true) {
+         pps_service_status_t pps_status;
+@@ -157,6 +158,7 @@
+         if (!eth_status.started || !eth_status.link_up || !eth_status.ipv4_ready) {
+             rx_seen = false;
+             stall_reported = false;
++            last_stall_snapshot_us = 0;
+             last_rx_progress_us = rx_now_us;
+             previous_rx = eth_status.diag_rx_frames;
+         } else if (!rx_seen || eth_status.diag_rx_frames != previous_rx) {
+@@ -168,9 +170,11 @@
+                          eth_status.diag_rx_frames);
+             }
+             stall_reported = false;
++            last_stall_snapshot_us = 0;
+         } else if (rx_seen && !stall_reported &&
+                    rx_now_us - last_rx_progress_us >= ETH_RX_STALL_THRESHOLD_US) {
+             stall_reported = true;
++            last_stall_snapshot_us = rx_now_us;
+             ESP_LOGE(TAG,
+                      "eth-rx-stall: DETECTED idle_ms=%" PRId64
+                      " rx=%" PRIu32 " arp=%" PRIu32
+@@ -184,6 +188,17 @@
+                      eth_status.diag_rx_forward_fail);
+             eth_service_diag_log_emac_snapshot();
+             eth_service_diag_log_phy_snapshot();
++        } else if (rx_seen && stall_reported &&
++                   rx_now_us - last_stall_snapshot_us >= 60000000LL) {
++            /* Periodic read-only follow-up while RX remains stalled. */
++            last_stall_snapshot_us = rx_now_us;
++            ESP_LOGW(TAG, "eth-rx-stall: FOLLOWUP idle_ms=%" PRId64
++                     " rx=%" PRIu32 " link=%d ipv4=%d",
++                     (rx_now_us - last_rx_progress_us) / 1000,
++                     eth_status.diag_rx_frames, eth_status.link_up,
++                     eth_status.ipv4_ready);
++            eth_service_diag_log_emac_snapshot();
++            eth_service_diag_log_phy_snapshot();
+         }
+ 
+         ESP_LOGI(

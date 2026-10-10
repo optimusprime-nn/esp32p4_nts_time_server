@@ -1,19 +1,29 @@
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "commissioning.h"
 #include "device_config.h"
+#include "hardware_profile.h"
 #include "diagnostics.h"
 #include "eth_service.h"
 #include "gnss_service.h"
+#include "management_ownership.h"
+#include "operations_history.h"
+#include "ota_manager.h"
 #include "ntp_server.h"
 #include "ntp_peer_monitor.h"
 #include "nts_ke.h"
 #include "pps_service.h"
+#include "sd_storage.h"
 #include "web_console.h"
 
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "nvs_flash.h"
 
@@ -79,6 +89,40 @@ void app_main(void)
         return;
     }
 
+    err = commissioning_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Commissioning configuration unavailable: %s", esp_err_to_name(err));
+    }
+
+    err = hardware_profile_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Hardware profile initialization failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Initializing persistent operations history");
+    err = operations_history_init();
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Persistent operations history unavailable; continuing fail-open: %s",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Persistent operations history initialized");
+    }
+
+    err = ota_manager_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "OTA manager initialization failed; continuing: %s", esp_err_to_name(err));
+    }
+
+    err = management_ownership_init();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Management ownership initialization failed: %s", esp_err_to_name(err));
+        return;
+    }
+
     err = pps_service_init();
 
     if (err != ESP_OK) {
@@ -123,6 +167,19 @@ void app_main(void)
 
     eth_service_wait_for_ip();
 
+    /* Management-only wall-clock bootstrap for TLS/ACME. This does not feed
+     * clock_discipline, NTP serving state, PPS/PTP correlation, or NTS timing. */
+    const esp_err_t bootstrap_err = commissioning_sync_management_time();
+    if (bootstrap_err != ESP_OK) {
+        ESP_LOGW(TAG, "Management-time fallback unavailable; continuing: %s",
+                 esp_err_to_name(bootstrap_err));
+    }
+    const esp_err_t time_manager_err = commissioning_start_time_manager();
+    if (time_manager_err != ESP_OK) {
+        ESP_LOGW(TAG, "Management-time source manager did not start: %s",
+                 esp_err_to_name(time_manager_err));
+    }
+
     err = ntp_server_start();
 
     if (err != ESP_OK) {
@@ -137,6 +194,14 @@ void app_main(void)
         ESP_LOGW(TAG,
                  "NTP peer monitor did not start: %s",
                  esp_err_to_name(peer_monitor_err));
+    }
+
+    /* SD storage is operations-plane only. Mount/write failure must never gate
+     * the authoritative clock, NTP, NTS, GNSS/PPS, or management service. */
+    const esp_err_t sd_err = sd_storage_start();
+    if (sd_err != ESP_OK) {
+        ESP_LOGW(TAG, "SD operational storage unavailable; continuing: %s",
+                 esp_err_to_name(sd_err));
     }
 
     err = web_console_start();
@@ -162,6 +227,14 @@ void app_main(void)
         ESP_LOGW(TAG,
                  "NTS-KE server did not start: %s",
                  esp_err_to_name(err));
+    }
+
+    /* A newly booted OTA image is confirmed only after the complete service
+     * startup path has succeeded. A crash/reset before this point leaves it
+     * pending so the bootloader can roll back on the next boot. */
+const esp_err_t ota_confirm_err = ota_manager_confirm_running_image();
+    if (ota_confirm_err != ESP_OK) {
+        ESP_LOGW(TAG, "OTA running-image confirmation deferred/failed: %s", esp_err_to_name(ota_confirm_err));
     }
 
     if (peer_monitor_err == ESP_OK) {

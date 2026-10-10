@@ -1,4 +1,5 @@
 #include "pps_service.h"
+#include "hardware_profile.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -114,7 +115,7 @@ static esp_err_t pps_configure_etm_capture(void)
                         "create GPIO ETM event");
 
     ESP_RETURN_ON_ERROR(gpio_etm_event_bind_gpio(s_gpio_etm_event,
-                                                 APP_PPS_GPIO),
+                                                 hardware_profile_pps_gpio()),
                         TAG,
                         "bind GPIO ETM event");
 
@@ -155,7 +156,7 @@ static esp_err_t pps_configure_gpio_interrupt(void)
      * gpio_config() function.
      */
     const gpio_config_t pps_gpio_config = {
-        .pin_bit_mask = (1ULL << APP_PPS_GPIO),
+        .pin_bit_mask = (1ULL << hardware_profile_pps_gpio()),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -176,7 +177,7 @@ static esp_err_t pps_configure_gpio_interrupt(void)
         return err;
     }
 
-    return gpio_isr_handler_add((gpio_num_t)APP_PPS_GPIO,
+    return gpio_isr_handler_add((gpio_num_t)hardware_profile_pps_gpio(),
                                 pps_gpio_isr,
                                 NULL);
 }
@@ -216,7 +217,7 @@ esp_err_t pps_service_init(void)
 
     ESP_LOGI(TAG,
              "PPS ETM capture active: GPIO=%d resolution=%u Hz",
-             APP_PPS_GPIO,
+             hardware_profile_pps_gpio(),
              APP_PPS_TIMER_RESOLUTION_HZ);
 
     return ESP_OK;

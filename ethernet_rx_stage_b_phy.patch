@@ -1,0 +1,64 @@
+--- a/main/eth_service.c
++++ b/main/eth_service.c
+@@ -1502,4 +1502,40 @@
+     portEXIT_CRITICAL(&s_eth_lock);
+ 
+     return true;
+-}+}
++
++/* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
++ * Read BMSR twice because the first read may report latched link loss. */
++void eth_service_diag_log_phy_snapshot(void)
++{
++    if (s_eth_handle == NULL) {
++        ESP_LOGW(TAG, "eth-phy-snapshot: driver unavailable");
++        return;
++    }
++    uint32_t phy_addr = 0U;
++    esp_err_t err = esp_eth_ioctl(s_eth_handle, ETH_CMD_G_PHY_ADDR, &phy_addr);
++    if (err != ESP_OK) {
++        ESP_LOGW(TAG, "eth-phy-snapshot: addr error=%s", esp_err_to_name(err));
++        return;
++    }
++    static const uint32_t regs[] = {0U, 1U, 1U, 2U, 3U, 4U, 5U, 6U};
++    static const char *names[] = {
++        "BMCR", "BMSR_first", "BMSR_second", "PHYID1",
++        "PHYID2", "ANAR", "ANLPAR", "ANER"
++    };
++    ESP_LOGW(TAG, "eth-phy-snapshot: addr=%" PRIu32, phy_addr);
++    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++        uint32_t value = 0U;
++        esp_eth_phy_reg_rw_data_t rw = {
++            .reg_addr = regs[i], .reg_value_p = &value
++        };
++        err = esp_eth_ioctl(s_eth_handle, ETH_CMD_READ_PHY_REG, &rw);
++        if (err == ESP_OK) {
++            ESP_LOGW(TAG, "eth-phy-snapshot: %s[%" PRIu32 "]=0x%04" PRIx32,
++                     names[i], regs[i], value & 0xffffU);
++        } else {
++            ESP_LOGW(TAG, "eth-phy-snapshot: %s error=%s",
++                     names[i], esp_err_to_name(err));
++        }
++    }
++}
+--- a/main/eth_service.h
++++ b/main/eth_service.h
+@@ -77,6 +77,8 @@
+ 
+ bool eth_service_get_status(eth_service_status_t *out_status);
+ 
++void eth_service_diag_log_phy_snapshot(void);
++
+ typedef struct {
+     uint32_t seconds;
+     uint32_t fraction;
+--- a/main/diagnostics.c
++++ b/main/diagnostics.c
+@@ -182,6 +182,7 @@
+                      eth_status.diag_tx_other_attempt,
+                      eth_status.diag_tx_other_fail,
+                      eth_status.diag_rx_forward_fail);
++            eth_service_diag_log_phy_snapshot();
+         }
+ 
+         ESP_LOGI(

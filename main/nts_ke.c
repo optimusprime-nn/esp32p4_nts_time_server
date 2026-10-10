@@ -688,12 +688,23 @@ static void nts_ke_task(void *arg)
     mbedtls_pk_context private_key;
     mbedtls_pk_init(&private_key);
 
-    esp_err_t err = nts_storage_ensure_cookie_keyring();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Cookie keyring unavailable: %s",
-                 esp_err_to_name(err));
-        goto exit;
+    esp_err_t err;
+    bool waiting_logged = false;
+    for (;;) {
+        err = nts_storage_ensure_cookie_keyring();
+        if (err == ESP_OK) break;
+        if (err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Cookie keyring unavailable: %s", esp_err_to_name(err));
+            goto exit;
+        }
+        if (!waiting_logged) {
+            ESP_LOGW(TAG, "NTS-KE waiting for GNSS/PPS authoritative time before cookie-key initialization");
+            waiting_logged = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000U));
     }
+    if (waiting_logged)
+        ESP_LOGI(TAG, "GNSS/PPS authoritative time available; continuing NTS-KE startup");
 
     err = configure_tls(&config, &certificate, &private_key);
     if (err != ESP_OK) {

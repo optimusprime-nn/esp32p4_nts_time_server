@@ -140,9 +140,16 @@ static esp_err_t cloudflare_client_resolve_zone_sync(const char *api_token,
         ESP_LOGW(TAG, "Cloudflare API returned HTTP %d", status);
         return ESP_ERR_INVALID_RESPONSE;
     }
-    if (!response_success(response.data) ||
-        !extract_zone_id(response.data, zone_id, zone_id_size)) {
-        ESP_LOGW(TAG, "Cloudflare token/zone verification did not return a zone");
+    if (!response_success(response.data)) {
+        ESP_LOGW(TAG, "Cloudflare API returned HTTP 200 but success=false for zone '%s'", zone_name);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!extract_zone_id(response.data, zone_id, zone_id_size)) {
+        const bool empty_result = strstr(response.data, "\"result\":[]") != NULL ||
+                                  strstr(response.data, "\"result\": []") != NULL;
+        ESP_LOGW(TAG,
+                 "Cloudflare zone lookup returned no usable zone for '%s' (HTTP 200, response_bytes=%u, empty_result=%s)",
+                 zone_name, (unsigned)response.used, empty_result ? "yes" : "no");
         return ESP_ERR_NOT_FOUND;
     }
 

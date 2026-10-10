@@ -2597,7 +2597,12 @@ esp_err_t acme_client_get_automatic_renewal_enabled(bool *out_enabled)
     uint8_t value = 0U;
     err = nvs_get_u8(handle, "renew_auto", &value);
     nvs_close(handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Production default: automatic renewal is armed unless an operator
+         * explicitly persists a disabled policy. */
+        *out_enabled = true;
+        return ESP_OK;
+    }
     if (err != ESP_OK) return err;
     if (value > 1U) return ESP_ERR_INVALID_STATE;
     *out_enabled = value != 0U;

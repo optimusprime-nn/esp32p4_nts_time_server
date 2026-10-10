@@ -725,20 +725,25 @@ Build from the project root:
 idf.py build
 ```
 
-Because the provisioned target has flash encryption enabled, use the
-encrypted flash workflow:
+Flashing depends on whether the board is genuinely factory-new or has already provisioned flash encryption. For a virgin board with no flash-encryption key, the validated first-flash workflow is:
 
 ``` powershell
-idf.py -p COM11 encrypted-flash --all
+idf.py -p <COM> flash monitor
 ```
 
-Do **not** use ordinary:
+Allow the first-boot flash-encryption process to finish without interruption. After flash encryption has been provisioned, all subsequent development servicing uses:
 
-``` text
-idf.py flash
+``` powershell
+idf.py -p <COM> encrypted-flash --all
 ```
 
-on this provisioned target.
+To attach the serial console without writing flash:
+
+``` powershell
+idf.py -p <COM> monitor
+```
+
+Do **not** use ordinary `idf.py flash` or `idf.py flash monitor` on an already encrypted target. See `PHASE9A_PROVISIONING.md` for the complete clean-board enrollment, mTLS, multi-board credential, and recovery procedure.
 
 Do not manually burn additional eFuses, alter the flash-encryption
 key/count, or enable Secure Boot unless a separate provisioning plan has
@@ -1251,3 +1256,23 @@ Phase 8C validation / production regression PASS / FROZEN
 Phase 8 Peer Health Monitoring              PASS / CLOSED
 Peer-monitor subsystem                      VALIDATED / FROZEN
 ```
+
+### Phase 9B operations and configuration recovery
+
+The authenticated management plane exposes persistent operations/reset history at `GET /api/v1/operations/history`. The dashboard displays the retained event ring, persistent boot count, last reset classification, and reset-class counters. Reset classification is operational telemetry only and has no timing authority.
+
+Configuration can be exported with `GET /api/v1/config/backup` and restored with `POST /api/v1/config/backup`. Restore validates the complete candidate and commits it as one NVS configuration transaction before replacing the active in-memory configuration. A reboot is recommended after restore so every service consumes the restored configuration from a clean startup state.
+
+**Security:** a configuration backup contains the Cloudflare API token when Cloudflare is configured. Store backup JSON as a secret. Backup/restore endpoints are registered only on the provisioned mTLS management server; they are not available from enrollment mode.
+
+### Web configuration backup and restore
+The authenticated mTLS management console includes a **Configuration Backup & Restore** panel. **Download Backup** saves the complete management configuration as JSON. **Restore Configuration** accepts a backup file, performs browser-side structural checks, requires explicit confirmation, and sends it to the device for authoritative validation and transactional commit. Backup files can contain the Cloudflare API token and must be stored as secrets. The backup panel is outside the auto-refreshed dashboard container so a selected restore file is not discarded by the three-second status refresh.
+
+### Revision-aware hardware profiles
+
+Phase 9B includes a persistent hardware profile used to separate carrier-board identity from ESP32-P4 silicon identity. The management console can configure board family/revision, PPS GPIO and GNSS UART pins. Wafer revision, eFuse block revision and package version are detected from the chip and are read-only. Hardware profile changes require reboot.
+
+The 360 MHz profile remains the compatibility baseline. A 400 MHz selection records intended capability only; it does not change the CPU clock until that board/silicon revision has completed timing qualification. Carrier-specific GPIO exposure masks are added only after the exact board/revision pinout is verified.
+
+### Web commissioning
+The authenticated management console includes a Commissioning & Certificate Setup panel. It configures the device hostname, certificate FQDN, three external NTP bootstrap servers, Cloudflare zone/API token, and production certificate request. External NTP is deliberately management-wall-time only: it exists so TLS/ACME can operate before GNSS UTC is available and never makes the NTP server synchronized or authoritative.
