@@ -1576,6 +1576,7 @@ void eth_service_diag_log_emac_snapshot(void)
         ESP_LOGW(TAG, "eth-emac-snapshot: unavailable");
         return;
     }
+    ESP_LOGW(TAG, "B6C: rx_poll_timeout=%" PRIu32, d.rx_poll_timeout);
     ESP_LOGW(TAG, "eth-emac-snapshot: irq=%" PRIu32 " wake=%" PRIu32
              " frame=%" PRIu32 " callback=%" PRIu32 " alloc_fail=%" PRIu32
              " copy_fail=%" PRIu32 " truncated=%" PRIu32
@@ -1585,6 +1586,20 @@ void eth_service_diag_log_emac_snapshot(void)
              d.rx_frames_remain, d.rx_desc_free);
     esp_eth_rx_hw_diag_t hw = {0};
     if (esp_eth_rx_hw_diag_snapshot(s_eth_mac, &hw)) {
+        ESP_LOGW(TAG, "B6D: emacdebug=0x%08" PRIx32
+                 " tx_fc=%" PRIu32 " rx_fifo=%" PRIu32,
+                 hw.mac_debug, hw.tx_frame_ctrl_state, hw.rx_fifo_read_state);
+        /* B6E: read-only bitfield correlation. These are raw slices,
+         * not decoded DMA process-state names; verify LL register mapping
+         * before interpreting. No read-to-clear register access added. */
+        ESP_LOGW(TAG, "B6E: dma_status=0x%08" PRIx32
+                 " status_bits_17_19=%" PRIu32
+                 " status_bits_20_22=%" PRIu32
+                 " dma_rx_enabled_bit1=%" PRIu32,
+                 hw.dma_status,
+                 (hw.dma_status >> 17) & 7U,
+                 (hw.dma_status >> 20) & 7U,
+                 (hw.dma_operation_mode >> 1) & 1U);
         ESP_LOGW(TAG, "eth-emac-hw: mac_cfg=0x%08" PRIx32
                  " dma_status=0x%08" PRIx32 " dma_op=0x%08" PRIx32
                  " dma_irq_en=0x%08" PRIx32,
@@ -1595,6 +1610,7 @@ void eth_service_diag_log_emac_snapshot(void)
                  hw.rx_descriptor_list, hw.rx_current_descriptor,
                  hw.rx_current_buffer);
     }
+
 }
 
 /* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
@@ -1631,4 +1647,41 @@ void eth_service_diag_log_phy_snapshot(void)
                      names[i], esp_err_to_name(err));
         }
     }
+}
+
+/* Stage B5: manually invoked, one-shot diagnostic restart. Never call from
+ * an ISR, Ethernet event handler, or timing-critical NTP/PPS task. */
+esp_err_t eth_service_diag_restart_driver(void)
+{
+    static volatile uint32_t busy = 0;
+    if (!__atomic_compare_exchange_n(&busy, &(uint32_t){0}, 1U, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_eth_handle == NULL || !s_status.initialized || !s_status.started) {
+        ESP_LOGE(TAG, "B5: Ethernet is not initialized and started");
+        goto done;
+    }
+    ESP_LOGW(TAG, "B5: pre-stop EMAC snapshot");
+    eth_service_diag_log_emac_snapshot();
+    eth_service_diag_log_phy_snapshot();
+    ESP_LOGW(TAG, "B5: stopping Ethernet (all network services will drop)");
+    err = esp_eth_stop(s_eth_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "B5: stop failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGW(TAG, "B5: starting existing Ethernet driver");
+    err = esp_eth_start(s_eth_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "B5: start failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+    ESP_LOGW(TAG, "B5: start returned OK; verify link/IP, RX counters and PTP externally");
+    eth_service_diag_log_emac_snapshot();
+done:
+    __atomic_store_n(&busy, 0U, __ATOMIC_RELEASE);
+    return err;
 }

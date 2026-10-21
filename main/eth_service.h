@@ -99,6 +99,9 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
                                        uint16_t client_port,
                                        eth_service_ntp_rx_timestamp_t *out_timestamp);
 
+/* Stage B5: diagnostic only; call from a dedicated non-timing task. */
+esp_err_t eth_service_diag_restart_driver(void);
+
 #ifdef __cplusplus
 }
 #endif

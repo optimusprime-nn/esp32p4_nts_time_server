@@ -1,6 +1,7 @@
 #include "diagnostics.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "app_config.h"
 #include "app_state.h"
@@ -8,10 +9,14 @@
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
+#include "operations_history.h"
 #include "pps_service.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_attr.h"
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,6 +25,26 @@ static const char *TAG = "DIAG";
 
 /* Observe-only callback inactivity threshold. Does not touch Ethernet state. */
 #define ETH_RX_STALL_THRESHOLD_US (30000000LL)
+
+/* Experimental one-shot recovery: set to 1 ONLY on the TS2 test build.
+ * Keep disabled on TS1 and production firmware. */
+#ifndef TS2_B5_ONE_SHOT_RECOVERY
+#define TS2_B5_ONE_SHOT_RECOVERY 0
+#endif
+
+
+/* TS2-only mitigation. Require 600 seconds without RX progress before reboot.
+ * RTC memory survives esp_restart(); cap consecutive recovery boots to avoid
+ * an endless reboot loop. This counter clears only after sustained RX progress.
+ */
+#define TS2_RX_AUTO_REBOOT 1
+#define TS2_RX_REBOOT_AFTER_US (600000000LL)
+#define TS2_RX_STABLE_CLEAR_US (600000000LL)
+#define TS2_RX_MAX_REBOOTS 2
+RTC_NOINIT_ATTR static uint32_t s_ts2_rx_reboot_magic;
+RTC_NOINIT_ATTR static uint32_t s_ts2_rx_reboot_count;
+#define TS2_RX_REBOOT_MAGIC 0x54325258U
+
 
 static const char *clock_state_to_string(app_clock_state_t state)
 {
@@ -70,7 +95,16 @@ static void diagnostics_task(void *arg)
     int64_t last_rx_progress_us = 0;
     bool rx_seen = false;
     bool stall_reported = false;
+    int64_t stable_rx_since_us = 0;
+    if (s_ts2_rx_reboot_magic != TS2_RX_REBOOT_MAGIC ||
+        s_ts2_rx_reboot_count > TS2_RX_MAX_REBOOTS) {
+        s_ts2_rx_reboot_magic = TS2_RX_REBOOT_MAGIC;
+        s_ts2_rx_reboot_count = 0;
+    }
     int64_t last_stall_snapshot_us = 0;
+#if TS2_B5_ONE_SHOT_RECOVERY
+    bool recovery_attempted = false;
+#endif
 
     while (true) {
         pps_service_status_t pps_status;
@@ -156,6 +190,7 @@ static void diagnostics_task(void *arg)
          * the RX callback or the frozen NTP/PTP timing path. */
         const int64_t rx_now_us = esp_timer_get_time();
         if (!eth_status.started || !eth_status.link_up || !eth_status.ipv4_ready) {
+            stable_rx_since_us = 0;
             rx_seen = false;
             stall_reported = false;
             last_stall_snapshot_us = 0;
@@ -165,6 +200,12 @@ static void diagnostics_task(void *arg)
             rx_seen = eth_status.diag_rx_frames != 0U;
             last_rx_progress_us = rx_now_us;
             previous_rx = eth_status.diag_rx_frames;
+            if (!stable_rx_since_us) stable_rx_since_us = rx_now_us;
+            if (rx_now_us - stable_rx_since_us >= TS2_RX_STABLE_CLEAR_US &&
+                s_ts2_rx_reboot_count != 0) {
+                ESP_LOGW(TAG, "TS2 RX watchdog: stable RX for 10min; clearing reboot budget");
+                s_ts2_rx_reboot_count = 0;
+            }
             if (stall_reported) {
                 ESP_LOGW(TAG, "eth-rx-stall: RECOVERED rx=%" PRIu32,
                          eth_status.diag_rx_frames);
@@ -173,6 +214,7 @@ static void diagnostics_task(void *arg)
             last_stall_snapshot_us = 0;
         } else if (rx_seen && !stall_reported &&
                    rx_now_us - last_rx_progress_us >= ETH_RX_STALL_THRESHOLD_US) {
+            stable_rx_since_us = 0;
             stall_reported = true;
             last_stall_snapshot_us = rx_now_us;
             ESP_LOGE(TAG,
@@ -188,7 +230,44 @@ static void diagnostics_task(void *arg)
                      eth_status.diag_rx_forward_fail);
             eth_service_diag_log_emac_snapshot();
             eth_service_diag_log_phy_snapshot();
-        } else if (rx_seen && stall_reported &&
+#if TS2_B5_ONE_SHOT_RECOVERY
+            if (!recovery_attempted) {
+                recovery_attempted = true; /* once per boot, even on failure */
+                ESP_LOGW(TAG, "B5: initiating one-shot diagnostic restart after RX stall");
+                esp_err_t restart_err = eth_service_diag_restart_driver();
+                ESP_LOGW(TAG, "B5: restart returned %s", esp_err_to_name(restart_err));
+            }
+#endif
+        }
+#if TS2_RX_AUTO_REBOOT
+        /* Avoid interpreting ordinary idle traffic as failure: require an
+         * established RX history, link+IPv4, and the TS2 hardware MAC.
+         * In this deployment periodic peer traffic is expected; 600s of RX
+         * silence is abnormal. This mitigation is deliberately TS2-only. */
+        static const uint8_t ts2_watchdog_mac[6] = {0xe8,0xf6,0x0a,0xe7,0x34,0x08};
+        if (rx_seen && stall_reported && eth_status.started &&
+            eth_status.link_up && eth_status.ipv4_ready &&
+            memcmp(eth_status.mac, ts2_watchdog_mac, sizeof(ts2_watchdog_mac)) == 0 &&
+            rx_now_us - last_rx_progress_us >= TS2_RX_REBOOT_AFTER_US &&
+            s_ts2_rx_reboot_count < TS2_RX_MAX_REBOOTS) {
+            ++s_ts2_rx_reboot_count;
+            ESP_LOGE(TAG, "TS2 RX watchdog: RX stalled >600s, reboot %" PRIu32 "/%u",
+                     s_ts2_rx_reboot_count, TS2_RX_MAX_REBOOTS);
+            /* Persist recovery reason before reboot; SD writes are asynchronous. */
+            char detail[OPERATIONS_EVENT_DETAIL_MAX + 1U];
+            (void)snprintf(detail, sizeof(detail),
+                           "TS2 RX stalled; reboot %" PRIu32 "/%u; rx=%" PRIu32,
+                           s_ts2_rx_reboot_count, TS2_RX_MAX_REBOOTS,
+                           eth_status.diag_rx_frames);
+            esp_err_t record_err = operations_history_record(
+                OPERATIONS_EVENT_RECOVERY, (int32_t)s_ts2_rx_reboot_count, detail);
+            if (record_err != ESP_OK) {
+                ESP_LOGE(TAG, "TS2 recovery NVS event failed: %s", esp_err_to_name(record_err));
+            }
+            esp_restart();
+        }
+#endif
+        if (rx_seen && stall_reported &&
                    rx_now_us - last_stall_snapshot_us >= 60000000LL) {
             /* Periodic read-only follow-up while RX remains stalled. */
             last_stall_snapshot_us = rx_now_us;

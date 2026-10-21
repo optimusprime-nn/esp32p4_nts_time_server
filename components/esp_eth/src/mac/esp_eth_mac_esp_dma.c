@@ -63,6 +63,7 @@ typedef struct {
     uint32_t copy_len;
 } __attribute__((packed)) emac_esp_dma_auto_buf_info_t;
 
+
 void emac_esp_dma_reset(emac_esp_dma_handle_t emac_esp_dma)
 {
     /* reset DMA descriptors */

@@ -50,6 +50,8 @@ typedef struct {
  */
 void emac_esp_dma_reset(emac_esp_dma_handle_t emac_esp_dma);
 
+
+
 /**
  * @brief Transmit data from buffer over EMAC
  *

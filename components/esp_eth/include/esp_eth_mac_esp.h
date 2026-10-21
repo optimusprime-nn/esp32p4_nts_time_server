@@ -508,3 +508,4 @@ uint32_t esp_eth_mac_get_ts_resolution(esp_eth_mac_t *mac);
 #ifdef __cplusplus
 }
 #endif
+

@@ -402,25 +402,33 @@ err:
     return ret;
 }
 
+/* B6A: propagate MAC start/stop failures to the PHY/driver state machine.
+ * The previous implementation discarded both return codes and always
+ * reported ESP_OK, masking a possible EMAC stop timeout during B5. */
 static esp_err_t emac_esp32_set_link(esp_eth_mac_t *mac, eth_link_t link)
 {
-    esp_err_t ret = ESP_OK;
+    esp_err_t ret;
     switch (link) {
     case ETH_LINK_UP:
-        emac_esp32_start(mac);
-        ESP_LOGD(TAG, "emac started");
-        break;
+        ret = emac_esp32_start(mac);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "B6A: MAC start failed: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "B6A: MAC start succeeded");
+        }
+        return ret;
     case ETH_LINK_DOWN:
-        emac_esp32_stop(mac);
-        ESP_LOGD(TAG, "emac stopped");
-        break;
+        ret = emac_esp32_stop(mac);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "B6A: MAC stop failed: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "B6A: MAC stop succeeded");
+        }
+        return ret;
     default:
-        ESP_GOTO_ON_FALSE(false, ESP_ERR_INVALID_ARG, err, TAG, "unknown link status");
-        break;
+        ESP_LOGE(TAG, "B6A: invalid MAC link state %d", (int)link);
+        return ESP_ERR_INVALID_ARG;
     }
-    return ESP_OK;
-err:
-    return ret;
 }
 
 static esp_err_t emac_esp32_set_speed(esp_eth_mac_t *mac, eth_speed_t speed)
@@ -590,12 +598,18 @@ static esp_err_t emac_esp32_transmit_ctrl_vargs(esp_eth_mac_t *mac, void *ctrl, 
  * Never read poll-demand registers, touch descriptor memory, or call HAL
  * helpers that clear pending interrupts from this diagnostic path.
  */
+
 bool esp_eth_rx_hw_diag_snapshot(esp_eth_mac_t *mac, esp_eth_rx_hw_diag_t *out)
 {
 #if CONFIG_IDF_TARGET_ESP32P4
     if (mac == NULL || out == NULL) {
         return false;
     }
+    /* TS2_B6D: snapshot controller state before other diagnostic registers. */
+    emac_esp32_t *emac = __containerof(mac, emac_esp32_t, parent);
+    out->mac_debug = emac_ll_read_debug_reg(emac->hal.mac_regs);
+    out->tx_frame_ctrl_state = emac_ll_transmit_frame_ctrl_status(emac->hal.mac_regs);
+    out->rx_fifo_read_state = emac_ll_receive_read_ctrl_state(emac->hal.mac_regs);
     out->mac_config = REG_READ(EMAC_MACCONFIGURATION_REG);
     out->dma_status = REG_READ(EMAC_STATUS_REG);
     out->dma_operation_mode = REG_READ(EMAC_OPERATIONMODE_REG);
@@ -620,6 +634,7 @@ bool esp_eth_rx_diag_snapshot(esp_eth_mac_t *mac, esp_eth_rx_diag_t *out)
     /* Independent 32-bit atomic loads: approximate snapshot, no DMA traversal. */
 #define RX_DIAG_LOAD(field) out->field = __atomic_load_n(&emac->rx_diag.field, __ATOMIC_RELAXED)
     RX_DIAG_LOAD(rx_irq);
+    RX_DIAG_LOAD(rx_poll_timeout);
     RX_DIAG_LOAD(rx_wakeup);
     RX_DIAG_LOAD(rx_frame);
     RX_DIAG_LOAD(rx_alloc_fail);
@@ -799,6 +814,10 @@ static esp_err_t emac_esp32_stop(esp_eth_mac_t *mac)
         to += 25;
         esp_rom_delay_us(25);
     } while (to < MAC_STOP_TIMEOUT_US);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "EMAC stop failed after %" PRId32
+                 " us, last_err=%s (%d)", to, esp_err_to_name(ret), (int)ret);
+    }
     return ret;
 }
 
