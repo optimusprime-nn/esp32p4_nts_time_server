@@ -12,10 +12,13 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
+
+#include "lwip/sockets.h"
 
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/pk.h"
@@ -31,6 +34,10 @@ static const char *TAG = "NTS_KE";
 #define NTS_KE_RESPONSE_MAX                 4096U
 #define NTS_KE_COOKIE_COUNT                    8U
 #define NTS_KE_COOKIE_LIFETIME_SECONDS     86400ULL
+/* Absolute budget for one connection: handshake, request, response and
+ * close_notify together. Connections are served one at a time, so this
+ * bounds how long a slow or hostile client can deny NTS-KE to others. */
+#define NTS_KE_CONNECTION_DEADLINE_MS       5000U
 
 #define NTS_KE_CRITICAL_BIT                0x8000U
 #define NTS_KE_RECORD_END_OF_MESSAGE       0x0000U
@@ -62,6 +69,11 @@ typedef struct {
     bool aes_siv_offered;
     uint16_t protocol_error;
 } nts_ke_request_state_t;
+
+typedef struct {
+    mbedtls_net_context *net;
+    int64_t deadline_us;
+} nts_ke_connection_t;
 
 static TaskHandle_t s_task;
 static volatile bool s_running;
@@ -401,13 +413,95 @@ static esp_err_t build_success_response(mbedtls_ssl_context *ssl,
     return err;
 }
 
+static bool connection_expired(const nts_ke_connection_t *connection)
+{
+    return esp_timer_get_time() >= connection->deadline_us;
+}
+
+static uint32_t connection_remaining_ms(const nts_ke_connection_t *connection)
+{
+    const int64_t remaining_us =
+        connection->deadline_us - esp_timer_get_time();
+
+    if (remaining_us <= 0) {
+        return 0U;
+    }
+
+    /* Round up so a sub-millisecond remainder is not treated as "block
+     * forever" (0) by mbedtls_net_recv_timeout(). */
+    return (uint32_t)((remaining_us + 999) / 1000);
+}
+
+/* BIO send: refuse once the connection deadline has passed, and bound each
+ * blocking send to the remaining budget so a peer that never drains its
+ * receive window cannot hold the task past the deadline. */
+static int connection_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    nts_ke_connection_t *connection = (nts_ke_connection_t *)ctx;
+    const uint32_t remaining_ms = connection_remaining_ms(connection);
+
+    if (remaining_ms == 0U) {
+        return MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+
+    const struct timeval timeout = {
+        .tv_sec = remaining_ms / 1000U,
+        .tv_usec = (remaining_ms % 1000U) * 1000U,
+    };
+    (void)setsockopt(connection->net->fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &timeout, sizeof(timeout));
+
+    return mbedtls_net_send(connection->net, buf, len);
+}
+
+/* BIO receive: never wait past the connection deadline, whatever per-read
+ * timeout mbedTLS asks for. */
+static int connection_recv_timeout(void *ctx,
+                                   unsigned char *buf,
+                                   size_t len,
+                                   uint32_t timeout_ms)
+{
+    nts_ke_connection_t *connection = (nts_ke_connection_t *)ctx;
+    const uint32_t remaining_ms = connection_remaining_ms(connection);
+
+    if (remaining_ms == 0U) {
+        return MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+
+    if (timeout_ms == 0U || timeout_ms > remaining_ms) {
+        timeout_ms = remaining_ms;
+    }
+
+    return mbedtls_net_recv_timeout(connection->net, buf, len, timeout_ms);
+}
+
+static void connection_set_socket_timeouts(mbedtls_net_context *client)
+{
+    const struct timeval timeout = {
+        .tv_sec = NTS_KE_CONNECTION_DEADLINE_MS / 1000U,
+        .tv_usec = (NTS_KE_CONNECTION_DEADLINE_MS % 1000U) * 1000U,
+    };
+
+    (void)setsockopt(client->fd, SOL_SOCKET, SO_SNDTIMEO,
+                     &timeout, sizeof(timeout));
+    (void)setsockopt(client->fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+}
+
 static esp_err_t tls_write_all(mbedtls_ssl_context *ssl,
+                               const nts_ke_connection_t *connection,
                                const uint8_t *data,
                                size_t length)
 {
     size_t sent = 0U;
 
     while (sent < length) {
+        if (connection_expired(connection)) {
+            stats_increment(&s_stats.deadline_expirations);
+            ESP_LOGW(TAG, "TLS write abandoned: connection deadline expired");
+            return ESP_ERR_TIMEOUT;
+        }
+
         const int ret = mbedtls_ssl_write(ssl, data + sent, length - sent);
 
         if (ret > 0) {
@@ -420,6 +514,12 @@ static esp_err_t tls_write_all(mbedtls_ssl_context *ssl,
             continue;
         }
 
+        if (ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+            stats_increment(&s_stats.deadline_expirations);
+            ESP_LOGW(TAG, "TLS write abandoned: connection deadline expired");
+            return ESP_ERR_TIMEOUT;
+        }
+
         ESP_LOGE(TAG, "TLS write failed: -0x%x", -ret);
         return ESP_FAIL;
     }
@@ -428,17 +528,25 @@ static esp_err_t tls_write_all(mbedtls_ssl_context *ssl,
 }
 
 static esp_err_t tls_read_request(mbedtls_ssl_context *ssl,
+                                  const nts_ke_connection_t *connection,
                                   uint8_t *request,
                                   size_t request_size,
                                   size_t *request_len)
 {
-    if (ssl == NULL || request == NULL || request_len == NULL) {
+    if (ssl == NULL || connection == NULL ||
+        request == NULL || request_len == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
     *request_len = 0U;
 
     while (*request_len < request_size) {
+        if (connection_expired(connection)) {
+            stats_increment(&s_stats.deadline_expirations);
+            ESP_LOGW(TAG, "TLS read abandoned: connection deadline expired");
+            return ESP_ERR_TIMEOUT;
+        }
+
         const int ret = mbedtls_ssl_read(
             ssl,
             request + *request_len,
@@ -479,6 +587,12 @@ static esp_err_t tls_read_request(mbedtls_ssl_context *ssl,
             return ESP_ERR_INVALID_RESPONSE;
         }
 
+        if (ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+            stats_increment(&s_stats.deadline_expirations);
+            ESP_LOGW(TAG, "TLS read abandoned: connection deadline expired");
+            return ESP_ERR_TIMEOUT;
+        }
+
         ESP_LOGW(TAG, "TLS read failed: -0x%x", -ret);
         return ESP_FAIL;
     }
@@ -486,14 +600,20 @@ static esp_err_t tls_read_request(mbedtls_ssl_context *ssl,
     return ESP_ERR_INVALID_SIZE;
 }
 
-static void close_tls_session(mbedtls_ssl_context *ssl)
+/* close_notify is a courtesy: send it only while the connection still has
+ * budget, and never spin on a peer that will not drain its receive window. */
+static void close_tls_session(mbedtls_ssl_context *ssl,
+                              const nts_ke_connection_t *connection)
 {
-    if (ssl == NULL) {
+    if (ssl == NULL || connection == NULL) {
         return;
     }
 
     int ret;
     do {
+        if (connection_expired(connection)) {
+            return;
+        }
         ret = mbedtls_ssl_close_notify(ssl);
     } while (ret == MBEDTLS_ERR_SSL_WANT_READ ||
              ret == MBEDTLS_ERR_SSL_WANT_WRITE);
@@ -502,6 +622,14 @@ static void close_tls_session(mbedtls_ssl_context *ssl)
 static void handle_client(mbedtls_net_context *client,
                           mbedtls_ssl_config *config)
 {
+    nts_ke_connection_t connection = {
+        .net = client,
+        .deadline_us = esp_timer_get_time() +
+                       ((int64_t)NTS_KE_CONNECTION_DEADLINE_MS * 1000LL),
+    };
+
+    connection_set_socket_timeouts(client);
+
     mbedtls_ssl_context ssl;
     mbedtls_ssl_init(&ssl);
 
@@ -512,18 +640,26 @@ static void handle_client(mbedtls_net_context *client,
         return;
     }
 
-    mbedtls_ssl_set_bio(&ssl, client,
-                        mbedtls_net_send,
-                        mbedtls_net_recv,
-                        mbedtls_net_recv_timeout);
+    mbedtls_ssl_set_bio(&ssl, &connection,
+                        connection_send,
+                        NULL,
+                        connection_recv_timeout);
 
     while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
-            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ ||
+             ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            !connection_expired(&connection)) {
             continue;
         }
 
-        ESP_LOGW(TAG, "TLS handshake failed: -0x%x", -ret);
+        if (ret == MBEDTLS_ERR_SSL_TIMEOUT ||
+            ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            stats_increment(&s_stats.deadline_expirations);
+            ESP_LOGW(TAG, "TLS handshake abandoned: connection deadline expired");
+        } else {
+            ESP_LOGW(TAG, "TLS handshake failed: -0x%x", -ret);
+        }
         stats_increment(&s_stats.tls_handshake_failures);
         mbedtls_ssl_free(&ssl);
         return;
@@ -533,14 +669,14 @@ static void handle_client(mbedtls_net_context *client,
     if (alpn == NULL || strcmp(alpn, "ntske/1") != 0) {
         ESP_LOGW(TAG, "Rejecting connection without ntske/1 ALPN");
         stats_increment(&s_stats.alpn_rejections);
-        close_tls_session(&ssl);
+        close_tls_session(&ssl, &connection);
         mbedtls_ssl_free(&ssl);
         return;
     }
 
     uint8_t request[NTS_KE_REQUEST_MAX];
     size_t request_len = 0U;
-    esp_err_t err = tls_read_request(&ssl, request, sizeof(request),
+    esp_err_t err = tls_read_request(&ssl, &connection, request, sizeof(request),
                                      &request_len);
 
     uint8_t response[NTS_KE_RESPONSE_MAX];
@@ -578,7 +714,7 @@ static void handle_client(mbedtls_net_context *client,
 
     if (response_len > 0U) {
         const esp_err_t write_err =
-            tls_write_all(&ssl, response, response_len);
+            tls_write_all(&ssl, &connection, response, response_len);
 
         if (write_err == ESP_OK) {
             stats_increment(&s_stats.exchanges_completed);
@@ -596,7 +732,7 @@ static void handle_client(mbedtls_net_context *client,
     nts_storage_zeroize(request, sizeof(request));
     nts_storage_zeroize(response, sizeof(response));
 
-    close_tls_session(&ssl);
+    close_tls_session(&ssl, &connection);
     mbedtls_ssl_free(&ssl);
 }
 
@@ -654,7 +790,9 @@ static esp_err_t configure_tls(mbedtls_ssl_config *config,
     mbedtls_ssl_conf_min_tls_version(config, MBEDTLS_SSL_VERSION_TLS1_3);
     mbedtls_ssl_conf_max_tls_version(config, MBEDTLS_SSL_VERSION_TLS1_3);
     mbedtls_ssl_conf_authmode(config, MBEDTLS_SSL_VERIFY_NONE);
-    mbedtls_ssl_conf_read_timeout(config, 10000U);
+    /* Per-read cap; connection_recv_timeout() further limits every read to
+     * what remains of the per-connection deadline. */
+    mbedtls_ssl_conf_read_timeout(config, NTS_KE_CONNECTION_DEADLINE_MS);
 
     ret = mbedtls_ssl_conf_alpn_protocols(config, NTS_ALPN_PROTOCOLS);
     if (ret != 0) {

@@ -39,6 +39,12 @@ static const char *TAG = "ETH";
 #define ETH_PTP_CORRELATION_MAX_AGE_US          30000000LL
 #define ETH_PTP_LOCAL_MAP_MAX_BRACKET_NS          250000ULL
 #define ETH_NTP_TX_COMPENSATION_NS                    98941ULL
+/* A queued RX timestamp older than this cannot belong to the request now
+ * being served: legitimate queueing is sub-millisecond, while the shortest
+ * client poll interval is seconds. Older entries are left behind by frames
+ * lwIP dropped after the MAC stamped them. */
+#define ETH_NTP_RX_MAX_AGE_NS                     100000000ULL
+#define ETH_HOT_PATH_LOG_INTERVAL_US               10000000LL
 
 static esp_eth_handle_t s_eth_handle;
 static esp_eth_mac_t *s_eth_mac;
@@ -94,6 +100,21 @@ static uint32_t read_be32(const uint8_t *p)
 }
 
 static bool eth_frame_is_ipv4_udp_ntp_response(const uint8_t *buffer, size_t length);
+
+/* Per-packet paths must never block on the console UART. Failures there are
+ * counted in s_status; this gates the occasional human-readable warning. */
+static bool eth_hot_path_log_allowed(int64_t *last_log_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    if (*last_log_us != 0 &&
+        (now_us - *last_log_us) < ETH_HOT_PATH_LOG_INTERVAL_US) {
+        return false;
+    }
+
+    *last_log_us = now_us;
+    return true;
+}
 
 static void write_be16(uint8_t *p, uint16_t value)
 {
@@ -597,13 +618,20 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
     }
     portEXIT_CRITICAL(&s_eth_lock);
 
+    /* This runs in the lwIP thread for every NTP response. Diagnostics are
+     * DEBUG level (compiled out at the default INFO maximum); failures are
+     * counted above and only warned about at a bounded rate. */
+    static int64_t s_tx_warn_log_us;
+
     if (tx_err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "HW TX NTP transmit failed: n=%" PRIu32 " err=%s",
-                 sample,
-                 esp_err_to_name(tx_err));
+        if (eth_hot_path_log_allowed(&s_tx_warn_log_us)) {
+            ESP_LOGW(TAG,
+                     "HW TX NTP transmit failed: n=%" PRIu32 " err=%s",
+                     sample,
+                     esp_err_to_name(tx_err));
+        }
     } else if (timestamp_valid) {
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "HW TX NTP timestamp: n=%" PRIu32
                  " ptp=%" PRIu32 ".%09" PRIu32,
                  sample,
@@ -626,7 +654,7 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
             const int64_t delta_ns =
                 (int64_t)software_xmt_ns - (int64_t)hw_tx_utc_ns;
 
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare: n=%" PRIu32
                      " xmt-hw=%" PRId64
                      " ns map_bracket=%" PRIu32 " ns age=%" PRIu32 " us",
@@ -641,30 +669,30 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
                 const int64_t late_delta_ns =
                     (int64_t)late_sw_ns - (int64_t)hw_tx_utc_ns;
 
-                ESP_LOGI(TAG,
+                ESP_LOGD(TAG,
                          "HW TX late compare: n=%" PRIu32
                          " late-hw=%" PRId64 " ns stamped=%u",
                          sample,
                          late_delta_ns,
                          late_stamp_applied ? 1U : 0U);
             } else {
-                ESP_LOGW(TAG,
+                ESP_LOGD(TAG,
                          "HW TX late compare unavailable: n=%" PRIu32
                          " disciplined UTC unavailable",
                          sample);
             }
         } else if (!xmt_valid) {
-            ESP_LOGW(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare unavailable: n=%" PRIu32
                      " serialized XMT unavailable",
                      sample);
         } else {
-            ESP_LOGW(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare unavailable: n=%" PRIu32
                      " PTP/UTC mapping unavailable",
                      sample);
         }
-    } else {
+    } else if (eth_hot_path_log_allowed(&s_tx_warn_log_us)) {
         ESP_LOGW(TAG,
                  "HW TX NTP timestamp invalid: n=%" PRIu32,
                  sample);
@@ -763,14 +791,17 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
     }
     portEXIT_CRITICAL(&s_eth_lock);
 
+    /* EMAC RX task context: never block every NTP frame on the console. */
     if (is_ntp) {
+        static int64_t s_rx_warn_log_us;
+
         if (timestamp_valid) {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "HW RX NTP timestamp: n=%" PRIu32 " ptp=%" PRIu32 ".%09" PRIu32,
                      ntp_sample,
                      timestamp->seconds,
                      timestamp->nanoseconds);
-        } else {
+        } else if (eth_hot_path_log_allowed(&s_rx_warn_log_us)) {
             ESP_LOGW(TAG,
                      "HW RX NTP timestamp invalid: n=%" PRIu32,
                      ntp_sample);
@@ -1362,14 +1393,41 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
     eth_mac_time_t rx_ptp = {0};
     bool found = false;
 
+    /* Reference instant for discarding stale queue entries. A frame stamped
+     * after this read has a later PTP time and is never considered stale. */
+    eth_mac_time_t scan_ptp_now = {0};
+    if (esp_eth_mac_get_ptp_time(s_eth_mac, &scan_ptp_now) != ESP_OK) {
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.rx_hw_map_failures++;
+        portEXIT_CRITICAL(&s_eth_lock);
+        return false;
+    }
+    const uint64_t scan_ptp_now_ns = ptp_timestamp_to_ns(&scan_ptp_now);
+
     portENTER_CRITICAL(&s_eth_lock);
-    /* Oldest matching entry wins. With a 16-entry queue this bounded scan is
-     * short and prevents two clients from stealing one another's timestamps. */
+    /* Purge every entry older than ETH_NTP_RX_MAX_AGE_NS, whatever its
+     * client: those frames were dropped above the MAC (e.g. lwIP mailbox
+     * full) and would otherwise hand a seconds-old T2 to a later request
+     * reusing the same address/port (ntpd's fixed source port 123, NAT).
+     * Among the remaining entries the oldest match wins, so back-to-back
+     * requests from one client are consumed in arrival order. */
     uint32_t best_index = 0U;
     uint32_t best_sequence = UINT32_MAX;
     for (uint32_t index = 0U; index < ETH_NTP_RX_QUEUE_SIZE; index++) {
-        const eth_ntp_rx_queue_entry_t *entry = &s_ntp_rx_queue[index];
-        if (entry->valid && entry->client_ipv4 == client_ipv4 &&
+        eth_ntp_rx_queue_entry_t *entry = &s_ntp_rx_queue[index];
+        if (!entry->valid) {
+            continue;
+        }
+
+        const uint64_t entry_ns = ptp_timestamp_to_ns(&entry->ptp_time);
+        if (entry_ns < scan_ptp_now_ns &&
+            (scan_ptp_now_ns - entry_ns) > ETH_NTP_RX_MAX_AGE_NS) {
+            entry->valid = false;
+            s_status.rx_hw_queue_stale_purges++;
+            continue;
+        }
+
+        if (entry->client_ipv4 == client_ipv4 &&
             entry->client_port == client_port && entry->sequence < best_sequence) {
             best_index = index;
             best_sequence = entry->sequence;

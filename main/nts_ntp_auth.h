@@ -22,6 +22,10 @@ typedef struct {
     size_t request_length;
     nts_cookie_keys_t keys;
     bool authenticated;
+    /* Set by nts_ntp_auth_prepare_response(): the fresh-cookie plaintext is
+     * staged in the module's static buffer (single NTP task owner). */
+    bool response_prepared;
+    size_t prepared_plaintext_len;
 } nts_ntp_auth_context_t;
 
 typedef struct {
@@ -39,6 +43,13 @@ esp_err_t nts_ntp_auth_verify_request(
     size_t packet_len,
     nts_ntp_auth_context_t *context);
 
+/* Generates the 1+k fresh cookies for an authenticated request. Call before
+ * the response transmit timestamp is sampled: this is the costly part of
+ * response protection and does not depend on the NTP header. */
+esp_err_t nts_ntp_auth_prepare_response(nts_ntp_auth_context_t *context);
+
+/* Appends the UID and Authenticator over the already-built NTP header. The
+ * context must have been prepared with nts_ntp_auth_prepare_response(). */
 esp_err_t nts_ntp_auth_protect_response(
     const nts_ntp_auth_context_t *context,
     uint8_t *packet,

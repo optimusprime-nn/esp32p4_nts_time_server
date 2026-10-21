@@ -53,6 +53,7 @@ typedef struct {
     uint32_t rx_hw_queue_overruns;
     uint32_t rx_hw_queue_matches;
     uint32_t rx_hw_queue_misses;
+    uint32_t rx_hw_queue_stale_purges;
     uint32_t rx_hw_map_successes;
     uint32_t rx_hw_map_failures;
     uint32_t rx_hw_last_map_bracket_ns;

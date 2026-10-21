@@ -28,6 +28,7 @@
 #define APP_NTP_TASK_STACK_SIZE                 6144U
 #define APP_NTP_TASK_PRIORITY                   12U
 #define APP_NTP_RECEIVE_TIMEOUT_SECONDS         1U
+#define APP_NTP_HOT_PATH_LOG_INTERVAL_US        10000000LL
 
 static const char *TAG = "NTP";
 
@@ -51,6 +52,22 @@ typedef struct {
 
 static ntp_timing_sums_t s_timing_sums;
 static int64_t s_hw_rx_delta_sum_ns;
+
+/* The request loop must never block on the console UART, and remote peers
+ * can trigger every failure path at will. Failures are counted in s_status;
+ * this gates the occasional human-readable warning. NTP-task context only. */
+static bool hot_path_log_allowed(int64_t *last_log_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    if (*last_log_us != 0 &&
+        (now_us - *last_log_us) < APP_NTP_HOT_PATH_LOG_INTERVAL_US) {
+        return false;
+    }
+
+    *last_log_us = now_us;
+    return true;
+}
 
 static uint32_t clamp_duration_us(int64_t start_us, int64_t end_us)
 {
@@ -161,7 +178,7 @@ static void ntp_status_record_hw_rx_comparison(
     const int64_t max_ns = s_status.hw_rx_delta_max_ns;
     portEXIT_CRITICAL(&s_ntp_lock);
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "HW RX compare: n=%" PRIu32 " sw-hw=%" PRId64
              " ns min/avg/max=%" PRId64 "/%" PRId64 "/%" PRId64
              " ns map_bracket=%" PRIu32 " ns age=%" PRIu32 " us",
@@ -585,6 +602,10 @@ static void ntp_server_task(void *arg)
 
         ESP_LOGI(TAG, "NTP UDP server listening on port %u", NTP_PORT);
 
+        static int64_t s_auth_warn_log_us;
+        static int64_t s_hw_rx_warn_log_us;
+        static int64_t s_protect_warn_log_us;
+
         while (true) {
             struct sockaddr_in client_address;
             socklen_t client_length = sizeof(client_address);
@@ -668,9 +689,11 @@ static void ntp_server_task(void *arg)
                     &nts_context);
 
                 if (nts_err != ESP_OK) {
-                    ESP_LOGW(TAG,
-                             "NTS request authentication failed: %s",
-                             esp_err_to_name(nts_err));
+                    if (hot_path_log_allowed(&s_auth_warn_log_us)) {
+                        ESP_LOGW(TAG,
+                                 "NTS request authentication failed: %s",
+                                 esp_err_to_name(nts_err));
+                    }
                     nts_ntp_auth_clear_context(&nts_context);
                     ntp_status_record_invalid_request();
                     continue;
@@ -724,7 +747,9 @@ static void ntp_server_task(void *arg)
             if (!hw_rx_available) {
                 nts_ntp_auth_clear_context(&nts_context);
                 ntp_status_record_hw_rx_authority_drop();
-                ESP_LOGW(TAG, "HW RX authority unavailable; dropping NTP request");
+                if (hot_path_log_allowed(&s_hw_rx_warn_log_us)) {
+                    ESP_LOGW(TAG, "HW RX authority unavailable; dropping NTP request");
+                }
                 continue;
             }
 
@@ -736,6 +761,26 @@ static void ntp_server_task(void *arg)
                 .fraction = hw_rx_timestamp.fraction,
             };
             ntp_status_record_hw_rx_authoritative();
+
+            /* Fresh cookie generation is the expensive part of NTS response
+             * protection and does not depend on the response header, so do
+             * it before build_server_response() samples T3. Only the final
+             * AES-SIV pass over header+UID+cookies remains after T3. */
+            if (nts_request) {
+                const esp_err_t nts_err =
+                    nts_ntp_auth_prepare_response(&nts_context);
+
+                if (nts_err != ESP_OK) {
+                    if (hot_path_log_allowed(&s_protect_warn_log_us)) {
+                        ESP_LOGW(TAG,
+                                 "NTS cookie preparation failed: %s",
+                                 esp_err_to_name(nts_err));
+                    }
+                    nts_ntp_auth_clear_context(&nts_context);
+                    ntp_status_record_send_failure();
+                    continue;
+                }
+            }
 
             uint8_t stratum = NTP_STRATUM_UNSYNCED;
             uint8_t leap = NTP_LI_UNSYNCED;
@@ -768,9 +813,11 @@ static void ntp_server_task(void *arg)
                     &response_length);
 
                 if (nts_err != ESP_OK) {
-                    ESP_LOGW(TAG,
-                             "NTS response protection failed: %s",
-                             esp_err_to_name(nts_err));
+                    if (hot_path_log_allowed(&s_protect_warn_log_us)) {
+                        ESP_LOGW(TAG,
+                                 "NTS response protection failed: %s",
+                                 esp_err_to_name(nts_err));
+                    }
                     nts_ntp_auth_clear_context(&nts_context);
                     ntp_status_record_send_failure();
                     continue;

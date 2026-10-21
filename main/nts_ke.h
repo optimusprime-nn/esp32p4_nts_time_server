@@ -15,6 +15,7 @@ typedef struct {
     uint32_t alpn_rejections;
     uint32_t exchanges_completed;
     uint32_t exchange_failures;
+    uint32_t deadline_expirations;
 } nts_ke_stats_t;
 
 esp_err_t nts_ke_start(void);
