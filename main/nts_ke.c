@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,11 +12,13 @@
 #include "nts_storage.h"
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 
@@ -31,8 +34,25 @@
 static const char *TAG = "NTS_KE";
 
 #define NTS_KE_PORT                         "4460"
-#define NTS_KE_TASK_STACK_SIZE              24576U
+/* Acceptor: self-test, keyring setup, certificate load/reload and accept. */
+#define NTS_KE_TASK_STACK_SIZE              16384U
 #define NTS_KE_TASK_PRIORITY                    5U
+/* Connections are served by a small worker pool so one slow client cannot
+ * block NTS-KE for others. Each worker runs one TLS session at a time
+ * (stack: handshake plus 6 KB of request/response buffers). */
+#define NTS_KE_WORKERS                          3U
+#define NTS_KE_WORKER_STACK_SIZE            20480U
+/* Accepted connections waiting for a free worker; beyond this they are
+ * closed immediately. Their 5 s deadline already runs while queued. */
+#define NTS_KE_JOB_QUEUE_LENGTH                 2U
+#define NTS_KE_MAX_CONNECTIONS_PER_IP           2U
+/* One slot per connection that can be in flight at once: every worker busy,
+ * the backlog full, and one more being admitted by the acceptor. */
+#define NTS_KE_CLIENT_SLOTS \
+    (NTS_KE_WORKERS + NTS_KE_JOB_QUEUE_LENGTH + 1U)
+/* Internal heap that must remain free to admit an additional parallel
+ * session (~40 KB per TLS 1.3 session plus headroom for HTTPS/lwIP). */
+#define NTS_KE_MIN_FREE_INTERNAL_BYTES      (72U * 1024U)
 #define NTS_KE_REQUEST_MAX                  2048U
 #define NTS_KE_RESPONSE_MAX                 4096U
 #define NTS_KE_COOKIE_COUNT                    8U
@@ -88,10 +108,36 @@ typedef struct {
     mbedtls_x509_crt certificate;
     mbedtls_pk_context private_key;
     uint8_t certificate_digest[NTS_KE_CERT_DIGEST_LEN];
+    /* Connections using this bundle; guarded by s_tls_lock. */
+    uint32_t refs;
 } nts_ke_tls_bundle_t;
+
+/* One accepted connection handed from the acceptor to a worker. */
+typedef struct {
+    mbedtls_net_context client;
+    uint8_t ip[16];
+    size_t ip_len;
+    int64_t accepted_us;
+    nts_ke_tls_bundle_t *tls;
+} nts_ke_job_t;
+
+typedef struct {
+    uint8_t ip[16];
+    size_t ip_len;
+    uint32_t active;
+} nts_ke_client_slot_t;
 
 static TaskHandle_t s_task;
 static volatile bool s_running;
+
+static portMUX_TYPE s_tls_lock = portMUX_INITIALIZER_UNLOCKED;
+static nts_ke_tls_bundle_t *s_tls_active;
+
+static QueueHandle_t s_jobs;
+static uint32_t s_active_connections;
+
+static portMUX_TYPE s_clients_lock = portMUX_INITIALIZER_UNLOCKED;
+static nts_ke_client_slot_t s_clients[NTS_KE_CLIENT_SLOTS];
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static nts_ke_stats_t s_stats;
 
@@ -112,6 +158,8 @@ void nts_ke_get_stats(nts_ke_stats_t *stats)
     *stats = s_stats;
     stats->running = s_running;
     portEXIT_CRITICAL(&s_stats_lock);
+    stats->active_connections =
+        __atomic_load_n(&s_active_connections, __ATOMIC_RELAXED);
 }
 
 static uint16_t read_u16(const uint8_t *p)
@@ -634,12 +682,15 @@ static void close_tls_session(mbedtls_ssl_context *ssl,
              ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 }
 
+/* The connection deadline runs from accept(), so time spent waiting in the
+ * worker queue counts against the same 5 s budget. */
 static void handle_client(mbedtls_net_context *client,
-                          mbedtls_ssl_config *config)
+                          mbedtls_ssl_config *config,
+                          int64_t accepted_us)
 {
     nts_ke_connection_t connection = {
         .net = client,
-        .deadline_us = esp_timer_get_time() +
+        .deadline_us = accepted_us +
                        ((int64_t)NTS_KE_CONNECTION_DEADLINE_MS * 1000LL),
     };
 
@@ -901,15 +952,53 @@ static esp_err_t tls_bundle_load(const uint8_t *current_digest,
     return ESP_OK;
 }
 
-/* ACME renewals replace the stored production certificate without telling
- * this task. Re-check periodically, between connections, and swap in a new
- * TLS config when the certificate has changed. On any failure the current
- * (still valid until expiry) bundle stays in service. */
-static void tls_bundle_maybe_reload(nts_ke_tls_bundle_t **active)
+/*
+ * The active TLS bundle is shared by all workers. Each connection holds a
+ * reference for its lifetime; a bundle replaced by a certificate reload is
+ * freed when its last connection finishes.
+ */
+static nts_ke_tls_bundle_t *tls_bundle_acquire(void)
 {
+    portENTER_CRITICAL(&s_tls_lock);
+    nts_ke_tls_bundle_t *bundle = s_tls_active;
+    if (bundle != NULL) {
+        bundle->refs++;
+    }
+    portEXIT_CRITICAL(&s_tls_lock);
+    return bundle;
+}
+
+static void tls_bundle_release(nts_ke_tls_bundle_t *bundle)
+{
+    if (bundle == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_tls_lock);
+    bundle->refs--;
+    const bool free_now = bundle->refs == 0U && bundle != s_tls_active;
+    portEXIT_CRITICAL(&s_tls_lock);
+
+    if (free_now) {
+        tls_bundle_free(bundle);
+    }
+}
+
+/* ACME renewals replace the stored production certificate without telling
+ * this task. Re-check periodically and swap in a new TLS config when the
+ * certificate has changed; connections already running keep the old one.
+ * On any failure the current (still valid until expiry) bundle stays. */
+static void tls_bundle_maybe_reload(void)
+{
+    nts_ke_tls_bundle_t *current = tls_bundle_acquire();
+    if (current == NULL) {
+        return;
+    }
+
     nts_ke_tls_bundle_t *replacement = NULL;
     const esp_err_t err =
-        tls_bundle_load((*active)->certificate_digest, &replacement);
+        tls_bundle_load(current->certificate_digest, &replacement);
+    tls_bundle_release(current);
 
     if (err == ESP_ERR_NOT_FINISHED) {
         return;
@@ -921,10 +1010,139 @@ static void tls_bundle_maybe_reload(nts_ke_tls_bundle_t **active)
         return;
     }
 
-    tls_bundle_free(*active);
-    *active = replacement;
+    portENTER_CRITICAL(&s_tls_lock);
+    nts_ke_tls_bundle_t *old = s_tls_active;
+    s_tls_active = replacement;
+    const bool free_old = old != NULL && old->refs == 0U;
+    portEXIT_CRITICAL(&s_tls_lock);
+
+    if (free_old) {
+        tls_bundle_free(old);
+    }
+
     stats_increment(&s_stats.certificate_reloads);
     ESP_LOGI(TAG, "NTS-KE TLS certificate reloaded after renewal");
+}
+
+/* Concurrent connections per client address. A NAT can put several real
+ * clients behind one address, so the cap is small but above one. */
+static bool client_slot_acquire(const uint8_t *ip, size_t ip_len)
+{
+    bool admitted = false;
+    nts_ke_client_slot_t *free_slot = NULL;
+
+    portENTER_CRITICAL(&s_clients_lock);
+    for (size_t i = 0U; i < NTS_KE_CLIENT_SLOTS; i++) {
+        nts_ke_client_slot_t *slot = &s_clients[i];
+        if (slot->active == 0U) {
+            if (free_slot == NULL) {
+                free_slot = slot;
+            }
+            continue;
+        }
+        if (slot->ip_len == ip_len && memcmp(slot->ip, ip, ip_len) == 0) {
+            if (slot->active < NTS_KE_MAX_CONNECTIONS_PER_IP) {
+                slot->active++;
+                admitted = true;
+            }
+            portEXIT_CRITICAL(&s_clients_lock);
+            return admitted;
+        }
+    }
+
+    /* There is one slot per possible in-flight connection, so a free slot
+     * always exists here. */
+    if (free_slot != NULL) {
+        memcpy(free_slot->ip, ip, ip_len);
+        free_slot->ip_len = ip_len;
+        free_slot->active = 1U;
+        admitted = true;
+    }
+    portEXIT_CRITICAL(&s_clients_lock);
+    return admitted;
+}
+
+static void client_slot_release(const uint8_t *ip, size_t ip_len)
+{
+    portENTER_CRITICAL(&s_clients_lock);
+    for (size_t i = 0U; i < NTS_KE_CLIENT_SLOTS; i++) {
+        nts_ke_client_slot_t *slot = &s_clients[i];
+        if (slot->active != 0U && slot->ip_len == ip_len &&
+            memcmp(slot->ip, ip, ip_len) == 0) {
+            slot->active--;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_clients_lock);
+}
+
+static void reject_connection(mbedtls_net_context *client, uint32_t *counter)
+{
+    stats_increment(counter);
+    mbedtls_net_free(client);
+}
+
+static void nts_ke_worker_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        nts_ke_job_t job;
+        if (xQueueReceive(s_jobs, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        __atomic_add_fetch(&s_active_connections, 1U, __ATOMIC_RELAXED);
+        handle_client(&job.client, &job.tls->config, job.accepted_us);
+        __atomic_sub_fetch(&s_active_connections, 1U, __ATOMIC_RELAXED);
+
+        mbedtls_net_free(&job.client);
+        client_slot_release(job.ip, job.ip_len);
+        tls_bundle_release(job.tls);
+
+        /* Track the tightest stack margin seen, to size the workers. */
+        const uint32_t stack_free =
+            (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+        portENTER_CRITICAL(&s_stats_lock);
+        if (s_stats.worker_stack_min_free == 0U ||
+            stack_free < s_stats.worker_stack_min_free) {
+            s_stats.worker_stack_min_free = stack_free;
+        }
+        portEXIT_CRITICAL(&s_stats_lock);
+    }
+}
+
+/* Admission by memory: each TLS 1.3 session needs ~35-40 KB of internal
+ * heap, which HTTPS and the network stack share. Refuse extra parallel
+ * sessions when internal heap is low, but always allow one so NTS-KE never
+ * degrades below the old one-at-a-time service. */
+static bool memory_allows_connection(void)
+{
+    if (__atomic_load_n(&s_active_connections, __ATOMIC_RELAXED) == 0U &&
+        uxQueueMessagesWaiting(s_jobs) == 0U) {
+        return true;
+    }
+
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >=
+           NTS_KE_MIN_FREE_INTERNAL_BYTES;
+}
+
+static size_t start_workers(void)
+{
+    size_t started = 0U;
+
+    for (size_t i = 0U; i < NTS_KE_WORKERS; i++) {
+        char name[configMAX_TASK_NAME_LEN];
+        snprintf(name, sizeof(name), "nts_ke_w%u", (unsigned)i);
+
+        if (xTaskCreate(nts_ke_worker_task, name, NTS_KE_WORKER_STACK_SIZE,
+                        NULL, NTS_KE_TASK_PRIORITY, NULL) != pdPASS) {
+            break;
+        }
+        started++;
+    }
+
+    return started;
 }
 
 static void nts_ke_task(void *arg)
@@ -967,6 +1185,24 @@ static void nts_ke_task(void *arg)
         goto exit;
     }
 
+    portENTER_CRITICAL(&s_tls_lock);
+    s_tls_active = tls;
+    portEXIT_CRITICAL(&s_tls_lock);
+    /* From here the bundle is owned through s_tls_active. */
+    tls = NULL;
+
+    s_jobs = xQueueCreate(NTS_KE_JOB_QUEUE_LENGTH, sizeof(nts_ke_job_t));
+    if (s_jobs == NULL) {
+        ESP_LOGE(TAG, "NTS-KE job queue allocation failed");
+        goto exit;
+    }
+
+    const size_t workers = start_workers();
+    if (workers == 0U) {
+        ESP_LOGE(TAG, "No NTS-KE worker could be started");
+        goto exit;
+    }
+
     int ret = mbedtls_net_bind(
         &listener, NULL, NTS_KE_PORT, MBEDTLS_NET_PROTO_TCP);
 
@@ -977,8 +1213,11 @@ static void nts_ke_task(void *arg)
 
     s_running = true;
     ESP_LOGI(TAG,
-             "NTS-KE active on TCP/%s; TLS 1.3; ALPN=ntske/1; production ACME credential",
-             NTS_KE_PORT);
+             "NTS-KE active on TCP/%s; TLS 1.3; ALPN=ntske/1; production ACME credential; "
+             "%u workers, %u per client; internal heap free=%u",
+             NTS_KE_PORT, (unsigned)workers,
+             (unsigned)NTS_KE_MAX_CONNECTIONS_PER_IP,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     int64_t last_reload_check_us = esp_timer_get_time();
 
@@ -987,7 +1226,7 @@ static void nts_ke_task(void *arg)
         if (now_us - last_reload_check_us >=
             (int64_t)NTS_KE_CERT_RELOAD_CHECK_SECONDS * 1000000LL) {
             last_reload_check_us = now_us;
-            tls_bundle_maybe_reload(&tls);
+            tls_bundle_maybe_reload();
         }
 
         /* Wait for a connection with a timeout so certificate renewals are
@@ -1009,21 +1248,46 @@ static void nts_ke_task(void *arg)
             continue;
         }
 
-        mbedtls_net_context client;
-        mbedtls_net_init(&client);
+        nts_ke_job_t job;
+        memset(&job, 0, sizeof(job));
+        mbedtls_net_init(&job.client);
 
-        ret = mbedtls_net_accept(&listener, &client, NULL, 0U, NULL);
+        ret = mbedtls_net_accept(&listener, &job.client,
+                                 job.ip, sizeof(job.ip), &job.ip_len);
         if (ret != 0) {
             ESP_LOGW(TAG, "TCP accept failed: -0x%x", -ret);
-            mbedtls_net_free(&client);
+            mbedtls_net_free(&job.client);
+            continue;
+        }
+        job.accepted_us = esp_timer_get_time();
+
+        /* Rejections close the TCP connection without a TLS alert: nothing
+         * has been negotiated yet, and the client simply retries later. */
+        if (!client_slot_acquire(job.ip, job.ip_len)) {
+            reject_connection(&job.client, &s_stats.per_client_rejections);
             continue;
         }
 
-        handle_client(&client, &tls->config);
-        mbedtls_net_free(&client);
+        if (!memory_allows_connection()) {
+            client_slot_release(job.ip, job.ip_len);
+            reject_connection(&job.client, &s_stats.low_memory_rejections);
+            continue;
+        }
+
+        job.tls = tls_bundle_acquire();
+        if (job.tls == NULL ||
+            xQueueSend(s_jobs, &job, 0) != pdTRUE) {
+            /* Every worker busy and the backlog full. */
+            tls_bundle_release(job.tls);
+            client_slot_release(job.ip, job.ip_len);
+            reject_connection(&job.client, &s_stats.busy_rejections);
+            continue;
+        }
     }
 
 exit:
+    /* Workers, once started, run for the life of the system, so this path
+     * is only reached during startup before any connection is accepted. */
     s_running = false;
     s_task = NULL;
 

@@ -9,9 +9,11 @@
 #include "eth_service.h"
 #include "gnss_service.h"
 #include "ntp_server.h"
+#include "nts_ke.h"
 #include "operations_history.h"
 #include "pps_service.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -358,6 +360,31 @@ static void diagnostics_task(void *arg)
                 eth_status.nts_tx_bias_ns,
                 eth_status.nts_tx_last_residual_ns,
                 eth_status.nts_tx_bias_samples);
+        }
+
+        nts_ke_stats_t ke_stats;
+        nts_ke_get_stats(&ke_stats);
+        if (ke_stats.exchanges_completed != 0U ||
+            ke_stats.exchange_failures != 0U ||
+            ke_stats.tls_handshake_failures != 0U) {
+            ESP_LOGI(
+                TAG,
+                "nts-ke: ok=%" PRIu32 " fail=%" PRIu32 " tls_fail=%" PRIu32
+                " deadline=%" PRIu32 " active=%" PRIu32
+                " reject_client=%" PRIu32 " reject_mem=%" PRIu32
+                " reject_busy=%" PRIu32 " cert_reload=%" PRIu32
+                " stack_min_free=%" PRIu32 " heap_int_free=%u",
+                ke_stats.exchanges_completed,
+                ke_stats.exchange_failures,
+                ke_stats.tls_handshake_failures,
+                ke_stats.deadline_expirations,
+                ke_stats.active_connections,
+                ke_stats.per_client_rejections,
+                ke_stats.low_memory_rejections,
+                ke_stats.busy_rejections,
+                ke_stats.certificate_reloads,
+                ke_stats.worker_stack_min_free,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         }
 
         vTaskDelay(pdMS_TO_TICKS(5000U));
