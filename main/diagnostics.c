@@ -334,6 +334,32 @@ static void diagnostics_task(void *arg)
                 ntp_status.total_response_max_us);
         }
 
+        /* Hardware-timestamp path health: why requests may be dropped
+         * (no RX stamp / mapping failed) and the learned TX corrections. */
+        if (ntp_status.requests_received > 0U) {
+            ESP_LOGI(
+                TAG,
+                "ntp-hw: rx_match=%" PRIu32 " rx_miss=%" PRIu32
+                " stale=%" PRIu32 " overrun=%" PRIu32
+                " map_ok=%" PRIu32 " map_fail=%" PRIu32
+                " drop=%" PRIu32 " rate_drop=%" PRIu32 " bracket=%" PRIu32 " ns"
+                " tx_comp=%" PRId64 " ns nts_bias=%" PRId32
+                " ns nts_resid=%" PRId64 " ns (n=%" PRIu32 ")",
+                eth_status.rx_hw_queue_matches,
+                eth_status.rx_hw_queue_misses,
+                eth_status.rx_hw_queue_stale_purges,
+                eth_status.rx_hw_queue_overruns,
+                eth_status.rx_hw_map_successes,
+                eth_status.rx_hw_map_failures,
+                ntp_status.hw_rx_authority_drops,
+                ntp_status.rate_limited_drops,
+                eth_status.rx_hw_last_map_bracket_ns,
+                eth_status.tx_compensation_ns,
+                eth_status.nts_tx_bias_ns,
+                eth_status.nts_tx_last_residual_ns,
+                eth_status.nts_tx_bias_samples);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5000U));
     }
 }

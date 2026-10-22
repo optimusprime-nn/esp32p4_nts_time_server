@@ -38,7 +38,24 @@ static const char *TAG = "ETH";
 #define ETH_NTP_RX_QUEUE_SIZE                        16U
 #define ETH_PTP_CORRELATION_MAX_AGE_US          30000000LL
 #define ETH_PTP_LOCAL_MAP_MAX_BRACKET_NS          250000ULL
-#define ETH_NTP_TX_COMPENSATION_NS                    98941ULL
+/* Initial L2-to-wire transmit latency added to the late-stamped XMT (the
+ * 6C.7A steady-state median). The running value then tracks measured
+ * hardware TX timestamps, bounded to the range below. */
+#define ETH_NTP_TX_COMPENSATION_NS                    98941LL
+#define ETH_NTP_TX_COMPENSATION_MIN_NS                20000LL
+#define ETH_NTP_TX_COMPENSATION_MAX_NS               500000LL
+/* Filter gain 1/16; samples mapped through a wide UTC/PTP bracket are too
+ * uncertain to learn from. */
+#define ETH_NTP_TX_COMPENSATION_GAIN_SHIFT                4
+#define ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS     20000ULL
+/* Best-of-N UTC/PTP pairing (see eth_sample_utc_ptp_pair). */
+#define ETH_PTP_PAIR_ATTEMPTS                            3U
+/* NTS T3 bias: integral gain 1/8, bounded to [0, 20 ms]. */
+#define ETH_NTS_TX_BIAS_GAIN_SHIFT                       3
+#define ETH_NTS_TX_BIAS_MAX_NS                    20000000LL
+#define ETH_NTS_TX_BIAS_INITIAL_NS                 1000000
+#define NTP_PACKET_LEN                                  48U
+#define ETH_PTP_PAIR_GOOD_BRACKET_NS                 10000ULL
 /* A queued RX timestamp older than this cannot belong to the request now
  * being served: legitimate queueing is sub-millisecond, while the shortest
  * client poll interval is seconds. Older entries are left behind by frames
@@ -78,6 +95,16 @@ typedef struct {
 } eth_ntp_tx_probe_status_t;
 
 static eth_ntp_tx_probe_status_t s_ntp_tx_probe;
+
+/* Current XMT transmit-latency compensation. Only the lwIP thread (the
+ * NTP TX hook) reads or writes it; s_status carries a copy for display. */
+static int64_t s_ntp_tx_compensation_ns = ETH_NTP_TX_COMPENSATION_NS;
+
+/* Learned T3-to-wire delay for NTS responses; written by the lwIP thread,
+ * read by the NTP task through eth_service_get_nts_tx_bias_ns(). Starts at
+ * the value measured on ESP32-P4 hardware so NTS is close from the first
+ * response; clients poll too rarely to learn it quickly from zero. */
+static int32_t s_nts_tx_bias_ns = ETH_NTS_TX_BIAS_INITIAL_NS;
 
 static TaskHandle_t s_ptp_correlation_task;
 static bool s_ptp_correlation_baseline_valid;
@@ -359,7 +386,8 @@ static uint64_t ptp_timestamp_to_ns(const eth_mac_time_t *timestamp);
 static bool eth_frame_get_ntp_response_xmt(const uint8_t *buffer,
                                            size_t length,
                                            uint32_t *out_seconds,
-                                           uint32_t *out_fraction)
+                                           uint32_t *out_fraction,
+                                           size_t *out_ntp_length)
 {
     if (buffer == NULL || out_seconds == NULL || out_fraction == NULL ||
         !eth_frame_is_ipv4_udp_ntp_response(buffer, length)) {
@@ -385,10 +413,63 @@ static bool eth_frame_get_ntp_response_xmt(const uint8_t *buffer,
 
     *out_seconds = read_be32(buffer + ntp_offset + 40U);
     *out_fraction = read_be32(buffer + ntp_offset + 44U);
+    if (out_ntp_length != NULL) {
+        const uint16_t udp_length = read_be16(buffer + ntp_offset - 8U + 4U);
+        *out_ntp_length = udp_length >= 8U ? (size_t)udp_length - 8U : 0U;
+    }
     return true;
 }
 
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+/*
+ * Pairs "now" on the disciplined UTC clock with "now" on the EMAC PTP clock
+ * by reading UTC, PTP, UTC and taking the midpoint. The pair is only as good
+ * as the UTC bracket: preemption between the reads widens it, and half the
+ * bracket is the worst-case mapping error. Take the tightest of a few
+ * attempts, stopping early once one is good enough.
+ */
+static bool eth_sample_utc_ptp_pair(uint64_t *out_utc_mid_ns,
+                                    uint64_t *out_ptp_now_ns,
+                                    uint64_t *out_bracket_ns)
+{
+    bool have_sample = false;
+    uint64_t best_bracket_ns = UINT64_MAX;
+
+    for (unsigned attempt = 0U; attempt < ETH_PTP_PAIR_ATTEMPTS; attempt++) {
+        clock_ntp_timestamp_t utc_before = {0};
+        clock_ntp_timestamp_t utc_after = {0};
+        eth_mac_time_t ptp_now = {0};
+
+        if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
+            esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
+            !clock_discipline_get_ntp_timestamp(&utc_after)) {
+            return false;
+        }
+
+        const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
+        const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
+
+        if (utc_after_ns < utc_before_ns) {
+            continue;
+        }
+
+        const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
+        if (bracket_ns < best_bracket_ns) {
+            best_bracket_ns = bracket_ns;
+            *out_utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
+            *out_ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+            *out_bracket_ns = bracket_ns;
+            have_sample = true;
+        }
+
+        if (best_bracket_ns <= ETH_PTP_PAIR_GOOD_BRACKET_NS) {
+            break;
+        }
+    }
+
+    return have_sample;
+}
+
 static bool eth_map_ptp_event_to_utc_ns(const eth_mac_time_t *event_ptp,
                                         uint64_t *out_utc_ns,
                                         uint32_t *out_bracket_ns,
@@ -398,27 +479,20 @@ static bool eth_map_ptp_event_to_utc_ns(const eth_mac_time_t *event_ptp,
         return false;
     }
 
-    clock_ntp_timestamp_t utc_before = {0};
-    clock_ntp_timestamp_t utc_after = {0};
-    eth_mac_time_t ptp_now = {0};
+    uint64_t utc_mid_ns = 0U;
+    uint64_t ptp_now_ns = 0U;
+    uint64_t bracket_ns = 0U;
 
-    if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
-        esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
-        !clock_discipline_get_ntp_timestamp(&utc_after)) {
+    if (!eth_sample_utc_ptp_pair(&utc_mid_ns, &ptp_now_ns, &bracket_ns)) {
         return false;
     }
 
-    const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
-    const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
-    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
     const uint64_t event_ptp_ns = ptp_timestamp_to_ns(event_ptp);
 
-    if (utc_after_ns < utc_before_ns || ptp_now_ns < event_ptp_ns) {
+    if (ptp_now_ns < event_ptp_ns) {
         return false;
     }
 
-    const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
-    const uint64_t utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
     const uint64_t ptp_age_ns = ptp_now_ns - event_ptp_ns;
 
     int64_t rate_ppb = 0;
@@ -564,7 +638,7 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
     clock_ntp_timestamp_t predicted_tx_timestamp = late_sw_timestamp;
     if (late_sw_valid) {
         const uint64_t fraction_delta =
-            ((ETH_NTP_TX_COMPENSATION_NS << 32) + 500000000ULL) /
+            (((uint64_t)s_ntp_tx_compensation_ns << 32) + 500000000ULL) /
             1000000000ULL;
         const uint64_t fraction_sum =
             (uint64_t)predicted_tx_timestamp.fraction + fraction_delta;
@@ -580,11 +654,13 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
 
     uint32_t xmt_seconds = 0U;
     uint32_t xmt_fraction = 0U;
+    size_t ntp_length = 0U;
     const bool xmt_valid =
         eth_frame_get_ntp_response_xmt((const uint8_t *)buffer,
                                        length,
                                        &xmt_seconds,
-                                       &xmt_fraction);
+                                       &xmt_fraction,
+                                       &ntp_length);
 
     eth_mac_time_t tx_timestamp = {0};
 
@@ -663,6 +739,39 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
                      mapping_bracket_ns,
                      mapping_age_us);
 
+            /* NTS responses cannot be late-stamped (the XMT is inside the
+             * authenticated data), so their T3 is sampled before the final
+             * seal and the send path. Learn that residual (hw - xmt) from
+             * the hardware TX stamp and feed it back as a bias the NTP task
+             * adds to NTS T3: an integral controller, so the bias already
+             * applied is accounted for. Only extension-bearing responses
+             * with a real XMT (not KoD/NAK) and a tight mapping count. */
+            const int64_t nts_residual_ns = -delta_ns;
+            if (!late_stamp_ready &&
+                ntp_length > NTP_PACKET_LEN &&
+                xmt_seconds != 0U &&
+                mapping_bracket_ns <= ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS &&
+                nts_residual_ns >= -ETH_NTS_TX_BIAS_MAX_NS &&
+                nts_residual_ns <= ETH_NTS_TX_BIAS_MAX_NS) {
+                int32_t bias_ns = __atomic_load_n(&s_nts_tx_bias_ns, __ATOMIC_RELAXED);
+                int64_t updated_ns =
+                    (int64_t)bias_ns +
+                    nts_residual_ns / (1LL << ETH_NTS_TX_BIAS_GAIN_SHIFT);
+                if (updated_ns < 0) {
+                    updated_ns = 0;
+                } else if (updated_ns > ETH_NTS_TX_BIAS_MAX_NS) {
+                    updated_ns = ETH_NTS_TX_BIAS_MAX_NS;
+                }
+                bias_ns = (int32_t)updated_ns;
+                __atomic_store_n(&s_nts_tx_bias_ns, bias_ns, __ATOMIC_RELAXED);
+
+                portENTER_CRITICAL(&s_eth_lock);
+                s_status.nts_tx_bias_ns = bias_ns;
+                s_status.nts_tx_bias_samples++;
+                s_status.nts_tx_last_residual_ns = nts_residual_ns;
+                portEXIT_CRITICAL(&s_eth_lock);
+            }
+
             if (late_sw_valid) {
                 const uint64_t late_sw_ns =
                     ntp_timestamp_to_ns(&late_sw_timestamp);
@@ -675,6 +784,25 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
                          sample,
                          late_delta_ns,
                          late_stamp_applied ? 1U : 0U);
+
+                /* Learn the real L2-to-wire latency (hw - late_sw) from
+                 * well-mapped samples so XMT tracks load and build changes
+                 * instead of a frozen constant. Bounded, slow (1/16) filter;
+                 * implausible samples are ignored rather than clamped. */
+                const int64_t measured_latency_ns = -late_delta_ns;
+                if (late_stamp_applied &&
+                    mapping_bracket_ns <= ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS &&
+                    measured_latency_ns >= ETH_NTP_TX_COMPENSATION_MIN_NS &&
+                    measured_latency_ns <= ETH_NTP_TX_COMPENSATION_MAX_NS) {
+                    s_ntp_tx_compensation_ns +=
+                        (measured_latency_ns - s_ntp_tx_compensation_ns) /
+                        (1LL << ETH_NTP_TX_COMPENSATION_GAIN_SHIFT);
+
+                    portENTER_CRITICAL(&s_eth_lock);
+                    s_status.tx_compensation_ns = s_ntp_tx_compensation_ns;
+                    s_status.tx_compensation_samples++;
+                    portEXIT_CRITICAL(&s_eth_lock);
+                }
             } else {
                 ESP_LOGD(TAG,
                          "HW TX late compare unavailable: n=%" PRIu32
@@ -1273,6 +1401,8 @@ esp_err_t eth_service_init(void)
     s_ntp_rx_queue_sequence = 0U;
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     memset(&s_ntp_tx_probe, 0, sizeof(s_ntp_tx_probe));
+    s_status.tx_compensation_ns = s_ntp_tx_compensation_ns;
+    s_status.nts_tx_bias_ns = s_nts_tx_bias_ns;
 #endif
 
     s_status.initialized = true;
@@ -1448,33 +1578,19 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
         return false;
     }
 
-    clock_ntp_timestamp_t utc_before = {0};
-    clock_ntp_timestamp_t utc_after = {0};
-    eth_mac_time_t ptp_now = {0};
-
-    if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
-        esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
-        !clock_discipline_get_ntp_timestamp(&utc_after)) {
-        portENTER_CRITICAL(&s_eth_lock);
-        s_status.rx_hw_map_failures++;
-        portEXIT_CRITICAL(&s_eth_lock);
-        return false;
-    }
-
-    const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
-    const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
-    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+    uint64_t utc_mid_ns = 0U;
+    uint64_t ptp_now_ns = 0U;
+    uint64_t bracket_ns = 0U;
     const uint64_t rx_ptp_ns = ptp_timestamp_to_ns(&rx_ptp);
 
-    if (utc_after_ns < utc_before_ns || ptp_now_ns < rx_ptp_ns) {
+    if (!eth_sample_utc_ptp_pair(&utc_mid_ns, &ptp_now_ns, &bracket_ns) ||
+        ptp_now_ns < rx_ptp_ns) {
         portENTER_CRITICAL(&s_eth_lock);
         s_status.rx_hw_map_failures++;
         portEXIT_CRITICAL(&s_eth_lock);
         return false;
     }
 
-    const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
-    const uint64_t utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
     const uint64_t ptp_age_ns = ptp_now_ns - rx_ptp_ns;
 
     int64_t rate_ppb = 0;
@@ -1547,6 +1663,15 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
     s_status.rx_hw_last_map_age_us = out_timestamp->mapping_age_us;
     portEXIT_CRITICAL(&s_eth_lock);
     return true;
+#endif
+}
+
+int32_t eth_service_get_nts_tx_bias_ns(void)
+{
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+    return __atomic_load_n(&s_nts_tx_bias_ns, __ATOMIC_RELAXED);
+#else
+    return 0;
 #endif
 }
 

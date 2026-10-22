@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "acme_client.h"
+#include "nts_aes_siv.h"
 #include "nts_cookie.h"
 #include "nts_storage.h"
 
@@ -25,6 +26,8 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
+#include "psa/crypto.h"
+
 static const char *TAG = "NTS_KE";
 
 #define NTS_KE_PORT                         "4460"
@@ -38,6 +41,11 @@ static const char *TAG = "NTS_KE";
  * close_notify together. Connections are served one at a time, so this
  * bounds how long a slow or hostile client can deny NTS-KE to others. */
 #define NTS_KE_CONNECTION_DEADLINE_MS       5000U
+/* How often the stored ACME certificate is compared with the one in use,
+ * and how long accept() may block before the loop re-checks. */
+#define NTS_KE_CERT_RELOAD_CHECK_SECONDS     600U
+#define NTS_KE_ACCEPT_WAKE_SECONDS            30
+#define NTS_KE_CERT_DIGEST_LEN                32U
 
 #define NTS_KE_CRITICAL_BIT                0x8000U
 #define NTS_KE_RECORD_END_OF_MESSAGE       0x0000U
@@ -74,6 +82,13 @@ typedef struct {
     mbedtls_net_context *net;
     int64_t deadline_us;
 } nts_ke_connection_t;
+
+typedef struct {
+    mbedtls_ssl_config config;
+    mbedtls_x509_crt certificate;
+    mbedtls_pk_context private_key;
+    uint8_t certificate_digest[NTS_KE_CERT_DIGEST_LEN];
+} nts_ke_tls_bundle_t;
 
 static TaskHandle_t s_task;
 static volatile bool s_running;
@@ -736,40 +751,56 @@ static void handle_client(mbedtls_net_context *client,
     mbedtls_ssl_free(&ssl);
 }
 
-static esp_err_t configure_tls(mbedtls_ssl_config *config,
-                               mbedtls_x509_crt *certificate,
-                               mbedtls_pk_context *private_key)
+static void tls_bundle_free(nts_ke_tls_bundle_t *bundle)
 {
-    acme_tls_credentials_t credentials;
-    memset(&credentials, 0, sizeof(credentials));
-
-    esp_err_t err =
-        acme_client_load_production_tls_credentials(&credentials);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Production TLS credential load failed: %s",
-                 esp_err_to_name(err));
-        return err;
+    if (bundle == NULL) {
+        return;
     }
 
+    mbedtls_ssl_config_free(&bundle->config);
+    mbedtls_pk_free(&bundle->private_key);
+    mbedtls_x509_crt_free(&bundle->certificate);
+    free(bundle);
+}
+
+static esp_err_t certificate_digest(const acme_tls_credentials_t *credentials,
+                                    uint8_t digest[NTS_KE_CERT_DIGEST_LEN])
+{
+    size_t digest_len = 0U;
+    const psa_status_t status = psa_hash_compute(
+        PSA_ALG_SHA_256,
+        (const uint8_t *)credentials->certificate_pem,
+        credentials->certificate_pem_length,
+        digest,
+        NTS_KE_CERT_DIGEST_LEN,
+        &digest_len);
+
+    return (status == PSA_SUCCESS && digest_len == NTS_KE_CERT_DIGEST_LEN)
+               ? ESP_OK
+               : ESP_FAIL;
+}
+
+static esp_err_t configure_tls(mbedtls_ssl_config *config,
+                               mbedtls_x509_crt *certificate,
+                               mbedtls_pk_context *private_key,
+                               const acme_tls_credentials_t *credentials)
+{
     int ret = mbedtls_x509_crt_parse(
         certificate,
-        (const unsigned char *)credentials.certificate_pem,
-        credentials.certificate_pem_length + 1U);
+        (const unsigned char *)credentials->certificate_pem,
+        credentials->certificate_pem_length + 1U);
 
     if (ret < 0) {
         ESP_LOGE(TAG, "Production certificate parse failed: -0x%x", -ret);
-        acme_client_free_tls_credentials(&credentials);
         return ESP_FAIL;
     }
 
     ret = mbedtls_pk_parse_key(
     private_key,
-    (const unsigned char *)credentials.private_key_pem,
-    credentials.private_key_pem_length,
+    (const unsigned char *)credentials->private_key_pem,
+    credentials->private_key_pem_length,
     NULL,
     0U);
-
-    acme_client_free_tls_credentials(&credentials);
 
     if (ret != 0) {
         ESP_LOGE(TAG, "Production private-key parse failed: -0x%x", -ret);
@@ -810,6 +841,92 @@ static esp_err_t configure_tls(mbedtls_ssl_config *config,
     return ESP_OK;
 }
 
+/*
+ * Loads the current production ACME credential into a new heap-allocated
+ * TLS bundle. When `current_digest` is given and the stored certificate is
+ * unchanged, returns ESP_ERR_NOT_FINISHED without building anything. The
+ * bundle lives on the heap because the SSL config holds pointers to the
+ * certificate and key inside it.
+ */
+static esp_err_t tls_bundle_load(const uint8_t *current_digest,
+                                 nts_ke_tls_bundle_t **out_bundle)
+{
+    *out_bundle = NULL;
+
+    acme_tls_credentials_t credentials;
+    memset(&credentials, 0, sizeof(credentials));
+
+    esp_err_t err =
+        acme_client_load_production_tls_credentials(&credentials);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Production TLS credential load failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    uint8_t digest[NTS_KE_CERT_DIGEST_LEN];
+    err = certificate_digest(&credentials, digest);
+    if (err != ESP_OK) {
+        acme_client_free_tls_credentials(&credentials);
+        return err;
+    }
+
+    if (current_digest != NULL &&
+        memcmp(digest, current_digest, sizeof(digest)) == 0) {
+        acme_client_free_tls_credentials(&credentials);
+        return ESP_ERR_NOT_FINISHED;
+    }
+
+    nts_ke_tls_bundle_t *bundle = calloc(1U, sizeof(*bundle));
+    if (bundle == NULL) {
+        acme_client_free_tls_credentials(&credentials);
+        return ESP_ERR_NO_MEM;
+    }
+
+    mbedtls_ssl_config_init(&bundle->config);
+    mbedtls_x509_crt_init(&bundle->certificate);
+    mbedtls_pk_init(&bundle->private_key);
+    memcpy(bundle->certificate_digest, digest, sizeof(digest));
+
+    err = configure_tls(&bundle->config, &bundle->certificate,
+                        &bundle->private_key, &credentials);
+    acme_client_free_tls_credentials(&credentials);
+
+    if (err != ESP_OK) {
+        tls_bundle_free(bundle);
+        return err;
+    }
+
+    *out_bundle = bundle;
+    return ESP_OK;
+}
+
+/* ACME renewals replace the stored production certificate without telling
+ * this task. Re-check periodically, between connections, and swap in a new
+ * TLS config when the certificate has changed. On any failure the current
+ * (still valid until expiry) bundle stays in service. */
+static void tls_bundle_maybe_reload(nts_ke_tls_bundle_t **active)
+{
+    nts_ke_tls_bundle_t *replacement = NULL;
+    const esp_err_t err =
+        tls_bundle_load((*active)->certificate_digest, &replacement);
+
+    if (err == ESP_ERR_NOT_FINISHED) {
+        return;
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TLS credential reload failed; keeping current: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    tls_bundle_free(*active);
+    *active = replacement;
+    stats_increment(&s_stats.certificate_reloads);
+    ESP_LOGI(TAG, "NTS-KE TLS certificate reloaded after renewal");
+}
+
 static void nts_ke_task(void *arg)
 {
     (void)arg;
@@ -817,16 +934,17 @@ static void nts_ke_task(void *arg)
     mbedtls_net_context listener;
     mbedtls_net_init(&listener);
 
-    mbedtls_ssl_config config;
-    mbedtls_ssl_config_init(&config);
+    nts_ke_tls_bundle_t *tls = NULL;
 
-    mbedtls_x509_crt certificate;
-    mbedtls_x509_crt_init(&certificate);
+    esp_err_t err = nts_aes_siv_self_test();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "AES-SIV self-test FAILED (%s); NTS disabled for this boot",
+                 esp_err_to_name(err));
+        goto exit;
+    }
+    ESP_LOGI(TAG, "AES-SIV self-test passed");
 
-    mbedtls_pk_context private_key;
-    mbedtls_pk_init(&private_key);
-
-    esp_err_t err;
     bool waiting_logged = false;
     for (;;) {
         err = nts_storage_ensure_cookie_keyring();
@@ -844,7 +962,7 @@ static void nts_ke_task(void *arg)
     if (waiting_logged)
         ESP_LOGI(TAG, "GNSS/PPS authoritative time available; continuing NTS-KE startup");
 
-    err = configure_tls(&config, &certificate, &private_key);
+    err = tls_bundle_load(NULL, &tls);
     if (err != ESP_OK) {
         goto exit;
     }
@@ -862,7 +980,35 @@ static void nts_ke_task(void *arg)
              "NTS-KE active on TCP/%s; TLS 1.3; ALPN=ntske/1; production ACME credential",
              NTS_KE_PORT);
 
+    int64_t last_reload_check_us = esp_timer_get_time();
+
     for (;;) {
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_reload_check_us >=
+            (int64_t)NTS_KE_CERT_RELOAD_CHECK_SECONDS * 1000000LL) {
+            last_reload_check_us = now_us;
+            tls_bundle_maybe_reload(&tls);
+        }
+
+        /* Wait for a connection with a timeout so certificate renewals are
+         * picked up even when no client connects. */
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(listener.fd, &readable);
+        struct timeval accept_wait = {
+            .tv_sec = NTS_KE_ACCEPT_WAKE_SECONDS,
+            .tv_usec = 0,
+        };
+        const int ready =
+            select(listener.fd + 1, &readable, NULL, NULL, &accept_wait);
+        if (ready <= 0) {
+            if (ready < 0) {
+                /* Avoid a tight loop if select() itself is failing. */
+                vTaskDelay(pdMS_TO_TICKS(100U));
+            }
+            continue;
+        }
+
         mbedtls_net_context client;
         mbedtls_net_init(&client);
 
@@ -873,7 +1019,7 @@ static void nts_ke_task(void *arg)
             continue;
         }
 
-        handle_client(&client, &config);
+        handle_client(&client, &tls->config);
         mbedtls_net_free(&client);
     }
 
@@ -882,9 +1028,7 @@ exit:
     s_task = NULL;
 
     mbedtls_net_free(&listener);
-    mbedtls_pk_free(&private_key);
-    mbedtls_x509_crt_free(&certificate);
-    mbedtls_ssl_config_free(&config);
+    tls_bundle_free(tls);
 
     vTaskDelete(NULL);
 }

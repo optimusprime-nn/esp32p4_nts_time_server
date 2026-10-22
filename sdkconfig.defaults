@@ -54,6 +54,11 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 # CONFIG_SPIRAM_USE_MEMMAP is not set
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
+# FATFS work buffers must stay in internal RAM: the SD host DMAs into them,
+# and DMA into encrypted PSRAM aborts with "MSPI PSRAM error" during the SD
+# mount (seen on TS2). IDF defaults this to y whenever caps-alloc PSRAM is on.
+# CONFIG_FATFS_ALLOC_PREFER_EXTRAM is not set
+
 # ESP32-P4 v1.3: do not route peer-certificate ECDSA verification through the
 # unsupported ECDSA peripheral. Keep normal software verification enabled.
 # This is a narrow management/NTS TLS reliability fix; hardware ECC/AES/SHA

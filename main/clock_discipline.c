@@ -30,6 +30,12 @@ static const char *TAG = "CLOCK";
 #define CLOCK_TIM_TP_POLL_DELAY_MS              10U
 #define CLOCK_TIM_TP_MAX_AGE_US                 1500000LL
 #define CLOCK_LOG_INTERVAL_US                   5000000LL
+/* Samples arrive once per second, and a TIM-TP record arriving late can
+ * push the gap just past one second. Only treat the reference as lost (and
+ * advertise holdover) after a few whole seconds without a sample, so a
+ * single late record does not flap the advertised stratum. Dispersion
+ * still grows from the last sample throughout. */
+#define CLOCK_HOLDOVER_ENTRY_SECONDS            3U
 
 typedef struct {
     bool initialized;
@@ -357,7 +363,7 @@ static void enforce_holdover_policy(void)
 
         ESP_LOGW(TAG,
                  "holdover limit exceeded; clock is fail-closed");
-    } else if (holdover_seconds > 0U &&
+    } else if (holdover_seconds >= CLOCK_HOLDOVER_ENTRY_SECONDS &&
                s_clock.state == APP_CLOCK_SYNCHRONIZED) {
         s_clock.state = APP_CLOCK_HOLDOVER;
     }

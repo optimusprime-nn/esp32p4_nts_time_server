@@ -88,6 +88,9 @@ static const char *TAG = "GNSS";
 #define UBX_NAV_TIMELS_TIME_TO_EVENT_OFFSET     12U
 #define UBX_NAV_TIMELS_VALID_OFFSET             20U
 
+/* NTP leap indicator is only raised within this many seconds of the event. */
+#define APP_LEAP_ANNOUNCE_WINDOW_SECONDS        86400
+
 #define UBX_NAV_TIMELS_VALID_CURRENT_LEAP       (1U << 0)
 #define UBX_NAV_TIMELS_VALID_TIME_TO_EVENT      (1U << 1)
 
@@ -542,13 +545,18 @@ static void handle_ubx_nav_timels(const uint8_t *payload,
     if (leap_information_usable) {
         leap_indicator = APP_LEAP_NO_WARNING;
 
-        if (event_time_valid &&
+        /* GNSS announces leap seconds months ahead, but NTP's leap
+         * indicator means "at the end of the current day": some SNTP
+         * clients apply it at the next midnight. Only raise it during the
+         * final 24 hours before the event. */
+        const bool leap_within_day =
+            event_time_valid &&
             seconds_to_event > 0 &&
-            leap_change > 0) {
+            seconds_to_event <= APP_LEAP_ANNOUNCE_WINDOW_SECONDS;
+
+        if (leap_within_day && leap_change > 0) {
             leap_indicator = APP_LEAP_ADD_SECOND;
-        } else if (event_time_valid &&
-                   seconds_to_event > 0 &&
-                   leap_change < 0) {
+        } else if (leap_within_day && leap_change < 0) {
             leap_indicator = APP_LEAP_DELETE_SECOND;
         }
     }

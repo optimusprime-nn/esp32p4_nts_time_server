@@ -16,6 +16,7 @@ typedef struct {
     uint32_t exchanges_completed;
     uint32_t exchange_failures;
     uint32_t deadline_expirations;
+    uint32_t certificate_reloads;
 } nts_ke_stats_t;
 
 esp_err_t nts_ke_start(void);

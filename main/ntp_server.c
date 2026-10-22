@@ -242,6 +242,13 @@ static void ntp_status_record_unsynchronized_drop(void)
     portEXIT_CRITICAL(&s_ntp_lock);
 }
 
+static void ntp_status_record_rate_limited_drop(void)
+{
+    portENTER_CRITICAL(&s_ntp_lock);
+    s_status.rate_limited_drops++;
+    portEXIT_CRITICAL(&s_ntp_lock);
+}
+
 static void ntp_status_record_kod(void)
 {
     portENTER_CRITICAL(&s_ntp_lock);
@@ -340,8 +347,14 @@ static bool get_server_quality(uint8_t *out_stratum,
 
     if (clock_status.state == APP_CLOCK_HOLDOVER &&
         clock_status.solution_valid) {
+        /* Keep announcing a pending leap second through holdover; GNSS
+         * leap data may itself be stale, so fall back to "no warning"
+         * only when it is unavailable. */
+        const uint8_t holdover_leap = leap_from_gnss();
+
         *out_stratum = NTP_STRATUM_SECONDARY;
-        *out_leap = NTP_LI_NO_WARNING;
+        *out_leap = holdover_leap == NTP_LI_UNSYNCED ? NTP_LI_NO_WARNING
+                                                     : holdover_leap;
         *out_refid = ntp_packet_refid_from_text("HOLD");
         *out_dispersion = clock_status.root_dispersion_16_16;
 
@@ -446,6 +459,23 @@ static void build_rate_kod(const ntp_packet_fields_t *request,
     ntp_packet_build(response, &packet);
 }
 
+/* NTS NAK header (RFC 8915 section 5.7): a Kiss-o'-Death with code "NTSN".
+ * nts_ntp_auth_build_nak() then appends the echoed Unique Identifier. */
+static void build_nts_nak_header(const ntp_packet_fields_t *request,
+                                 uint8_t response[NTP_PACKET_SIZE])
+{
+    ntp_packet_fields_t packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.leap_indicator = NTP_LI_UNSYNCED;
+    packet.version = request->version;
+    packet.mode = NTP_MODE_SERVER;
+    packet.stratum = NTP_STRATUM_KOD;
+    packet.precision = -20;
+    packet.reference_id = ntp_packet_refid_from_text("NTSN");
+    packet.origin_timestamp = request->transmit_timestamp;
+    ntp_packet_build(response, &packet);
+}
+
 /* Status-only response for an unavailable local timing reference.
  * Never returns valid NTP time or grants this node timing authority. */
 static void build_unsynchronized_status(const ntp_packet_fields_t *request,
@@ -471,7 +501,8 @@ static bool build_server_response(const ntp_packet_fields_t *request,
                                   uint8_t *out_leap,
                                   uint32_t *out_dispersion,
                                   int64_t *out_tx_timestamp_complete_us,
-                                  int64_t *out_packet_built_us)
+                                  int64_t *out_packet_built_us,
+                                  int32_t transmit_bias_ns)
 {
     uint8_t stratum = NTP_STRATUM_UNSYNCED;
     uint8_t leap = NTP_LI_UNSYNCED;
@@ -495,6 +526,18 @@ static bool build_server_response(const ntp_packet_fields_t *request,
 
     if (out_tx_timestamp_complete_us != NULL) {
         *out_tx_timestamp_complete_us = esp_timer_get_time();
+    }
+
+    /* NTS T3 is sealed into the Authenticator, so it is sampled before the
+     * seal and send path; advance it by their learned duration. */
+    if (transmit_bias_ns > 0) {
+        const uint64_t fraction_delta =
+            (((uint64_t)transmit_bias_ns << 32) + 500000000ULL) /
+            1000000000ULL;
+        const uint64_t fraction_sum =
+            (uint64_t)transmit_timestamp.fraction + fraction_delta;
+        transmit_timestamp.seconds += (uint32_t)(fraction_sum >> 32);
+        transmit_timestamp.fraction = (uint32_t)fraction_sum;
     }
 
     ntp_packet_fields_t packet;
@@ -674,6 +717,8 @@ static void ntp_server_task(void *arg)
                     } else {
                         ntp_status_record_send_failure();
                     }
+                } else {
+                    ntp_status_record_rate_limited_drop();
                 }
 
                 continue;
@@ -694,8 +739,42 @@ static void ntp_server_task(void *arg)
                                  "NTS request authentication failed: %s",
                                  esp_err_to_name(nts_err));
                     }
-                    nts_ntp_auth_clear_context(&nts_context);
                     ntp_status_record_invalid_request();
+
+                    /* Expired/unknown cookie or bad Authenticator on an
+                     * otherwise well-formed request: tell the client to
+                     * re-run NTS-KE instead of letting it time out.
+                     * Malformed requests are still dropped silently. */
+                    uint8_t nak_stratum = NTP_STRATUM_UNSYNCED;
+                    uint8_t nak_leap = NTP_LI_UNSYNCED;
+                    uint32_t nak_refid = 0U;
+                    uint32_t nak_dispersion = 0U;
+
+                    /* An unsynchronised clock also fails cookie expiry
+                     * checks; never NAK then, or clients would discard
+                     * valid cookies. */
+                    if (nts_context.nak_eligible &&
+                        get_server_quality(&nak_stratum, &nak_leap,
+                                           &nak_refid, &nak_dispersion)) {
+                        size_t nak_length = 0U;
+                        build_nts_nak_header(&request, s_response_buffer);
+
+                        if (nts_ntp_auth_build_nak(&nts_context,
+                                                   s_response_buffer,
+                                                   NTP_PACKET_SIZE,
+                                                   sizeof(s_response_buffer),
+                                                   &nak_length) == ESP_OK) {
+                            const int sent = sendto(
+                                socket_fd, s_response_buffer, nak_length, 0,
+                                (const struct sockaddr *)&client_address,
+                                client_length);
+                            if (sent != (int)nak_length) {
+                                ntp_status_record_send_failure();
+                            }
+                        }
+                    }
+
+                    nts_ntp_auth_clear_context(&nts_context);
                     continue;
                 }
             }
@@ -796,7 +875,10 @@ static void ntp_server_task(void *arg)
                                        &leap,
                                        &dispersion,
                                        &timing_tx_complete_us,
-                                       &timing_packet_built_us)) {
+                                       &timing_packet_built_us,
+                                       nts_request
+                                           ? eth_service_get_nts_tx_bias_ns()
+                                           : 0)) {
                 nts_ntp_auth_clear_context(&nts_context);
                 ntp_status_record_unsynchronized_drop();
                 continue;

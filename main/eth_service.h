@@ -54,6 +54,11 @@ typedef struct {
     uint32_t rx_hw_queue_matches;
     uint32_t rx_hw_queue_misses;
     uint32_t rx_hw_queue_stale_purges;
+    int64_t tx_compensation_ns;
+    uint32_t tx_compensation_samples;
+    int32_t nts_tx_bias_ns;
+    uint32_t nts_tx_bias_samples;
+    int64_t nts_tx_last_residual_ns;
     uint32_t rx_hw_map_successes;
     uint32_t rx_hw_map_failures;
     uint32_t rx_hw_last_map_bracket_ns;
@@ -98,6 +103,11 @@ typedef struct {
 bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
                                        uint16_t client_port,
                                        eth_service_ntp_rx_timestamp_t *out_timestamp);
+
+/* Learned delay from sampling an NTS response's T3 to its hardware transmit
+ * time, in ns (0 until learned). The NTP task adds it to NTS T3, which cannot
+ * be late-stamped because it is covered by the NTS Authenticator. */
+int32_t eth_service_get_nts_tx_bias_ns(void);
 
 /* Stage B5: diagnostic only; call from a dedicated non-timing task. */
 esp_err_t eth_service_diag_restart_driver(void);
