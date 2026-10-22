@@ -33,9 +33,19 @@ static portMUX_TYPE s_pps_lock = portMUX_INITIALIZER_UNLOCKED;
 static pps_service_status_t s_status;
 static uint64_t s_previous_capture_us;
 
+_Static_assert((1000000000ULL % APP_PPS_TIMER_RESOLUTION_HZ) == 0ULL,
+               "PPS timer resolution must divide 1 GHz for exact ns conversion");
+
+#define PPS_NS_PER_TICK (1000000000ULL / APP_PPS_TIMER_RESOLUTION_HZ)
+
+static uint64_t ticks_to_ns(uint64_t ticks)
+{
+    return ticks * PPS_NS_PER_TICK;
+}
+
 static uint64_t ticks_to_us(uint64_t ticks)
 {
-    return (ticks * 1000000ULL) / APP_PPS_TIMER_RESOLUTION_HZ;
+    return ticks_to_ns(ticks) / 1000ULL;
 }
 
 static void IRAM_ATTR pps_gpio_isr(void *arg)
@@ -58,6 +68,7 @@ static void IRAM_ATTR pps_gpio_isr(void *arg)
 
     const pps_capture_event_t event = {
         .capture_ticks = captured_ticks,
+        .capture_ns = ticks_to_ns(captured_ticks),
         .capture_us = ticks_to_us(captured_ticks),
     };
 
@@ -313,6 +324,22 @@ bool pps_service_get_monotonic_us(uint64_t *out_us)
     }
 
     *out_us = ticks_to_us(raw_ticks);
+    return true;
+}
+
+bool pps_service_get_monotonic_ns(uint64_t *out_ns)
+{
+    if (out_ns == NULL || s_gptimer == NULL) {
+        return false;
+    }
+
+    uint64_t raw_ticks = 0;
+
+    if (gptimer_get_raw_count(s_gptimer, &raw_ticks) != ESP_OK) {
+        return false;
+    }
+
+    *out_ns = ticks_to_ns(raw_ticks);
     return true;
 }
 

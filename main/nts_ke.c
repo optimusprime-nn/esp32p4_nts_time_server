@@ -37,6 +37,8 @@ static const char *TAG = "NTS_KE";
 /* Acceptor: self-test, keyring setup, certificate load/reload and accept. */
 #define NTS_KE_TASK_STACK_SIZE              16384U
 #define NTS_KE_TASK_PRIORITY                    5U
+/* All NTS-KE TLS work stays on core 0, away from the NTP task (core 1). */
+#define NTS_KE_TASK_CORE                        0
 /* Connections are served by a small worker pool so one slow client cannot
  * block NTS-KE for others. Each worker runs one TLS session at a time
  * (stack: handshake plus 6 KB of request/response buffers). */
@@ -1135,8 +1137,10 @@ static size_t start_workers(void)
         char name[configMAX_TASK_NAME_LEN];
         snprintf(name, sizeof(name), "nts_ke_w%u", (unsigned)i);
 
-        if (xTaskCreate(nts_ke_worker_task, name, NTS_KE_WORKER_STACK_SIZE,
-                        NULL, NTS_KE_TASK_PRIORITY, NULL) != pdPASS) {
+        if (xTaskCreatePinnedToCore(nts_ke_worker_task, name,
+                                    NTS_KE_WORKER_STACK_SIZE, NULL,
+                                    NTS_KE_TASK_PRIORITY, NULL,
+                                    NTS_KE_TASK_CORE) != pdPASS) {
             break;
         }
         started++;
@@ -1303,13 +1307,14 @@ esp_err_t nts_ke_start(void)
         return ESP_OK;
     }
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         nts_ke_task,
         "nts_ke",
         NTS_KE_TASK_STACK_SIZE,
         NULL,
         NTS_KE_TASK_PRIORITY,
-        &s_task);
+        &s_task,
+        NTS_KE_TASK_CORE);
 
     if (created != pdPASS) {
         s_task = NULL;

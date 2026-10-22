@@ -1248,7 +1248,8 @@ static void got_ip_event_handler(void *arg,
     }
 
     ESP_LOGI(TAG,
-             "DHCP IPv4 acquired: " IPSTR,
+             "%s IPv4 acquired: " IPSTR,
+             s_status.ipv4_static ? "Static" : "DHCP",
              IP2STR(&got_ip->ip_info.ip));
 }
 
@@ -1331,6 +1332,44 @@ esp_err_t eth_service_init(void)
 
     ESP_LOGI(TAG, "DHCP hostname configured: %s", dhcp_hostname);
 
+    /* Static IPv4: stop the DHCP client before the netif comes up and fix
+     * the address. esp-netif then raises IP_EVENT_ETH_GOT_IP on link-up as
+     * it does for a DHCP lease, so the rest of the boot is unchanged. Any
+     * failure here falls back to DHCP rather than leaving no address. */
+    bool static_ipv4_applied = false;
+    device_config_snapshot_t net_cfg;
+    if (device_config_get_snapshot(&net_cfg) == ESP_OK &&
+        net_cfg.static_ipv4_enabled) {
+        esp_netif_ip_info_t ip_info = {
+            .ip.addr = net_cfg.static_ipv4_address,
+            .netmask.addr = net_cfg.static_ipv4_netmask,
+            .gw.addr = net_cfg.static_ipv4_gateway,
+        };
+        esp_err_t ip_err = esp_netif_dhcpc_stop(s_eth_netif);
+        if (ip_err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+            ip_err = ESP_OK;
+        }
+        if (ip_err == ESP_OK) {
+            ip_err = esp_netif_set_ip_info(s_eth_netif, &ip_info);
+        }
+        if (ip_err == ESP_OK && net_cfg.static_ipv4_dns != 0U) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = net_cfg.static_ipv4_dns;
+            ip_err = esp_netif_set_dns_info(s_eth_netif, ESP_NETIF_DNS_MAIN, &dns);
+        }
+
+        if (ip_err == ESP_OK) {
+            static_ipv4_applied = true;
+            ESP_LOGI(TAG, "Static IPv4 configured: " IPSTR " mask " IPSTR " gw " IPSTR,
+                     IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
+        } else {
+            ESP_LOGE(TAG, "Static IPv4 setup failed (%s); falling back to DHCP",
+                     esp_err_to_name(ip_err));
+            (void)esp_netif_dhcpc_start(s_eth_netif);
+        }
+    }
+
     const esp_eth_netif_glue_handle_t glue =
         esp_eth_new_netif_glue(s_eth_handle);
 
@@ -1406,6 +1445,7 @@ esp_err_t eth_service_init(void)
 #endif
 
     s_status.initialized = true;
+    s_status.ipv4_static = static_ipv4_applied;
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     s_status.ptp_supported = true;
 #endif

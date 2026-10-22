@@ -27,6 +27,9 @@
 
 #define APP_NTP_TASK_STACK_SIZE                 6144U
 #define APP_NTP_TASK_PRIORITY                   12U
+/* NTP serving runs on core 1; NTS-KE TLS work is pinned to core 0 so a
+ * handshake can never preempt the request loop on the same core. */
+#define APP_NTP_TASK_CORE                       1
 #define APP_NTP_RECEIVE_TIMEOUT_SECONDS         1U
 #define APP_NTP_HOT_PATH_LOG_INTERVAL_US        10000000LL
 
@@ -960,13 +963,14 @@ esp_err_t ntp_server_start(void)
 
     portEXIT_CRITICAL(&s_ntp_lock);
 
-    const BaseType_t task_created = xTaskCreate(
+    const BaseType_t task_created = xTaskCreatePinnedToCore(
         ntp_server_task,
         "ntp_server",
         APP_NTP_TASK_STACK_SIZE,
         NULL,
         APP_NTP_TASK_PRIORITY,
-        NULL);
+        NULL,
+        APP_NTP_TASK_CORE);
 
     if (task_created != pdPASS) {
         portENTER_CRITICAL(&s_ntp_lock);

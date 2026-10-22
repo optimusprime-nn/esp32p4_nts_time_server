@@ -165,26 +165,26 @@ void app_main(void)
         return;
     }
 
-    eth_service_wait_for_ip();
-
-    /* Management-only wall-clock bootstrap for TLS/ACME. This does not feed
-     * clock_discipline, NTP serving state, PPS/PTP correlation, or NTS timing. */
-    const esp_err_t bootstrap_err = commissioning_sync_management_time();
-    if (bootstrap_err != ESP_OK) {
-        ESP_LOGW(TAG, "Management-time fallback unavailable; continuing: %s",
-                 esp_err_to_name(bootstrap_err));
-    }
-    const esp_err_t time_manager_err = commissioning_start_time_manager();
-    if (time_manager_err != ESP_OK) {
-        ESP_LOGW(TAG, "Management-time source manager did not start: %s",
-                 esp_err_to_name(time_manager_err));
-    }
-
+    /* NTP binds INADDR_ANY, which works before the interface has an address,
+     * so start it first: it answers as soon as DHCP (or the static address)
+     * completes, without waiting on anything below. */
     err = ntp_server_start();
 
     if (err != ESP_OK) {
         enter_fail_closed("NTP server startup", err);
         return;
+    }
+
+    eth_service_wait_for_ip();
+
+    /* Management-only wall-clock bootstrap for TLS/ACME. The manager task
+     * syncs immediately and then periodically, in the background, so boot
+     * no longer blocks on external NTP lookups. It does not feed
+     * clock_discipline, NTP serving state, PPS/PTP correlation, or NTS. */
+    const esp_err_t time_manager_err = commissioning_start_time_manager();
+    if (time_manager_err != ESP_OK) {
+        ESP_LOGW(TAG, "Management-time source manager did not start: %s",
+                 esp_err_to_name(time_manager_err));
     }
 
     const esp_err_t peer_monitor_err = ntp_peer_monitor_start();

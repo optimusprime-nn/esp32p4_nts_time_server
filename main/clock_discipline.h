@@ -41,7 +41,7 @@ esp_err_t clock_discipline_init(void);
  * Point 4C calls this only after a PPS edge has been correlated to a
  * valid GNSS UTC second.
  */
-esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
+esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_ns,
                                          int64_t utc_seconds,
                                          int32_t timing_quantization_error_ns,
                                          app_leap_indicator_t leap_indicator);

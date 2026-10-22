@@ -1678,7 +1678,13 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"root_dispersion_16_16\":%" PRIu32 ","
         "\"last_client\":\"" IPSTR "\","
         "\"last_request_monotonic_us\":%" PRId64 ","
-        "\"last_response_monotonic_us\":%" PRId64
+        "\"last_response_monotonic_us\":%" PRId64 ","
+        "\"rate_limited_drops\":%" PRIu32 ","
+        "\"hw_rx_drops\":%" PRIu32 ","
+        "\"rx_stale_purges\":%" PRIu32 ","
+        "\"rx_map_failures\":%" PRIu32 ","
+        "\"tx_compensation_ns\":%" PRId64 ","
+        "\"nts_tx_bias_ns\":%" PRId32
         "},"
         "\"nts\":{"
         "\"ke_running\":%s,"
@@ -1686,11 +1692,18 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"ke_exchange_failures\":%" PRIu32 ","
         "\"ke_tls_handshake_failures\":%" PRIu32 ","
         "\"ke_alpn_rejections\":%" PRIu32 ","
+        "\"ke_deadline_expirations\":%" PRIu32 ","
+        "\"ke_certificate_reloads\":%" PRIu32 ","
+        "\"ke_active_connections\":%" PRIu32 ","
+        "\"ke_per_client_rejections\":%" PRIu32 ","
+        "\"ke_busy_rejections\":%" PRIu32 ","
+        "\"ke_low_memory_rejections\":%" PRIu32 ","
         "\"verification_attempts\":%" PRIu32 ","
         "\"authenticated_requests\":%" PRIu32 ","
         "\"verification_failures\":%" PRIu32 ","
         "\"protected_responses\":%" PRIu32 ","
-        "\"protection_failures\":%" PRIu32
+        "\"protection_failures\":%" PRIu32 ","
+        "\"naks_sent\":%" PRIu32
         "}"
         "}",
         APP_WEB_CONSOLE_PORT,
@@ -1784,17 +1797,30 @@ static esp_err_t send_status_json(httpd_req_t *request)
         IP2STR(&last_client),
         ntp_status.last_request_monotonic_us,
         ntp_status.last_response_monotonic_us,
+        ntp_status.rate_limited_drops,
+        ntp_status.hw_rx_authority_drops,
+        eth_status.rx_hw_queue_stale_purges,
+        eth_status.rx_hw_map_failures,
+        eth_status.tx_compensation_ns,
+        eth_status.nts_tx_bias_ns,
 
         nts_ke_stats.running ? "true" : "false",
         nts_ke_stats.exchanges_completed,
         nts_ke_stats.exchange_failures,
         nts_ke_stats.tls_handshake_failures,
         nts_ke_stats.alpn_rejections,
+        nts_ke_stats.deadline_expirations,
+        nts_ke_stats.certificate_reloads,
+        nts_ke_stats.active_connections,
+        nts_ke_stats.per_client_rejections,
+        nts_ke_stats.busy_rejections,
+        nts_ke_stats.low_memory_rejections,
         nts_auth_stats.verification_attempts,
         nts_auth_stats.authenticated_requests,
         nts_auth_stats.verification_failures,
         nts_auth_stats.protected_responses,
-        nts_auth_stats.protection_failures);
+        nts_auth_stats.protection_failures,
+        nts_auth_stats.naks_sent);
 
     if (length > 0 && (size_t)length < response_size && response[length - 1] == '}') {
         response[--length] = '\0';
@@ -1996,7 +2022,30 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         "esp32_nts_protected_responses_total %" PRIu32 "\n"
         "# HELP esp32_nts_protection_failures_total NTS response protection failures.\n"
         "# TYPE esp32_nts_protection_failures_total counter\n"
-        "esp32_nts_protection_failures_total %" PRIu32 "\n",
+        "esp32_nts_protection_failures_total %" PRIu32 "\n"
+        "# HELP esp32_nts_naks_sent_total NTS NAK (KoD NTSN) responses sent.\n"
+        "# TYPE esp32_nts_naks_sent_total counter\n"
+        "esp32_nts_naks_sent_total %" PRIu32 "\n"
+        "# HELP esp32_nts_ke_deadline_expirations_total NTS-KE connections closed at the 5 s deadline.\n"
+        "# TYPE esp32_nts_ke_deadline_expirations_total counter\n"
+        "esp32_nts_ke_deadline_expirations_total %" PRIu32 "\n"
+        "# HELP esp32_nts_ke_rejections_total NTS-KE connections refused before TLS.\n"
+        "# TYPE esp32_nts_ke_rejections_total counter\n"
+        "esp32_nts_ke_rejections_total{reason=\"per_client\"} %" PRIu32 "\n"
+        "esp32_nts_ke_rejections_total{reason=\"busy\"} %" PRIu32 "\n"
+        "esp32_nts_ke_rejections_total{reason=\"low_memory\"} %" PRIu32 "\n"
+        "# HELP esp32_nts_ke_certificate_reloads_total NTS-KE TLS certificate reloads.\n"
+        "# TYPE esp32_nts_ke_certificate_reloads_total counter\n"
+        "esp32_nts_ke_certificate_reloads_total %" PRIu32 "\n"
+        "# HELP esp32_ntp_rate_limited_drops_total Requests dropped by the rate limiter without a reply.\n"
+        "# TYPE esp32_ntp_rate_limited_drops_total counter\n"
+        "esp32_ntp_rate_limited_drops_total %" PRIu32 "\n"
+        "# HELP esp32_ntp_tx_compensation_ns Learned NTP transmit-latency compensation.\n"
+        "# TYPE esp32_ntp_tx_compensation_ns gauge\n"
+        "esp32_ntp_tx_compensation_ns %" PRId64 "\n"
+        "# HELP esp32_nts_tx_bias_ns Learned NTS T3-to-wire bias.\n"
+        "# TYPE esp32_nts_tx_bias_ns gauge\n"
+        "esp32_nts_tx_bias_ns %" PRId32 "\n",
         (int)clock_status.state,
         clock_status.solution_valid ? 1 : 0,
         clock_status.phase_error_ns,
@@ -2018,7 +2067,16 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         nts_auth_stats.authenticated_requests,
         nts_auth_stats.verification_failures,
         nts_auth_stats.protected_responses,
-        nts_auth_stats.protection_failures);
+        nts_auth_stats.protection_failures,
+        nts_auth_stats.naks_sent,
+        nts_ke_stats.deadline_expirations,
+        nts_ke_stats.per_client_rejections,
+        nts_ke_stats.busy_rejections,
+        nts_ke_stats.low_memory_rejections,
+        nts_ke_stats.certificate_reloads,
+        ntp_status.rate_limited_drops,
+        eth_status.tx_compensation_ns,
+        eth_status.nts_tx_bias_ns);
 
     if (length > 0 && (size_t)length < response_size) {
         int n = snprintf(response + length, response_size - (size_t)length,
@@ -2154,7 +2212,15 @@ static esp_err_t send_config_json(httpd_req_t *request)
         length += n;
     }
     if (length > 0 && length < (int)sizeof(response)) {
-        int n = snprintf(response + length, sizeof(response) - (size_t)length, "],\"redundant_server\":{\"enabled\":%s,\"server\":\"%s\",\"warning_ns\":%" PRIu32 ",\"critical_ns\":%" PRIu32 "}}}\n", config.ntp_peers[APP_REDUNDANT_PEER_INDEX].enabled ? "true" : "false", config.ntp_peers[APP_REDUNDANT_PEER_INDEX].server, config.redundant_peer_warning_ns, config.redundant_peer_critical_ns);
+        const esp_ip4_addr_t net_addr = {.addr = config.static_ipv4_address};
+        const esp_ip4_addr_t net_mask = {.addr = config.static_ipv4_netmask};
+        const esp_ip4_addr_t net_gw = {.addr = config.static_ipv4_gateway};
+        const esp_ip4_addr_t net_dns = {.addr = config.static_ipv4_dns};
+        int n = snprintf(response + length, sizeof(response) - (size_t)length, "],\"redundant_server\":{\"enabled\":%s,\"server\":\"%s\",\"warning_ns\":%" PRIu32 ",\"critical_ns\":%" PRIu32 "}},"
+                         "\"network\":{\"static_ipv4_enabled\":%s,\"address\":\"" IPSTR "\",\"netmask\":\"" IPSTR "\",\"gateway\":\"" IPSTR "\",\"dns\":\"" IPSTR "\"}}\n",
+                         config.ntp_peers[APP_REDUNDANT_PEER_INDEX].enabled ? "true" : "false", config.ntp_peers[APP_REDUNDANT_PEER_INDEX].server, config.redundant_peer_warning_ns, config.redundant_peer_critical_ns,
+                         config.static_ipv4_enabled ? "true" : "false",
+                         IP2STR(&net_addr), IP2STR(&net_mask), IP2STR(&net_gw), IP2STR(&net_dns));
         if (n < 0 || n >= (int)(sizeof(response) - (size_t)length)) length = (int)sizeof(response); else length += n;
     }
     if (length < 0 || length >= (int)sizeof(response)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration serialization failed");
@@ -2378,6 +2444,53 @@ static esp_err_t redundant_server_put_handler(httpd_req_t *request)
         current.ntp_peer_response_timeout_ms, warning_ns, critical_ns, peers);
     if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "redundant-server configuration commit failed");
     (void)operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, "redundant_server_updated");
+    return send_config_json(request);
+}
+
+/* Dotted-quad to network-order u32; "" or "0.0.0.0" gives 0. */
+static bool parse_ipv4_text(const char *text, uint32_t *out_addr)
+{
+    if (text == NULL || out_addr == NULL) return false;
+    if (text[0] == '\0') { *out_addr = 0U; return true; }
+    esp_ip4_addr_t addr = {0};
+    if (esp_netif_str_to_ip4(text, &addr) != ESP_OK) return false;
+    *out_addr = addr.addr;
+    return true;
+}
+
+/* Static IPv4 takes effect at the next reboot, so a mistake can be undone
+ * from the console before it applies; an invalid stored value boots DHCP. */
+static esp_err_t network_put_handler(httpd_req_t *request)
+{
+    if (request->content_len <= 0 || request->content_len >= APP_WEB_CONFIG_BODY_MAX)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
+    char body[APP_WEB_CONFIG_BODY_MAX]; size_t received = 0U;
+    while (received < (size_t)request->content_len) {
+        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+    bool enabled = false;
+    char addr_text[16] = {0}, mask_text[16] = {0}, gw_text[16] = {0}, dns_text[16] = {0};
+    uint32_t addr = 0U, mask = 0U, gw = 0U, dns = 0U;
+    if (!json_get_bool(body, "static_ipv4_enabled", &enabled))
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "static_ipv4_enabled is required");
+    if (enabled) {
+        if (!json_get_string(body, "address", addr_text, sizeof(addr_text)) ||
+            !json_get_string(body, "netmask", mask_text, sizeof(mask_text)) ||
+            !json_get_string(body, "gateway", gw_text, sizeof(gw_text)) ||
+            !json_get_string(body, "dns", dns_text, sizeof(dns_text)) ||
+            !parse_ipv4_text(addr_text, &addr) || !parse_ipv4_text(mask_text, &mask) ||
+            !parse_ipv4_text(gw_text, &gw) || !parse_ipv4_text(dns_text, &dns))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "address, netmask, gateway and dns must be IPv4 dotted quads");
+        if (!device_config_static_ipv4_is_valid(addr, mask, gw, dns))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid static IPv4 configuration (address, mask or gateway)");
+    }
+    const esp_err_t err = device_config_set_static_ipv4(enabled, addr, mask, gw, dns);
+    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "network configuration commit failed");
+    (void)operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, enabled ? "static_ipv4_set" : "dhcp_selected");
     return send_config_json(request);
 }
 
@@ -3777,6 +3890,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "<main><div id=\"cards\"></div>\n"
         "<section class=\"card backupbar\" id=\"commission-panel\"><h2>Commissioning &amp; Certificate Setup</h2>\n"
         "<div class=\"backupgrid\"><div><label>Device hostname<input id=\"cmhost\" maxlength=\"63\"></label><label>Certificate FQDN<input id=\"cmfqdn\" maxlength=\"253\"></label><label>External NTP 1<input id=\"cmntp0\"></label><label>External NTP 2<input id=\"cmntp1\"></label></div><div><label>Cloudflare zone name<input id=\"cmzone\" maxlength=\"253\" placeholder=\"example.com\"></label><label>Cloudflare Zone ID<input id=\"cmzoneid\" maxlength=\"32\" placeholder=\"32-character Zone ID\"></label><label>Cloudflare API token<input id=\"cmtoken\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Enter only to configure/replace\"></label><p class=\"backupnote\">The token is stored in encrypted NVS and is never returned by the status API.</p><div id=\"cmtime\" class=\"backupstatus\">Management time: loading...</div></div></div>\n"
+        "<div class=\"backupgrid\"><div><label><input id=\"netstatic\" type=\"checkbox\"> Static IPv4 address (takes effect after reboot; DHCP when off)</label><label>Address<input id=\"netaddr\" maxlength=\"15\" placeholder=\"192.168.2.55\"></label><label>Netmask<input id=\"netmask\" maxlength=\"15\" placeholder=\"255.255.255.0\"></label></div><div><label>Gateway<input id=\"netgw\" maxlength=\"15\" placeholder=\"192.168.2.254\"></label><label>DNS server<input id=\"netdns\" maxlength=\"15\" placeholder=\"optional\"></label><button onclick=\"saveNetwork()\">Save Network</button><div id=\"netmsg\" class=\"backupstatus\"></div></div></div>\n"
         "<div class=\"actions\"><button onclick=\"saveCommissioning()\">Save Identity &amp; External NTP</button><button onclick=\"syncManagementTime()\">Sync Management Time</button><button onclick=\"saveCloudflare()\">Save/Test Cloudflare</button><button onclick=\"requestCertificate()\">Request Certificate</button></div><div id=\"cmmsg\" class=\"backupstatus\"></div>\n"
         "<p class=\"backupnote\">GNSS/GPS is the master civil-time source. If it is unavailable, the dedicated Redundant Time Server is tried first, then External NTP 1 and External NTP 2, for management TLS/ACME wall time only. It never disciplines the Phase 8 clock and cannot make NTP/NTS timing ready or change stratum/LI.</p></section>\n"
         "<section class=\"card backupbar\" id=\"backup-panel\"><h2>Configuration Backup &amp; Restore</h2>\n"
@@ -3816,7 +3930,8 @@ static esp_err_t management_handler(httpd_req_t *request)
         "function renew(){if(confirm('Request production certificate renewal now? The existing 30-day renewal policy is still enforced.'))action('/api/v1/acme/production/certificate/renew','renewbtn');}\n"
         "function reboot(){if(confirm('Reboot the NTP server now? NTP and management HTTPS will be temporarily unavailable.'))action('/api/v1/system/reboot','rebootbtn');}\n"
         "let selectedBackupText='';\n"
-        "async function loadCommissioning(){try{const [c,d]=await Promise.all([getJson('/api/v1/commissioning'),getJson('/api/v1/config')]);document.getElementById('cmhost').value=d.hostname||'';document.getElementById('cmfqdn').value=c.certificate_fqdn||'';for(let i=0;i<2;i++)document.getElementById('cmntp'+i).value=c.ntp_servers[i]||'';document.getElementById('cmzone').value=d.cloudflare_zone_name||'';document.getElementById('cmzoneid').value=d.cloudflare_zone_id||'';document.getElementById('cmtime').textContent='Management time: '+(c.management_time_valid?'VALID via '+c.management_time_source+' / '+c.management_time_server:'NOT VALID');}catch(e){document.getElementById('cmmsg').textContent='Commissioning status error: '+e.message;}}\n"
+        "async function loadCommissioning(){try{const [c,d]=await Promise.all([getJson('/api/v1/commissioning'),getJson('/api/v1/config')]);document.getElementById('cmhost').value=d.hostname||'';document.getElementById('cmfqdn').value=c.certificate_fqdn||'';for(let i=0;i<2;i++)document.getElementById('cmntp'+i).value=c.ntp_servers[i]||'';document.getElementById('cmzone').value=d.cloudflare_zone_name||'';document.getElementById('cmzoneid').value=d.cloudflare_zone_id||'';if(d.network){const n=d.network,z=v=>v&&v!=='0.0.0.0'?v:'';document.getElementById('netstatic').checked=!!n.static_ipv4_enabled;document.getElementById('netaddr').value=z(n.address);document.getElementById('netmask').value=z(n.netmask);document.getElementById('netgw').value=z(n.gateway);document.getElementById('netdns').value=z(n.dns);}document.getElementById('cmtime').textContent='Management time: '+(c.management_time_valid?'VALID via '+c.management_time_source+' / '+c.management_time_server:'NOT VALID');}catch(e){document.getElementById('cmmsg').textContent='Commissioning status error: '+e.message;}}\n"
+        "async function saveNetwork(){const m=document.getElementById('netmsg'),en=document.getElementById('netstatic').checked;const body={static_ipv4_enabled:en,address:document.getElementById('netaddr').value.trim(),netmask:document.getElementById('netmask').value.trim(),gateway:document.getElementById('netgw').value.trim(),dns:document.getElementById('netdns').value.trim()};if(en&&!confirm('Save static IPv4 '+body.address+'? It applies at the next reboot; a wrong address makes the console unreachable until it is changed back over the network or serial.'))return;try{const r=await fetch('/api/v1/config/network',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const t=await r.text();if(!r.ok)throw new Error(t);m.textContent=en?'Static IPv4 saved; reboot to apply.':'DHCP selected; reboot to apply.';}catch(e){m.textContent='Save refused: '+e.message;}}\n"
         "async function saveCommissioning(){const m=document.getElementById('cmmsg');try{const h=document.getElementById('cmhost').value.trim(),body={certificate_fqdn:document.getElementById('cmfqdn').value.trim(),ntp0:document.getElementById('cmntp0').value.trim(),ntp1:document.getElementById('cmntp1').value.trim()};let r=await fetch('/api/v1/config/hostname',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({hostname:h})});if(!r.ok)throw new Error('hostname: '+await r.text());r=await fetch('/api/v1/commissioning',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());m.textContent='Identity and External NTP fallback configuration saved.';await loadCommissioning();}catch(e){m.textContent='Save refused: '+e.message;}}\n"
         "async function syncManagementTime(){const m=document.getElementById('cmmsg');m.textContent='Synchronizing management wall time...';try{const r=await fetch('/api/v1/commissioning/time/sync',{method:'POST'});const t=await r.text();if(!r.ok)throw new Error(t);m.textContent='Management wall time synchronized. Timing authority remains GNSS/PPS only.';await loadCommissioning();}catch(e){m.textContent='Management time synchronization failed: '+e.message;}}\n"
         "async function saveCloudflare(){const m=document.getElementById('cmmsg'),token=document.getElementById('cmtoken').value,zone=document.getElementById('cmzone').value.trim(),zoneid=document.getElementById('cmzoneid').value.trim();if(!token){m.textContent='Enter a Cloudflare API token to configure or replace it.';return;}if(!zone){m.textContent='Enter the Cloudflare zone name (for example example.com).';return;}if(zoneid&&!/^[0-9a-fA-F]{32}$/.test(zoneid)){m.textContent='Cloudflare Zone ID must be exactly 32 hexadecimal characters.';return;}try{const r=await fetch('/api/v1/config/cloudflare',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token:token,zone_name:zone,zone_id:zoneid})});const t=await r.text();document.getElementById('cmtoken').value='';if(!r.ok)throw new Error(t);m.textContent='Cloudflare credentials verified and stored.';await loadCommissioning();}catch(e){m.textContent='Cloudflare setup failed: '+e.message;}}\n"
@@ -3847,14 +3962,17 @@ static esp_err_t management_handler(httpd_req_t *request)
         "async function refresh(){\n"
         " if(peerFormDirty||Date.now()-lastCardInteraction<8000||document.querySelector('#cards input:focus,#cards button:focus,#cards select:focus,#cards textarea:focus'))return;\n"
         " try{\n"
-        "  const [d,cert,sched,cfg,ops,storage]=await Promise.all([\n"
-        "   getJson('/api/v1/status'),\n"
-        "   getOptionalJson('/api/v1/acme/production/certificate',[404]),\n"
-        "   getJson('/api/v1/acme/production/renewal/scheduler'),\n"
-        "   getJson('/api/v1/config'),\n"
-        "   getJson('/api/v1/operations/history'),\n"
-        "   getOptionalJson('/api/v1/storage/status',[404])\n"
-        "  ]);\n"
+        /* Sequential on purpose: parallel fetches make the browser open one TLS
+         * connection per request, more than the server keeps open, so every
+         * refresh forced fresh mTLS handshakes that compete with NTS for the
+         * crypto hardware. One request at a time reuses one kept-alive
+         * connection. */
+        "  const d=await getJson('/api/v1/status');\n"
+        "  const cert=await getOptionalJson('/api/v1/acme/production/certificate',[404]);\n"
+        "  const sched=await getJson('/api/v1/acme/production/renewal/scheduler');\n"
+        "  const cfg=await getJson('/api/v1/config');\n"
+        "  const ops=await getJson('/api/v1/operations/history');\n"
+        "  const storage=await getOptionalJson('/api/v1/storage/status',[404]);\n"
         "  const summary=[\n"
         "   badge('Clock: '+d.clock.state,stateClass(d.clock.state)),\n"
         "   badge('NTP: '+(d.readiness.ntp_ready?'READY':'NOT READY'),d.readiness.ntp_ready?'ok':'bad'),\n"
@@ -3937,7 +4055,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
         "  const gn=d.gnss||{};const diagGnss=card('GNSS Receiver — Diagnostics',[row('Receiver Model',gn.receiver_model||'--'),row('Receiver SW',gn.receiver_software_version||'--'),row('Receiver HW',gn.receiver_hardware_version||'--'),row('Identity Valid',yesNo(!!gn.receiver_identity_valid)),row('UTC Source',gn.utc_from_ubx_pvt?'UBX-NAV-PVT':'Fallback / unavailable'),row('UTC Valid',yesNo(!!gn.utc_valid)),row('UTC Age',gn.utc_age_us>=0?gn.utc_age_us+' us':'--'),row('Fix Valid',yesNo(!!gn.fix_valid)),row('Fix Type',gn.fix_type),row('Satellites Used',gn.satellites),row('Fully Resolved',yesNo(!!gn.fully_resolved)),row('Leap State',gn.leap),row('Leap Offset',gn.current_leap_seconds+' s'),row('Timing Pulse Valid',yesNo(!!gn.timing_pulse_valid)),row('TIM-TP Age',gn.timing_pulse_age_us>=0?gn.timing_pulse_age_us+' us':'--'),row('TIM-TP qErr',gn.timing_qerr_ps+' ps'),row('UART Bytes',gn.uart_bytes_received||0),row('UBX Frames Valid',gn.ubx_frames_valid||0),row('Bad Checksums',gn.ubx_frames_invalid_checksum||0),row('Bad Lengths',gn.ubx_frames_invalid_length||0),row('Unsupported UBX',gn.ubx_frames_unsupported||0),row('NAV-PVT Messages',gn.ubx_nav_pvt_messages||0),row('NAV-TIMELS Messages',gn.ubx_nav_timels_messages||0),row('TIM-TP Messages',gn.ubx_tim_tp_messages||0),row('Valid ZDA',gn.valid_zda_messages||0),row('Invalid Messages',gn.invalid_messages||0),row('UBX Config Complete',yesNo(!!gn.ubx_configuration_complete)),row('Timepulse Config Complete',yesNo(!!gn.ubx_timepulse_configuration_complete)),row('UBX ACK / NAK',(gn.ubx_ack_count||0)+' / '+(gn.ubx_nak_count||0)),row('Config Failures',gn.ubx_configuration_failures||0)]);\n"
         "  const diagTiming=card('Timing Capture — Diagnostics',[row('Clock State',d.clock.state),row('Solution Valid',yesNo(d.clock.solution_valid)),row('Phase Error',d.clock.phase_error_ns+' ns'),row('Frequency',d.clock.frequency_ppm+' ppm'),row('Accepted / Rejected',d.clock.accepted_samples+' / '+d.clock.rejected_samples),row('Holdover',d.clock.holdover_seconds+' s'),row('PPS Valid',yesNo(d.pps.valid)),row('PPS Period',d.pps.period_us+' us'),row('PPS Jitter',d.pps.jitter_us+' us'),row('PPS Age',d.pps.age_us+' us'),row('PPS Edges',d.pps.edge_count),row('PPS Queue Drops',d.pps.queue_drops)]);\n"
-        "  const diagServices=card('NTP / NTS — Diagnostics',[row('NTP Requests',d.ntp.requests),row('NTP Responses',d.ntp.responses),row('Invalid NTP',d.ntp.invalid_requests),row('Unsync Drops',d.ntp.unsynchronized_drops),row('RATE KoD',d.ntp.rate_kod),row('Send Failures',d.ntp.send_failures),row('Socket Failures',d.ntp.socket_failures),row('NTS-KE Exchanges',d.nts.ke_exchanges),row('NTS-KE Failures',d.nts.ke_exchange_failures),row('NTS TLS Failures',d.nts.ke_tls_handshake_failures),row('NTS Verify Failures',d.nts.verification_failures),row('NTS Protection Failures',d.nts.protection_failures)]);\n"
+        "  const diagServices=card('NTP / NTS — Diagnostics',[row('NTP Requests',d.ntp.requests),row('NTP Responses',d.ntp.responses),row('Invalid NTP',d.ntp.invalid_requests),row('Unsync Drops',d.ntp.unsynchronized_drops),row('RATE KoD',d.ntp.rate_kod),row('Send Failures',d.ntp.send_failures),row('Socket Failures',d.ntp.socket_failures),row('NTS-KE Exchanges',d.nts.ke_exchanges),row('NTS-KE Failures',d.nts.ke_exchange_failures),row('NTS TLS Failures',d.nts.ke_tls_handshake_failures),row('NTS Verify Failures',d.nts.verification_failures),row('NTS Protection Failures',d.nts.protection_failures),row('NTS NAKs Sent',d.nts.naks_sent),row('Rate-Limited Drops',d.ntp.rate_limited_drops),row('HW RX Drops',d.ntp.hw_rx_drops),row('NTS-KE Deadline Expiries',d.nts.ke_deadline_expirations),row('NTS-KE Rejected (per client / busy / memory)',d.nts.ke_per_client_rejections+' / '+d.nts.ke_busy_rejections+' / '+d.nts.ke_low_memory_rejections),row('NTS-KE Active',d.nts.ke_active_connections),row('TLS Certificate Reloads',d.nts.ke_certificate_reloads),row('TX Compensation',(d.ntp.tx_compensation_ns/1000).toFixed(1)+' \\u00b5s'),row('NTS T3 Bias',(d.ntp.nts_tx_bias_ns/1000).toFixed(1)+' \\u00b5s')]);\n"
         "  const recentDiag=(ops&&ops.events?ops.events.slice(-20).reverse():[]);let recentHtml='<div class=\"peers\">';for(const e of recentDiag){recentHtml+='<div class=\"peerbox diag-event\"><div class=\"peerhead\"><span class=\"peername\">'+esc(e.type)+' #'+e.sequence+'</span><span class=\"event-time\">'+esc(e.unix_time_valid?new Date(e.unix_time*1000).toISOString():'uptime '+e.uptime_seconds+'s')+'</span></div><div class=\"event-detail\">'+esc(e.detail||'')+'</div></div>';}recentHtml+='</div><div class=\"actions\"><button onclick=\"refresh()\">Refresh Now</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button onclick=\"copyDiagnosticSummary()\">Copy Summary</button></div>';const diagRecent=card('Recent Faults / State Changes',[row('Events retained',ops?ops.event_count:'--'),row('Overwritten',ops?ops.overwritten_events:'--')],recentHtml);\n"
         "  let pageCols; if(pageMode==='dashboard'){pageCols=[[col1[0],col1[1]],[col2[0],col2[1]],[col3[0],redCompact],[peerLive]];}else if(pageMode==='system'){pageCols=[[col4[3],col4[2]],[col4[1]],[col4[0]],[col2[2]]];}else if(pageMode==='management'){pageCols=[[col3[1]],[col3[2]],[],[]];}else{pageCols=[[diagGnss],[diagTiming],[diagServices,redDiag],[diagRecent]];}\n"
         "  if(Date.now()-lastCardInteraction<8000||document.querySelector('#cards input:focus,#cards button:focus,#cards select:focus,#cards textarea:focus'))return;\n"
@@ -3948,7 +4066,8 @@ static esp_err_t management_handler(httpd_req_t *request)
         " }\n"
         "}\n"
         "if(pageMode==='management'){loadHardware();loadCommissioning();}else{for(const id of ['commission-panel','backup-panel','hardware-panel']){const e=document.getElementById(id);if(e)e.style.display='none';}}\n"
-        "refresh();setInterval(refresh,3000);\n"
+        "let refreshBusy=false;async function refreshTick(){if(refreshBusy)return;refreshBusy=true;try{await refresh();}finally{refreshBusy=false;}}\n"
+        "refreshTick();setInterval(refreshTick,3000);\n"
         "</script></body></html>\n";
 
     httpd_resp_set_type(request, "text/html");
@@ -4157,6 +4276,18 @@ static esp_err_t config_backup_get_handler(httpd_req_t *request)
         backup.config.ntp_peer_monitor_enabled ? "true" : "false",
         backup.config.ntp_peer_poll_interval_seconds, backup.config.ntp_peer_response_timeout_ms,
         backup.config.redundant_peer_warning_ns, backup.config.redundant_peer_critical_ns);
+    if (length >= 0 && length < 8192) {
+        const esp_ip4_addr_t b_addr = {.addr = backup.config.static_ipv4_address};
+        const esp_ip4_addr_t b_mask = {.addr = backup.config.static_ipv4_netmask};
+        const esp_ip4_addr_t b_gw = {.addr = backup.config.static_ipv4_gateway};
+        const esp_ip4_addr_t b_dns = {.addr = backup.config.static_ipv4_dns};
+        const int n = snprintf(response + length, 8192U - (size_t)length,
+            ",\"static_ipv4_enabled\":%s,\"static_ipv4_address\":\"" IPSTR "\",\"static_ipv4_netmask\":\"" IPSTR "\""
+            ",\"static_ipv4_gateway\":\"" IPSTR "\",\"static_ipv4_dns\":\"" IPSTR "\"",
+            backup.config.static_ipv4_enabled ? "true" : "false",
+            IP2STR(&b_addr), IP2STR(&b_mask), IP2STR(&b_gw), IP2STR(&b_dns));
+        if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
+    }
     hardware_profile_status_t hw_status;
     if (hardware_profile_get_status(&hw_status) != ESP_OK) { free(response); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "hardware profile backup unavailable"); }
     hardware_profile_config_t hw = hw_status.config;
@@ -4262,6 +4393,18 @@ static esp_err_t config_backup_restore_handler(httpd_req_t *request)
         valid = json_get_bool(body, "peer4_enabled", &backup.config.ntp_peers[APP_REDUNDANT_PEER_INDEX].enabled) &&
                 json_get_string(body, "peer4", backup.config.ntp_peers[APP_REDUNDANT_PEER_INDEX].server,
                                 sizeof(backup.config.ntp_peers[APP_REDUNDANT_PEER_INDEX].server));
+    }
+    if (valid && strstr(body, "\"static_ipv4_enabled\"") != NULL) {
+        char ip_text[4][16] = {{0}};
+        valid = json_get_bool(body, "static_ipv4_enabled", &backup.config.static_ipv4_enabled) &&
+                json_get_string(body, "static_ipv4_address", ip_text[0], sizeof(ip_text[0])) &&
+                json_get_string(body, "static_ipv4_netmask", ip_text[1], sizeof(ip_text[1])) &&
+                json_get_string(body, "static_ipv4_gateway", ip_text[2], sizeof(ip_text[2])) &&
+                json_get_string(body, "static_ipv4_dns", ip_text[3], sizeof(ip_text[3])) &&
+                parse_ipv4_text(ip_text[0], &backup.config.static_ipv4_address) &&
+                parse_ipv4_text(ip_text[1], &backup.config.static_ipv4_netmask) &&
+                parse_ipv4_text(ip_text[2], &backup.config.static_ipv4_gateway) &&
+                parse_ipv4_text(ip_text[3], &backup.config.static_ipv4_dns);
     }
     hardware_profile_config_t hw;
     memset(&hw, 0, sizeof(hw));
@@ -4728,6 +4871,13 @@ static const httpd_uri_t s_redundant_server_put_uri = {
     .user_ctx = NULL,
 };
 
+static const httpd_uri_t s_network_put_uri = {
+    .uri = "/api/v1/config/network",
+    .method = HTTP_PUT,
+    .handler = network_put_handler,
+    .user_ctx = NULL,
+};
+
 static const httpd_uri_t s_hostname_put_uri = {
     .uri = "/api/v1/config/hostname",
     .method = HTTP_PUT,
@@ -4972,7 +5122,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_index_uri, &s_system_page_uri, &s_management_uri, &s_diagnostics_page_uri, &s_firmware_page_uri, &s_status_uri, &s_health_uri, &s_metrics_uri,
         &s_operations_history_uri, &s_storage_status_uri, &s_storage_flush_uri, &s_storage_mount_uri, &s_storage_unmount_uri, &s_storage_erase_logs_uri, &s_storage_format_uri, &s_storage_diagnostics_uri, &s_system_reboot_uri, &s_hardware_profile_get_uri, &s_hardware_profile_put_uri,
         &s_commissioning_get_uri, &s_commissioning_put_uri, &s_commissioning_sync_uri,
-        &s_config_get_uri, &s_config_backup_get_uri, &s_config_backup_restore_uri, &s_peer_monitor_put_uri, &s_redundant_server_put_uri, &s_hostname_put_uri, &s_cloudflare_put_uri,
+        &s_config_get_uri, &s_config_backup_get_uri, &s_config_backup_restore_uri, &s_peer_monitor_put_uri, &s_redundant_server_put_uri, &s_hostname_put_uri, &s_network_put_uri, &s_cloudflare_put_uri,
         &s_cloudflare_delete_uri, &s_cloudflare_verify_uri,
         &s_dns01_create_uri, &s_dns01_query_uri, &s_dns01_delete_uri,
         &s_acme_staging_probe_uri, &s_acme_account_status_uri,

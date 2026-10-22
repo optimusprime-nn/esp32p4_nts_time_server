@@ -99,14 +99,6 @@ config APP_NTS_MAX_PACKET_SIZE
     range 128 2048
     default 512
 
-config APP_ENABLE_NTS
-    bool "Enable Network Time Security"
-    default n
-    help
-        Keep disabled until PSA Crypto AES-SIV, NTS cookies,
-        authenticated NTP extension handling, TLS 1.3 NTS-KE,
-        ALPN ntske/1, and interoperability testing are complete.
-
 config APP_ENABLE_INTERLEAVED
     bool "Enable NTP interleaved mode"
     default n
@@ -129,18 +121,6 @@ config APP_ENABLE_WEB_CONSOLE
 config APP_ENABLE_MANAGEMENT_API
     bool "Enable management API"
     default n
-
-config APP_ENABLE_NTS_UART_PROVISIONING
-    bool "Enable temporary UART NTS provisioning"
-    default n
-    help
-        Enables local UART commands for TLS certificate and private-key
-        provisioning. Disable after provisioning is complete.
-
-config APP_NTS_PROVISION_UART
-    int "UART used for temporary NTS provisioning"
-    range 0 9
-    default 0
 
 config APP_SD_STORAGE_ENABLE
     bool "Enable onboard SD-card operational storage (SDMMC 4-bit)"

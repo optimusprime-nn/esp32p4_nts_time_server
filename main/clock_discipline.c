@@ -41,14 +41,15 @@ typedef struct {
     bool initialized;
     bool solution_valid;
 
-    uint64_t anchor_capture_us;
+    /* PPS capture instants on the GPTimer timebase, in ns. */
+    uint64_t anchor_capture_ns;
     int64_t anchor_utc_seconds;
 
-    uint64_t last_sample_capture_us;
+    uint64_t last_sample_capture_ns;
     int64_t last_sample_utc_seconds;
 
     bool reference_timestamp_valid;
-    uint64_t reference_capture_us;
+    uint64_t reference_capture_ns;
     int64_t reference_utc_seconds;
 
     int64_t last_phase_error_ns;
@@ -109,15 +110,28 @@ static void rate_limited_log(esp_log_level_t level, const char *text)
     }
 }
 
-static uint32_t calculate_holdover_seconds_locked(uint64_t now_capture_us)
+static uint32_t calculate_holdover_seconds_locked(uint64_t now_capture_ns)
 {
     if (!s_clock.solution_valid ||
-        now_capture_us < s_clock.last_sample_capture_us) {
+        now_capture_ns < s_clock.last_sample_capture_ns) {
         return 0U;
     }
 
     return (uint32_t)(
-        (now_capture_us - s_clock.last_sample_capture_us) / 1000000ULL);
+        (now_capture_ns - s_clock.last_sample_capture_ns) / 1000000000ULL);
+}
+
+/*
+ * Elapsed local time scaled to UTC: elapsed * (1 + f), in integer ns. Only
+ * the small frequency correction is floating point, so the result keeps
+ * full GPTimer resolution (a double holding absolute UTC seconds only
+ * resolves ~0.24 us).
+ */
+static int64_t corrected_elapsed_ns(uint64_t elapsed_ns, double frequency_ppm)
+{
+    const double correction_ns =
+        (double)elapsed_ns * (frequency_ppm / 1000000.0);
+    return (int64_t)elapsed_ns + (int64_t)llround(correction_ns);
 }
 
 static uint32_t calculate_dispersion_16_16_locked(uint32_t holdover_seconds)
@@ -147,12 +161,12 @@ static uint32_t calculate_dispersion_16_16_locked(uint32_t holdover_seconds)
 
 static void publish_state_locked(void)
 {
-    uint64_t now_capture_us = s_clock.last_sample_capture_us;
+    uint64_t now_capture_ns = s_clock.last_sample_capture_ns;
 
-    (void)pps_service_get_monotonic_us(&now_capture_us);
+    (void)pps_service_get_monotonic_ns(&now_capture_ns);
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     app_state_set_clock_solution(
         s_clock.state,
@@ -347,15 +361,15 @@ static void enforce_holdover_policy(void)
         return;
     }
 
-    uint64_t now_capture_us = 0;
+    uint64_t now_capture_ns = 0;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us)) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns)) {
         unlock_clock();
         return;
     }
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     if (holdover_seconds > APP_HOLDOVER_MAX_SECONDS) {
         s_clock.solution_valid = false;
@@ -410,7 +424,7 @@ static void clock_monitor_task(void *arg)
                 if (wait_for_gnss_sample(&gnss_sample)) {
                     const esp_err_t err =
                         clock_discipline_submit_sample(
-                            pps_event.capture_us,
+                            pps_event.capture_ns,
                             gnss_sample.utc_seconds,
                             gnss_sample.quantization_error_ns,
                             gnss_sample.leap_indicator);
@@ -484,13 +498,13 @@ esp_err_t clock_discipline_init(void)
     return ESP_OK;
 }
 
-esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
+esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_ns,
                                          int64_t utc_seconds,
                                          int32_t timing_quantization_error_ns,
                                          app_leap_indicator_t leap_indicator)
 {
     if (!s_clock.initialized ||
-        pps_capture_us == 0U ||
+        pps_capture_ns == 0U ||
         utc_seconds <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -510,14 +524,14 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
     }
 
     if (!s_clock.solution_valid) {
-        s_clock.anchor_capture_us = pps_capture_us;
+        s_clock.anchor_capture_ns = pps_capture_ns;
         s_clock.anchor_utc_seconds = utc_seconds;
 
-        s_clock.last_sample_capture_us = pps_capture_us;
+        s_clock.last_sample_capture_ns = pps_capture_ns;
         s_clock.last_sample_utc_seconds = utc_seconds;
 
         s_clock.reference_timestamp_valid = true;
-        s_clock.reference_capture_us = pps_capture_us;
+        s_clock.reference_capture_ns = pps_capture_ns;
         s_clock.reference_utc_seconds = utc_seconds;
 
         s_clock.last_phase_error_ns = timing_quantization_error_ns;
@@ -541,15 +555,15 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         return ESP_OK;
     }
 
-    if (pps_capture_us <= s_clock.last_sample_capture_us ||
+    if (pps_capture_ns <= s_clock.last_sample_capture_ns ||
         utc_seconds <= s_clock.last_sample_utc_seconds) {
         reject_sample_locked();
         unlock_clock();
         return ESP_ERR_INVALID_STATE;
     }
 
-    const uint64_t local_elapsed_us =
-        pps_capture_us - s_clock.last_sample_capture_us;
+    const uint64_t local_elapsed_ns =
+        pps_capture_ns - s_clock.last_sample_capture_ns;
 
     const int64_t utc_elapsed_seconds =
         utc_seconds - s_clock.last_sample_utc_seconds;
@@ -560,12 +574,12 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         return ESP_ERR_INVALID_STATE;
     }
 
-    const double expected_elapsed_us =
-        (double)utc_elapsed_seconds * 1000000.0;
+    const double expected_elapsed_ns =
+        (double)utc_elapsed_seconds * 1000000000.0;
 
     const double measured_period_error_ppm =
-        (((double)local_elapsed_us - expected_elapsed_us) /
-         expected_elapsed_us) * 1000000.0;
+        (((double)local_elapsed_ns - expected_elapsed_ns) /
+         expected_elapsed_ns) * 1000000.0;
 
     /*
      * The local counter runs fast when its measured interval exceeds one
@@ -587,26 +601,23 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         s_clock.frequency_ppm = -APP_CLOCK_MAX_FREQUENCY_PPM;
     }
 
-    const uint64_t anchor_elapsed_us =
-        pps_capture_us - s_clock.anchor_capture_us;
-
-    const double predicted_utc_seconds =
-        (double)s_clock.anchor_utc_seconds +
-        ((double)anchor_elapsed_us / 1000000.0) *
-            (1.0 + (s_clock.frequency_ppm / 1000000.0));
+    /* Phase error = actual UTC elapsed - predicted (corrected local)
+     * elapsed, in integer ns: subtracting two absolute UTC doubles would
+     * lose everything below ~0.24 us. */
+    const uint64_t anchor_elapsed_ns =
+        pps_capture_ns - s_clock.anchor_capture_ns;
 
     const int64_t phase_error_ns =
-        (int64_t)llround(
-            ((double)utc_seconds - predicted_utc_seconds) *
-            1000000000.0) +
+        ((utc_seconds - s_clock.anchor_utc_seconds) * 1000000000LL) -
+        corrected_elapsed_ns(anchor_elapsed_ns, s_clock.frequency_ppm) +
         (int64_t)timing_quantization_error_ns;
 
     if (llabs(phase_error_ns) >
         APP_CLOCK_MAX_ACCEPTABLE_ERROR_NS) {
-        s_clock.anchor_capture_us = pps_capture_us;
+        s_clock.anchor_capture_ns = pps_capture_ns;
         s_clock.anchor_utc_seconds = utc_seconds;
 
-        s_clock.last_sample_capture_us = pps_capture_us;
+        s_clock.last_sample_capture_ns = pps_capture_ns;
         s_clock.last_sample_utc_seconds = utc_seconds;
 
         s_clock.last_phase_error_ns = phase_error_ns;
@@ -619,14 +630,14 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    s_clock.anchor_capture_us = pps_capture_us;
+    s_clock.anchor_capture_ns = pps_capture_ns;
     s_clock.anchor_utc_seconds = utc_seconds;
 
-    s_clock.last_sample_capture_us = pps_capture_us;
+    s_clock.last_sample_capture_ns = pps_capture_ns;
     s_clock.last_sample_utc_seconds = utc_seconds;
 
     s_clock.reference_timestamp_valid = true;
-    s_clock.reference_capture_us = pps_capture_us;
+    s_clock.reference_capture_ns = pps_capture_ns;
     s_clock.reference_utc_seconds = utc_seconds;
 
     s_clock.last_phase_error_ns = phase_error_ns;
@@ -664,36 +675,34 @@ bool clock_discipline_get_ntp_timestamp(clock_ntp_timestamp_t *out_timestamp)
         return false;
     }
 
-    uint64_t now_capture_us = 0;
+    uint64_t now_capture_ns = 0;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us) ||
-        now_capture_us < s_clock.anchor_capture_us) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns) ||
+        now_capture_ns < s_clock.anchor_capture_ns) {
         unlock_clock();
         return false;
     }
 
-    const uint64_t elapsed_us =
-        now_capture_us - s_clock.anchor_capture_us;
+    const int64_t since_anchor_ns = corrected_elapsed_ns(
+        now_capture_ns - s_clock.anchor_capture_ns, s_clock.frequency_ppm);
 
-    const double utc_seconds =
-        (double)s_clock.anchor_utc_seconds +
-        ((double)elapsed_us / 1000000.0) *
-            (1.0 + (s_clock.frequency_ppm / 1000000.0));
-
-    if (utc_seconds < 0.0) {
+    if (s_clock.anchor_utc_seconds < 0 || since_anchor_ns < 0) {
         unlock_clock();
         return false;
     }
 
-    const uint64_t integer_seconds = (uint64_t)utc_seconds;
-    const double fractional_seconds =
-        utc_seconds - (double)integer_seconds;
+    const uint64_t integer_seconds =
+        (uint64_t)s_clock.anchor_utc_seconds +
+        (uint64_t)since_anchor_ns / 1000000000ULL;
+    const uint64_t remainder_ns =
+        (uint64_t)since_anchor_ns % 1000000000ULL;
 
     out_timestamp->seconds =
         (uint32_t)(integer_seconds + APP_NTP_EPOCH_DELTA);
 
+    /* remainder_ns < 1e9, so remainder_ns << 32 fits in 64 bits. */
     out_timestamp->fraction =
-        (uint32_t)(fractional_seconds * 4294967296.0);
+        (uint32_t)((remainder_ns << 32) / 1000000000ULL);
 
     unlock_clock();
 
@@ -721,10 +730,10 @@ bool clock_discipline_get_reference_timestamp(
         return false;
     }
 
-    uint64_t now_capture_us = s_clock.reference_capture_us;
+    uint64_t now_capture_ns = s_clock.reference_capture_ns;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us) ||
-        now_capture_us < s_clock.reference_capture_us) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns) ||
+        now_capture_ns < s_clock.reference_capture_ns) {
         unlock_clock();
         return false;
     }
@@ -736,7 +745,7 @@ bool clock_discipline_get_reference_timestamp(
 
     if (out_age_seconds != NULL) {
         const uint64_t age_seconds =
-            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+            (now_capture_ns - s_clock.reference_capture_ns) / 1000000000ULL;
 
         *out_age_seconds = age_seconds > UINT32_MAX
                                ? UINT32_MAX
@@ -757,12 +766,12 @@ bool clock_discipline_get_status(clock_discipline_status_t *out_status)
         return false;
     }
 
-    uint64_t now_capture_us = s_clock.last_sample_capture_us;
+    uint64_t now_capture_ns = s_clock.last_sample_capture_ns;
 
-    (void)pps_service_get_monotonic_us(&now_capture_us);
+    (void)pps_service_get_monotonic_ns(&now_capture_ns);
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     out_status->initialized = s_clock.initialized;
     out_status->solution_valid = s_clock.solution_valid;
@@ -782,9 +791,9 @@ bool clock_discipline_get_status(clock_discipline_status_t *out_status)
     out_status->reference_utc_seconds = s_clock.reference_utc_seconds;
 
     if (out_status->reference_timestamp_valid &&
-        now_capture_us >= s_clock.reference_capture_us) {
+        now_capture_ns >= s_clock.reference_capture_ns) {
         const uint64_t reference_age_seconds =
-            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+            (now_capture_ns - s_clock.reference_capture_ns) / 1000000000ULL;
 
         out_status->reference_age_seconds =
             reference_age_seconds > UINT32_MAX

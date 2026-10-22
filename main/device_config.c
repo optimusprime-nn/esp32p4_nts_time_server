@@ -10,6 +10,7 @@
 #include "app_state.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "lwip/inet.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -32,6 +33,12 @@ static const char *TAG = "DEVICE_CFG";
 #define KEY_PEER1           "peer1"
 #define KEY_PEER2           "peer2"
 #define KEY_PEER3           "redundant"
+/* Optional static IPv4; absent keys mean DHCP. Older firmware ignores them. */
+#define KEY_IP_STATIC       "ip_static"
+#define KEY_IP_ADDR         "ip_addr"
+#define KEY_IP_MASK         "ip_mask"
+#define KEY_IP_GW           "ip_gw"
+#define KEY_IP_DNS          "ip_dns"
 
 typedef struct {
     device_config_snapshot_t public_config;
@@ -135,6 +142,27 @@ static void lowercase(char *value)
     }
 }
 
+bool device_config_static_ipv4_is_valid(uint32_t address,
+                                        uint32_t netmask,
+                                        uint32_t gateway,
+                                        uint32_t dns)
+{
+    (void)dns;
+    const uint32_t addr = ntohl(address);
+    const uint32_t mask = ntohl(netmask);
+    const uint32_t gw = ntohl(gateway);
+
+    /* Contiguous mask between /8 and /30. */
+    if ((~mask & (~mask + 1U)) != 0U ||
+        mask < 0xFF000000U || mask > 0xFFFFFFFCU) return false;
+    const uint32_t host = addr & ~mask;
+    if (host == 0U || host == ~mask) return false;
+    const uint8_t first_octet = (uint8_t)(addr >> 24);
+    if (first_octet == 0U || first_octet == 127U || first_octet >= 224U) return false;
+    if (gw != 0U && ((gw & mask) != (addr & mask) || gw == addr)) return false;
+    return true;
+}
+
 static void make_default_config(stored_config_t *config)
 {
     memset(config, 0, sizeof(*config));
@@ -194,6 +222,13 @@ static esp_err_t persist_config(const stored_config_t *config)
             if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) err = erase_err;
         }
     }
+
+    if (err == ESP_OK) err = nvs_set_u8(handle, KEY_IP_STATIC,
+                                         config->public_config.static_ipv4_enabled ? 1U : 0U);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_ADDR, config->public_config.static_ipv4_address);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_MASK, config->public_config.static_ipv4_netmask);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_GW, config->public_config.static_ipv4_gateway);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_DNS, config->public_config.static_ipv4_dns);
 
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
@@ -329,6 +364,25 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
                 config->public_config.ntp_peers[i].enabled = false;
             }
         }
+        uint8_t ip_static = 0U;
+        uint32_t ip_addr = 0U, ip_mask = 0U, ip_gw = 0U, ip_dns = 0U;
+        (void)nvs_get_u8(handle, KEY_IP_STATIC, &ip_static);
+        (void)nvs_get_u32(handle, KEY_IP_ADDR, &ip_addr);
+        (void)nvs_get_u32(handle, KEY_IP_MASK, &ip_mask);
+        (void)nvs_get_u32(handle, KEY_IP_GW, &ip_gw);
+        (void)nvs_get_u32(handle, KEY_IP_DNS, &ip_dns);
+        /* A stored but invalid static configuration falls back to DHCP so a
+         * bad value can never leave the device unreachable. */
+        if (ip_static != 0U &&
+            device_config_static_ipv4_is_valid(ip_addr, ip_mask, ip_gw, ip_dns)) {
+            config->public_config.static_ipv4_enabled = true;
+        } else if (ip_static != 0U) {
+            ESP_LOGW(TAG, "Stored static IPv4 configuration is invalid; using DHCP");
+        }
+        config->public_config.static_ipv4_address = ip_addr;
+        config->public_config.static_ipv4_netmask = ip_mask;
+        config->public_config.static_ipv4_gateway = ip_gw;
+        config->public_config.static_ipv4_dns = ip_dns;
         nvs_close(handle);
     }
     config->public_config.ntp_peer_monitor_enabled = peer_enabled != 0U;
@@ -550,6 +604,35 @@ esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
     return err;
 }
 
+esp_err_t device_config_set_static_ipv4(bool enabled,
+                                        uint32_t address,
+                                        uint32_t netmask,
+                                        uint32_t gateway,
+                                        uint32_t dns)
+{
+    if (!s_initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
+    if (enabled && !device_config_static_ipv4_is_valid(address, netmask, gateway, dns))
+        return ESP_ERR_INVALID_ARG;
+    if (!lock_config()) return ESP_FAIL;
+    stored_config_t candidate = s_config;
+    candidate.public_config.static_ipv4_enabled = enabled;
+    /* Keep the last addresses when disabling, so re-enabling is easy. */
+    if (enabled) {
+        candidate.public_config.static_ipv4_address = address;
+        candidate.public_config.static_ipv4_netmask = netmask;
+        candidate.public_config.static_ipv4_gateway = gateway;
+        candidate.public_config.static_ipv4_dns = dns;
+    }
+    candidate.public_config.generation = next_generation(candidate.public_config.generation);
+    esp_err_t err = persist_config(&candidate);
+    if (err == ESP_OK) s_config = candidate;
+    unlock_config();
+    if (err == ESP_OK)
+        ESP_LOGI(TAG, "Network configuration committed: generation=%" PRIu32 " static_ipv4=%s (applies at reboot)",
+                 candidate.public_config.generation, enabled ? "yes" : "no");
+    return err;
+}
+
 esp_err_t device_config_export_backup(device_config_backup_t *out_backup)
 {
     if (out_backup == NULL) return ESP_ERR_INVALID_ARG;
@@ -586,6 +669,11 @@ esp_err_t device_config_restore_backup(const device_config_backup_t *backup)
         if (backup->config.ntp_peers[i].enabled &&
             !device_config_ntp_peer_server_is_valid(backup->config.ntp_peers[i].server)) return ESP_ERR_INVALID_ARG;
     }
+    if (backup->config.static_ipv4_enabled &&
+        !device_config_static_ipv4_is_valid(backup->config.static_ipv4_address,
+                                            backup->config.static_ipv4_netmask,
+                                            backup->config.static_ipv4_gateway,
+                                            backup->config.static_ipv4_dns)) return ESP_ERR_INVALID_ARG;
     if (backup->config.cloudflare_configured &&
         (!device_config_cloudflare_zone_is_valid(backup->config.cloudflare_zone_name) ||
          !zone_id_is_valid(backup->config.cloudflare_zone_id) ||

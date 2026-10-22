@@ -14,6 +14,7 @@ typedef struct {
     bool started;
     bool link_up;
     bool ipv4_ready;
+    bool ipv4_static;
 
     bool ptp_supported;
     bool ptp_enabled;

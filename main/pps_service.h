@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 typedef struct {
+    uint64_t capture_ns;
     uint64_t capture_us;
     uint64_t capture_ticks;
 } pps_capture_event_t;
@@ -47,6 +48,9 @@ bool pps_service_wait_for_capture(pps_capture_event_t *out_event,
                                   uint32_t timeout_ms);
 
 bool pps_service_get_monotonic_us(uint64_t *out_us);
+
+/* Same timebase as the PPS captures, at full GPTimer resolution. */
+bool pps_service_get_monotonic_ns(uint64_t *out_ns);
 
 bool pps_service_get_status(pps_service_status_t *out_status);
 
