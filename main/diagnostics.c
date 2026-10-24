@@ -35,17 +35,24 @@ static const char *TAG = "DIAG";
 #endif
 
 
-/* TS2-only mitigation. Require 600 seconds without RX progress before reboot.
- * RTC memory survives esp_restart(); cap consecutive recovery boots to avoid
- * an endless reboot loop. This counter clears only after sustained RX progress.
- */
-#define TS2_RX_AUTO_REBOOT 1
-#define TS2_RX_REBOOT_AFTER_US (600000000LL)
-#define TS2_RX_STABLE_CLEAR_US (600000000LL)
-#define TS2_RX_MAX_REBOOTS 2
-RTC_NOINIT_ATTR static uint32_t s_ts2_rx_reboot_magic;
-RTC_NOINIT_ATTR static uint32_t s_ts2_rx_reboot_count;
-#define TS2_RX_REBOOT_MAGIC 0x54325258U
+/* Ethernet RX-hang watchdog, on every board. The ESP32-P4 EMAC can stop
+ * delivering received frames (first seen on TS2, then on TS1 on 24 Oct 2026,
+ * when TS1 stayed dark for 56 min until power-cycled). Reboot after 120 s with
+ * no RX progress while link and IPv4 are up. Boards normally receive steady
+ * traffic (ARP, peer polls every 16 s, NTP clients), so 2 min of silence is
+ * not ordinary idleness. RTC memory survives esp_restart(); cap consecutive
+ * recovery boots so a fault that a reboot does not fix cannot loop forever.
+ * The budget clears only after 10 min of sustained RX progress. */
+#define RX_WATCHDOG_ENABLED 1
+#define RX_WATCHDOG_REBOOT_AFTER_US (120000000LL)
+/* Link up but no IPv4 for this long: DHCP has had ample time, so treat an
+ * RX path that cannot complete DHCP as a hang. */
+#define RX_WATCHDOG_NO_IP_AFTER_US  (600000000LL)
+#define RX_WATCHDOG_STABLE_CLEAR_US (600000000LL)
+#define RX_WATCHDOG_MAX_REBOOTS 2
+RTC_NOINIT_ATTR static uint32_t s_rx_watchdog_magic;
+RTC_NOINIT_ATTR static uint32_t s_rx_watchdog_reboots;
+#define RX_WATCHDOG_MAGIC 0x54325258U
 
 
 static const char *clock_state_to_string(app_clock_state_t state)
@@ -98,10 +105,10 @@ static void diagnostics_task(void *arg)
     bool rx_seen = false;
     bool stall_reported = false;
     int64_t stable_rx_since_us = 0;
-    if (s_ts2_rx_reboot_magic != TS2_RX_REBOOT_MAGIC ||
-        s_ts2_rx_reboot_count > TS2_RX_MAX_REBOOTS) {
-        s_ts2_rx_reboot_magic = TS2_RX_REBOOT_MAGIC;
-        s_ts2_rx_reboot_count = 0;
+    if (s_rx_watchdog_magic != RX_WATCHDOG_MAGIC ||
+        s_rx_watchdog_reboots > RX_WATCHDOG_MAX_REBOOTS) {
+        s_rx_watchdog_magic = RX_WATCHDOG_MAGIC;
+        s_rx_watchdog_reboots = 0;
     }
     int64_t last_stall_snapshot_us = 0;
 #if TS2_B5_ONE_SHOT_RECOVERY
@@ -203,10 +210,10 @@ static void diagnostics_task(void *arg)
             last_rx_progress_us = rx_now_us;
             previous_rx = eth_status.diag_rx_frames;
             if (!stable_rx_since_us) stable_rx_since_us = rx_now_us;
-            if (rx_now_us - stable_rx_since_us >= TS2_RX_STABLE_CLEAR_US &&
-                s_ts2_rx_reboot_count != 0) {
-                ESP_LOGW(TAG, "TS2 RX watchdog: stable RX for 10min; clearing reboot budget");
-                s_ts2_rx_reboot_count = 0;
+            if (rx_now_us - stable_rx_since_us >= RX_WATCHDOG_STABLE_CLEAR_US &&
+                s_rx_watchdog_reboots != 0) {
+                ESP_LOGW(TAG, "RX watchdog: stable RX for 10min; clearing reboot budget");
+                s_rx_watchdog_reboots = 0;
             }
             if (stall_reported) {
                 ESP_LOGW(TAG, "eth-rx-stall: RECOVERED rx=%" PRIu32,
@@ -241,30 +248,102 @@ static void diagnostics_task(void *arg)
             }
 #endif
         }
-#if TS2_RX_AUTO_REBOOT
+#if RX_WATCHDOG_ENABLED
         /* Avoid interpreting ordinary idle traffic as failure: require an
-         * established RX history, link+IPv4, and the TS2 hardware MAC.
-         * In this deployment periodic peer traffic is expected; 600s of RX
-         * silence is abnormal. This mitigation is deliberately TS2-only. */
-        static const uint8_t ts2_watchdog_mac[6] = {0xe8,0xf6,0x0a,0xe7,0x34,0x08};
+         * established RX history and link + IPv4 up, so a cable pull or a
+         * lost DHCP lease never triggers a reboot. */
         if (rx_seen && stall_reported && eth_status.started &&
             eth_status.link_up && eth_status.ipv4_ready &&
-            memcmp(eth_status.mac, ts2_watchdog_mac, sizeof(ts2_watchdog_mac)) == 0 &&
-            rx_now_us - last_rx_progress_us >= TS2_RX_REBOOT_AFTER_US &&
-            s_ts2_rx_reboot_count < TS2_RX_MAX_REBOOTS) {
-            ++s_ts2_rx_reboot_count;
-            ESP_LOGE(TAG, "TS2 RX watchdog: RX stalled >600s, reboot %" PRIu32 "/%u",
-                     s_ts2_rx_reboot_count, TS2_RX_MAX_REBOOTS);
+            rx_now_us - last_rx_progress_us >= RX_WATCHDOG_REBOOT_AFTER_US &&
+            s_rx_watchdog_reboots < RX_WATCHDOG_MAX_REBOOTS) {
+            ++s_rx_watchdog_reboots;
+            ESP_LOGE(TAG, "RX watchdog: RX stalled >%llds, reboot %" PRIu32 "/%u",
+                     (long long)(RX_WATCHDOG_REBOOT_AFTER_US / 1000000LL),
+                     s_rx_watchdog_reboots, RX_WATCHDOG_MAX_REBOOTS);
             /* Persist recovery reason before reboot; SD writes are asynchronous. */
             char detail[OPERATIONS_EVENT_DETAIL_MAX + 1U];
             (void)snprintf(detail, sizeof(detail),
-                           "TS2 RX stalled; reboot %" PRIu32 "/%u; rx=%" PRIu32,
-                           s_ts2_rx_reboot_count, TS2_RX_MAX_REBOOTS,
+                           "Ethernet RX stalled; reboot %" PRIu32 "/%u; rx=%" PRIu32,
+                           s_rx_watchdog_reboots, RX_WATCHDOG_MAX_REBOOTS,
                            eth_status.diag_rx_frames);
             esp_err_t record_err = operations_history_record(
-                OPERATIONS_EVENT_RECOVERY, (int32_t)s_ts2_rx_reboot_count, detail);
+                OPERATIONS_EVENT_RECOVERY, (int32_t)s_rx_watchdog_reboots, detail);
             if (record_err != ESP_OK) {
-                ESP_LOGE(TAG, "TS2 recovery NVS event failed: %s", esp_err_to_name(record_err));
+                ESP_LOGE(TAG, "RX watchdog NVS event failed: %s", esp_err_to_name(record_err));
+            }
+            esp_restart();
+        }
+
+        /* The RX counter alone cannot see every whole-board outage: the
+         * board can keep receiving while transmit is dead (for example the
+         * MAC left stopped after a failed link-down), or while received
+         * frames never reach lwIP. Watch progress on both paths, and the
+         * link-up-but-no-address case where an RX hang stops DHCP. All
+         * share the same reboot budget. */
+        static uint32_t s_wd_last_tx_ok;
+        static uint32_t s_wd_last_tx_attempt;
+        static int64_t s_wd_tx_failing_since_us;
+        static uint32_t s_wd_last_rx_fwd_ok;
+        static uint32_t s_wd_last_rx_seen;
+        static int64_t s_wd_rx_failing_since_us;
+        static int64_t s_wd_link_no_ip_since_us;
+
+        const uint32_t tx_ok = eth_status.diag_tx_other_attempt - eth_status.diag_tx_other_fail;
+        const uint32_t rx_fwd_ok = eth_status.diag_rx_frames - eth_status.diag_rx_forward_fail;
+        const bool link_and_ip = eth_status.started && eth_status.link_up && eth_status.ipv4_ready;
+
+        /* A failure run starts at the first attempt that fails after a
+         * success and ends at the next success. Idle windows neither start
+         * nor end it, so bursty retries while a path is dead still count,
+         * and a single failure after a long quiet spell does not. */
+        if (!link_and_ip || tx_ok != s_wd_last_tx_ok) {
+            s_wd_tx_failing_since_us = 0;
+        } else if (eth_status.diag_tx_other_attempt != s_wd_last_tx_attempt &&
+                   s_wd_tx_failing_since_us == 0) {
+            s_wd_tx_failing_since_us = rx_now_us;
+        }
+        s_wd_last_tx_ok = tx_ok;
+        s_wd_last_tx_attempt = eth_status.diag_tx_other_attempt;
+
+        if (!link_and_ip || rx_fwd_ok != s_wd_last_rx_fwd_ok) {
+            s_wd_rx_failing_since_us = 0;
+        } else if (eth_status.diag_rx_frames != s_wd_last_rx_seen &&
+                   s_wd_rx_failing_since_us == 0) {
+            s_wd_rx_failing_since_us = rx_now_us;
+        }
+        s_wd_last_rx_fwd_ok = rx_fwd_ok;
+        s_wd_last_rx_seen = eth_status.diag_rx_frames;
+
+        /* Link up without an address. */
+        if (eth_status.started && eth_status.link_up && !eth_status.ipv4_ready) {
+            if (s_wd_link_no_ip_since_us == 0) s_wd_link_no_ip_since_us = rx_now_us;
+        } else {
+            s_wd_link_no_ip_since_us = 0;
+        }
+
+        const char *stall_reason = NULL;
+        if (s_wd_tx_failing_since_us != 0 &&
+            rx_now_us - s_wd_tx_failing_since_us >= RX_WATCHDOG_REBOOT_AFTER_US) {
+            stall_reason = "Ethernet TX stalled";
+        } else if (s_wd_rx_failing_since_us != 0 &&
+                   rx_now_us - s_wd_rx_failing_since_us >= RX_WATCHDOG_REBOOT_AFTER_US) {
+            stall_reason = "Ethernet RX not reaching lwIP";
+        } else if (s_wd_link_no_ip_since_us != 0 &&
+                   rx_now_us - s_wd_link_no_ip_since_us >= RX_WATCHDOG_NO_IP_AFTER_US) {
+            stall_reason = "Ethernet link up without IPv4";
+        }
+
+        if (stall_reason != NULL && s_rx_watchdog_reboots < RX_WATCHDOG_MAX_REBOOTS) {
+            ++s_rx_watchdog_reboots;
+            ESP_LOGE(TAG, "Network watchdog: %s, reboot %" PRIu32 "/%u",
+                     stall_reason, s_rx_watchdog_reboots, RX_WATCHDOG_MAX_REBOOTS);
+            char detail[OPERATIONS_EVENT_DETAIL_MAX + 1U];
+            (void)snprintf(detail, sizeof(detail), "%s; reboot %" PRIu32 "/%u",
+                           stall_reason, s_rx_watchdog_reboots, RX_WATCHDOG_MAX_REBOOTS);
+            esp_err_t record_err = operations_history_record(
+                OPERATIONS_EVENT_RECOVERY, (int32_t)s_rx_watchdog_reboots, detail);
+            if (record_err != ESP_OK) {
+                ESP_LOGE(TAG, "Network watchdog NVS event failed: %s", esp_err_to_name(record_err));
             }
             esp_restart();
         }

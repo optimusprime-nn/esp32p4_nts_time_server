@@ -1,3 +1,5 @@
+#include <stdbool.h>
+
 #include "app_state.h"
 #include "clock_discipline.h"
 #include "commissioning.h"
@@ -28,6 +30,37 @@
 #include "nvs_flash.h"
 
 static const char *TAG = "MAIN";
+
+/* How long a new OTA image must run before it is confirmed. Long enough to
+ * cover the SD mount, the first GNSS lock and the first network-watchdog
+ * window, so the failures seen in the field (SD/PSRAM boot loop, network
+ * stall) happen while the image can still roll back. */
+#define OTA_SOAK_SECONDS 300U
+
+static bool s_web_console_started;
+
+static void ota_soak_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(OTA_SOAK_SECONDS * 1000U));
+
+    if (!s_web_console_started) {
+        /* The console is the only OTA path: an image without it cannot be
+         * replaced remotely, so return to the previous one if still pending. */
+        const esp_err_t err =
+            ota_manager_reject_running_image("web console failed to start; rolling back");
+        if (err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "OTA rollback request failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        const esp_err_t err = ota_manager_confirm_running_image();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "OTA running-image confirmation failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    vTaskDelete(NULL);
+}
 
 static void enter_fail_closed(const char *component, esp_err_t err)
 {
@@ -205,6 +238,7 @@ void app_main(void)
     }
 
     err = web_console_start();
+    s_web_console_started = (err == ESP_OK);
 
     if (err != ESP_OK) {
         /*
@@ -229,12 +263,13 @@ void app_main(void)
                  esp_err_to_name(err));
     }
 
-    /* A newly booted OTA image is confirmed only after the complete service
-     * startup path has succeeded. A crash/reset before this point leaves it
-     * pending so the bootloader can roll back on the next boot. */
-const esp_err_t ota_confirm_err = ota_manager_confirm_running_image();
-    if (ota_confirm_err != ESP_OK) {
-        ESP_LOGW(TAG, "OTA running-image confirmation deferred/failed: %s", esp_err_to_name(ota_confirm_err));
+    /* A newly booted OTA image is confirmed only after it has run for a soak
+     * period with the management console up (see ota_soak_task). Any crash
+     * or watchdog reboot before then leaves it pending, so the bootloader
+     * rolls back to the previous image. */
+    if (xTaskCreate(ota_soak_task, "ota_soak", 4096U, NULL, 3U, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "OTA soak task unavailable; confirming running image now");
+        (void)ota_manager_confirm_running_image();
     }
 
     if (peer_monitor_err == ESP_OK) {

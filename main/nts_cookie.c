@@ -393,11 +393,14 @@ esp_err_t nts_cookie_unpack(
         cookie_len -
         NTS_COOKIE_WIRE_PREFIX_LEN;
 
+    /* Storage/clock faults are reported as ESP_FAIL / ESP_ERR_TIMEOUT so the
+     * NTP path never answers them with an NTS NAK: a NAK tells the client to
+     * discard cookies that may be perfectly valid. */
     esp_err_t err =
         nts_storage_maintain_cookie_keyring();
 
     if (err != ESP_OK) {
-        return err;
+        return err == ESP_ERR_TIMEOUT ? ESP_ERR_TIMEOUT : ESP_FAIL;
     }
 
     nts_storage_cookie_keyring_t keyring;
@@ -406,7 +409,7 @@ esp_err_t nts_cookie_unpack(
         &keyring);
 
     if (err != ESP_OK) {
-        return err;
+        return ESP_FAIL;
     }
 
     const nts_storage_cookie_key_t *master =
@@ -504,7 +507,7 @@ esp_err_t nts_cookie_unpack(
         plaintext,
         sizeof(plaintext));
 
-    return ESP_ERR_INVALID_STATE;
+    return ESP_ERR_TIMEOUT; /* clock unavailable, not expiry */
     }
 
     const uint64_t now_ntp =

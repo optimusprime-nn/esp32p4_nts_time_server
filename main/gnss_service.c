@@ -42,6 +42,7 @@ static const char *TAG = "GNSS";
 
 #define UBX_ID_NAV_PVT                          0x07U
 #define UBX_ID_NAV_TIMELS                       0x26U
+#define UBX_ID_NAV_TIMEGPS                      0x20U
 
 #define UBX_ID_TIM_TP                           0x01U
 
@@ -82,11 +83,20 @@ static const char *TAG = "GNSS";
 #define UBX_NAV_PVT_VALID_FULLY_RESOLVED        (1U << 2)
 #define UBX_NAV_PVT_FLAG_GNSS_FIX_OK            (1U << 0)
 
+#define UBX_NAV_TIMEGPS_MIN_LENGTH              16U
+#define UBX_NAV_TIMEGPS_LEAPS_OFFSET            10U
+#define UBX_NAV_TIMEGPS_VALID_OFFSET            11U
+#define UBX_NAV_TIMEGPS_VALID_LEAPS             (1U << 2)
+#define GNSS_TIMEGPS_LEAP_MAX_AGE_US            3000000LL
+
 #define UBX_NAV_TIMELS_MIN_LENGTH               24U
 #define UBX_NAV_TIMELS_CURRENT_LEAP_OFFSET      9U
 #define UBX_NAV_TIMELS_LEAP_CHANGE_OFFSET       11U
 #define UBX_NAV_TIMELS_TIME_TO_EVENT_OFFSET     12U
-#define UBX_NAV_TIMELS_VALID_OFFSET             20U
+/* u-blox M8 UBX-NAV-TIMELS: bytes 20-22 are reserved, valid is byte 23.
+ * Reading byte 20 made validCurrLs/validTimeToLsEvent always look false,
+ * which hid real leap announcements and forced the unvalidated fallback. */
+#define UBX_NAV_TIMELS_VALID_OFFSET             23U
 
 /* NTP leap indicator is only raised within this many seconds of the event. */
 #define APP_LEAP_ANNOUNCE_WINDOW_SECONDS        86400
@@ -100,6 +110,7 @@ static const char *TAG = "GNSS";
 #define UBX_TIM_TP_QERR_OFFSET                  8U
 #define UBX_TIM_TP_WEEK_OFFSET                  12U
 #define UBX_TIM_TP_FLAGS_OFFSET                 14U
+#define UBX_TIM_TP_REF_INFO_OFFSET              15U
 
 typedef enum {
     UBX_WAIT_SYNC_1 = 0,
@@ -137,6 +148,10 @@ static size_t s_nmea_length;
 static int64_t s_last_utc_rx_us;
 static int64_t s_last_pvt_rx_us;
 static int64_t s_last_tim_tp_rx_us;
+/* Independently receiver-validated leap seconds from NAV-TIMEGPS. */
+static int64_t s_last_timegps_leap_rx_us;
+static int8_t s_timegps_leap_seconds;
+static bool s_timegps_leap_valid;
 
 static bool s_ack_waiting;
 static uint8_t s_ack_expected_class;
@@ -498,6 +513,36 @@ static void handle_ubx_nav_pvt(const uint8_t *payload,
                              0);
 }
 
+static void handle_ubx_nav_timegps(const uint8_t *payload,
+                                    uint16_t payload_length)
+{
+    if (payload_length < UBX_NAV_TIMEGPS_MIN_LENGTH) return;
+    const int8_t leap = (int8_t)payload[UBX_NAV_TIMEGPS_LEAPS_OFFSET];
+    const uint8_t valid = payload[UBX_NAV_TIMEGPS_VALID_OFFSET];
+    const bool leap_valid = (valid & UBX_NAV_TIMEGPS_VALID_LEAPS) != 0U &&
+                            leap >= 0 && leap <= 64;
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_gnss_lock);
+    s_timegps_leap_valid = leap_valid;
+    if (leap_valid) {
+        s_timegps_leap_seconds = leap;
+        s_last_timegps_leap_rx_us = now_us;
+        /* Do not override a different, validated NAV-TIMELS value. */
+        if (!s_status.leap_information_valid) {
+            s_status.current_leap_seconds = leap;
+            s_status.leap_information_valid = true;
+            s_status.leap_indicator = APP_LEAP_NO_WARNING;
+        }
+    }
+    portEXIT_CRITICAL(&s_gnss_lock);
+    static int64_t last_log_us;
+    if (now_us - last_log_us > 5000000LL) {
+        last_log_us = now_us;
+        ESP_LOGI(TAG, "NAV-TIMEGPS leap_valid=%d leap=%d valid_flags=0x%02x",
+                 (int)leap_valid, (int)leap, (unsigned)valid);
+    }
+}
+
 static void handle_ubx_nav_timels(const uint8_t *payload,
                                   uint16_t payload_length)
 {
@@ -525,20 +570,87 @@ static void handle_ubx_nav_timels(const uint8_t *payload,
 
     /*
      * LEA-M8T receivers can report a usable current leap-second value before
-     * validCurrLs is asserted. Accept only the bounded no-pending-leap case:
+     * validCurrLs is asserted. Accept it only in the no-pending-leap case:
      *
      * - Current leap value is plausible.
-     * - No insertion or deletion is pending.
-     * - The next event is more than 24 hours away.
+     * - No insertion or deletion is pending (leap_change == 0).
+     *
+     * There is deliberately no time-to-event condition. GPS routinely
+     * broadcasts a scheduled "event" with zero change; a requirement that it
+     * be more than 24 h away made this fallback lapse a day before that
+     * event (23 Oct 2026) and never return once the countdown went negative,
+     * leaving the clock unable to synchronise. A zero-change event cannot
+     * insert or delete a second, so its timing is irrelevant here.
      */
     const bool bounded_current_leap_fallback =
         current_leap_seconds >= 0 &&
         current_leap_seconds <= 64 &&
-        leap_change == 0 &&
-        seconds_to_event > 86400;
+        leap_change == 0;
 
+    /* NAV-TIMEGPS has an independent receiver-valid leapS bit. A fresh
+     * validated value can replace unvalidated NAV-TIMELS leap metadata.
+     * Reject conflicting offsets instead of silently choosing one. */
+    bool timegps_usable = false;
+    int8_t timegps_offset = 0;
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_gnss_lock);
+    timegps_usable = s_timegps_leap_valid &&
+        s_last_timegps_leap_rx_us > 0 &&
+        now_us >= s_last_timegps_leap_rx_us &&
+        now_us - s_last_timegps_leap_rx_us <= GNSS_TIMEGPS_LEAP_MAX_AGE_US;
+    timegps_offset = s_timegps_leap_seconds;
+    portEXIT_CRITICAL(&s_gnss_lock);
+    /* Disagreements repeat with every 1 Hz NAV-TIMELS message for as long
+     * as they last; report them at most once a minute. */
+    static int64_t s_last_disagreement_log_us;
+    const bool log_disagreement =
+        s_last_disagreement_log_us == 0 ||
+        now_us - s_last_disagreement_log_us >= 60000000LL;
+
+    /* Two receiver-validated values that conflict: trust neither. Serving
+     * whole seconds wrong at stratum 1 is worse than not serving. */
+    const bool validated_conflict =
+        timegps_usable && current_leap_valid &&
+        timegps_offset != current_leap_seconds;
+    if (validated_conflict && log_disagreement) {
+        s_last_disagreement_log_us = now_us;
+        ESP_LOGE(TAG, "Validated leap disagreement TIMEGPS=%d TIMELS=%d; leap data unusable",
+                 (int)timegps_offset, (int)current_leap_seconds);
+    } else if (!current_leap_valid && !timegps_usable &&
+               bounded_current_leap_fallback && log_disagreement) {
+        s_last_disagreement_log_us = now_us;
+        ESP_LOGW(TAG, "Leap seconds not yet validated by the receiver (unvalidated value %d); not synchronising",
+                 (int)current_leap_seconds);
+    }
+    /* Only receiver-validated leap data may make the clock eligible. The
+     * unvalidated value (bounded_current_leap_fallback) is reported for
+     * diagnosis only: after a cold start it can be the receiver's firmware
+     * default rather than the broadcast value. */
     const bool leap_information_usable =
-        current_leap_valid || bounded_current_leap_fallback;
+        !validated_conflict && (current_leap_valid || timegps_usable);
+    /* Preference: validated TIMELS, then validated TIMEGPS. */
+    const int8_t selected_leap_seconds =
+        (!current_leap_valid && timegps_usable)
+            ? timegps_offset : current_leap_seconds;
+
+    /* Diagnostic only: do not change leap validity or clock eligibility. */
+    static int64_t last_leap_diag_us = 0;
+    const int64_t leap_diag_now_us = esp_timer_get_time();
+    if (leap_diag_now_us - last_leap_diag_us >= 5000000LL) {
+        last_leap_diag_us = leap_diag_now_us;
+        ESP_LOGW(TAG,
+                 "SYNC_DIAG NAV-TIMELS valid=0x%02x curr_valid=%d "
+                 "event_valid=%d curr_ls=%d change=%d event_s=%ld "
+                 "fallback=%d leap_usable=%d",
+                 (unsigned)valid_flags,
+                 (int)current_leap_valid,
+                 (int)event_time_valid,
+                 (int)current_leap_seconds,
+                 (int)leap_change,
+                 (long)seconds_to_event,
+                 (int)bounded_current_leap_fallback,
+                 (int)leap_information_usable);
+    }
 
     app_leap_indicator_t leap_indicator = APP_LEAP_UNKNOWN;
 
@@ -565,14 +677,20 @@ static void handle_ubx_nav_timels(const uint8_t *payload,
 
     s_status.ubx_nav_timels_messages++;
     s_status.leap_information_valid = leap_information_usable;
-    s_status.current_leap_seconds = current_leap_seconds;
+    s_status.current_leap_seconds = selected_leap_seconds;
     s_status.pending_leap_change = leap_change;
     s_status.seconds_to_leap_event = seconds_to_event;
     s_status.leap_indicator = leap_indicator;
 
     portEXIT_CRITICAL(&s_gnss_lock);
 
-    if (!current_leap_valid && bounded_current_leap_fallback) {
+    /* The fallback can stay in use indefinitely; note it once a minute
+     * rather than with every 1 Hz message. */
+    static int64_t s_last_fallback_log_us;
+    if (!current_leap_valid && bounded_current_leap_fallback &&
+        (s_last_fallback_log_us == 0 ||
+         now_us - s_last_fallback_log_us >= 60000000LL)) {
+        s_last_fallback_log_us = now_us;
         ESP_LOGW(TAG,
                  "NAV-TIMELS fallback: current_ls=%d event_in=%" PRId32
                  " s",
@@ -607,6 +725,21 @@ static void handle_ubx_tim_tp(const uint8_t *payload,
     const uint8_t flags =
         payload[UBX_TIM_TP_FLAGS_OFFSET];
 
+    const uint8_t ref_info =
+        payload[UBX_TIM_TP_REF_INFO_OFFSET];
+
+    /* Record the time base once per boot (and on change) so the TIM-TP
+     * interpretation in clock_discipline can be confirmed on hardware. */
+    static int16_t s_logged_flags = -1;
+    static int16_t s_logged_ref_info = -1;
+    if (s_logged_flags != flags || s_logged_ref_info != ref_info) {
+        s_logged_flags = flags;
+        s_logged_ref_info = ref_info;
+        ESP_LOGI(TAG, "TIM-TP time base: flags=0x%02x (%s) refInfo=0x%02x",
+                 (unsigned)flags, (flags & 0x01U) ? "UTC" : "GNSS",
+                 (unsigned)ref_info);
+    }
+
     const int64_t now_us = esp_timer_get_time();
 
     portENTER_CRITICAL(&s_gnss_lock);
@@ -618,6 +751,7 @@ static void handle_ubx_tim_tp(const uint8_t *payload,
     s_status.timing_tow_sub_ms = tow_sub_ms;
     s_status.timing_quantization_error_ns = qerr_ps;
     s_status.timing_pulse_flags = flags;
+    s_status.timing_pulse_ref_info = ref_info;
     s_status.timing_pulse_age_us = 0;
 
     s_last_tim_tp_rx_us = now_us;
@@ -719,6 +853,12 @@ static void dispatch_ubx_frame(uint8_t message_class,
     if (message_class == UBX_CLASS_NAV &&
         message_id == UBX_ID_NAV_PVT) {
         handle_ubx_nav_pvt(payload, payload_length);
+        return;
+    }
+
+    if (message_class == UBX_CLASS_NAV &&
+        message_id == UBX_ID_NAV_TIMEGPS) {
+        handle_ubx_nav_timegps(payload, payload_length);
         return;
     }
 
@@ -1105,6 +1245,15 @@ static void gnss_configure_receiver(void)
     }
 
     err = ubx_configure_message_rate(UBX_CLASS_NAV,
+                                     UBX_ID_NAV_TIMEGPS,
+                                     1U);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "UBX-NAV-TIMEGPS configuration failed: %s",
+                 esp_err_to_name(err));
+        complete = false;
+    }
+
+    err = ubx_configure_message_rate(UBX_CLASS_NAV,
                                      UBX_ID_NAV_TIMELS,
                                      1U);
 
@@ -1311,6 +1460,9 @@ esp_err_t gnss_service_init(void)
     s_last_utc_rx_us = 0;
     s_last_pvt_rx_us = 0;
     s_last_tim_tp_rx_us = 0;
+    s_last_timegps_leap_rx_us = 0;
+    s_timegps_leap_seconds = 0;
+    s_timegps_leap_valid = false;
 
     s_ack_waiting = false;
     s_ack_expected_class = 0U;
@@ -1355,19 +1507,25 @@ bool gnss_service_get_status(gnss_service_status_t *out_status)
 
     gnss_service_status_t local_status;
 
+    /* Copy the receive times in the same critical section as the status:
+     * 64-bit reads can tear on this 32-bit dual-core part, and a stamp read
+     * separately could belong to a newer TIM-TP than the fields copied.
+     * clock_discipline pairs PPS edges with TIM-TP using this age. */
     portENTER_CRITICAL(&s_gnss_lock);
     local_status = s_status;
+    const int64_t last_utc_rx_us = s_last_utc_rx_us;
+    const int64_t last_tim_tp_rx_us = s_last_tim_tp_rx_us;
     portEXIT_CRITICAL(&s_gnss_lock);
 
     const int64_t now_us = esp_timer_get_time();
 
-    if (local_status.utc_valid && s_last_utc_rx_us > 0) {
-        const int64_t age_us = now_us - s_last_utc_rx_us;
+    if (local_status.utc_valid && last_utc_rx_us > 0) {
+        const int64_t age_us = now_us - last_utc_rx_us;
         local_status.utc_age_us = age_us >= 0 ? age_us : 0;
     }
 
-    if (local_status.timing_pulse_valid && s_last_tim_tp_rx_us > 0) {
-        const int64_t age_us = now_us - s_last_tim_tp_rx_us;
+    if (local_status.timing_pulse_valid && last_tim_tp_rx_us > 0) {
+        const int64_t age_us = now_us - last_tim_tp_rx_us;
         local_status.timing_pulse_age_us = age_us >= 0 ? age_us : 0;
     }
 

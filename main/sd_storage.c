@@ -292,7 +292,19 @@ static esp_err_t mount_card(bool explicit_format_if_needed)
 static esp_err_t archive_current_boot_events(void)
 {
     if (s_log == NULL) return ESP_ERR_INVALID_STATE;
-    operations_event_t events[OPERATIONS_HISTORY_CAPACITY];
+
+    /* This runs every 2 s. Reading the whole NVS ring each time costs ~150
+     * flash reads, each of which disables the cache and stalls the other
+     * core, so only read when a new event has been recorded. */
+    static uint32_t s_seen_next_sequence;
+    static bool s_seen_valid;
+    operations_history_status_t hist;
+    const bool hist_ok = operations_history_get_status(&hist) == ESP_OK;
+    if (hist_ok && s_seen_valid && hist.next_sequence == s_seen_next_sequence) return ESP_OK;
+
+    /* Static: 3 KB would otherwise sit on this task's 6 KB stack while the
+     * file I/O below runs. Only this task calls this function. */
+    static operations_event_t events[OPERATIONS_HISTORY_CAPACITY];
     size_t count = 0;
     esp_err_t err = operations_history_read(events, OPERATIONS_HISTORY_CAPACITY, &count);
     if (err != ESP_OK) return err;
@@ -322,7 +334,7 @@ static esp_err_t archive_current_boot_events(void)
         written_events++;
         written_bytes += (uint64_t)n;
     }
-    if (!wrote_any) return ESP_OK;
+    if (!wrote_any) { if (hist_ok) { s_seen_next_sequence = hist.next_sequence; s_seen_valid = true; } return ESP_OK; }
     if (fflush(s_log) != 0) return ESP_FAIL;
 
     s_last_sequence = committed_sequence;
@@ -331,6 +343,7 @@ static esp_err_t archive_current_boot_events(void)
     s_status.bytes_written += written_bytes;
     s_status.archived_events += written_events;
     status_unlock();
+    if (hist_ok) { s_seen_next_sequence = hist.next_sequence; s_seen_valid = true; }
     return ESP_OK;
 }
 

@@ -42,7 +42,7 @@
 static const char *TAG = "WEB";
 
 #define APP_WEB_CONSOLE_PORT                    443U
-#define APP_WEB_CONSOLE_STACK_SIZE              12288U
+#define APP_WEB_CONSOLE_STACK_SIZE              16384U  /* ACME issue path needs ~11 KB of frames */
 #define APP_WEB_CONSOLE_MAX_HANDLERS            64U
 #define APP_WEB_CONFIG_BODY_MAX                  2048U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
@@ -1319,6 +1319,22 @@ static esp_err_t start_renewal_scheduler(void)
 
 static void set_security_headers(httpd_req_t *request);
 
+/* All handlers run in the single httpd task, so a body read that retries a
+ * silent client forever freezes the whole console (and, for OTA, leaves the
+ * update flagged in progress). Allow a few consecutive receive timeouts
+ * (httpd's socket timeout is a few seconds each), then fail the read so the
+ * caller's existing error path cleans up. */
+#define WEB_RECV_MAX_CONSECUTIVE_TIMEOUTS 3
+
+static int web_req_recv_bounded(httpd_req_t *request, char *buffer, size_t length)
+{
+    for (unsigned timeouts = 0U;; ++timeouts) {
+        const int r = httpd_req_recv(request, buffer, length);
+        if (r != HTTPD_SOCK_ERR_TIMEOUT) return r;
+        if (timeouts + 1U >= WEB_RECV_MAX_CONSECUTIVE_TIMEOUTS) return HTTPD_SOCK_ERR_FAIL;
+    }
+}
+
 static const char *renewal_eligibility_reason(const acme_renewal_scheduler_status_t *status)
 {
     if (!status->automatic_renewal_enabled) return "disabled";
@@ -1457,7 +1473,7 @@ static esp_err_t acme_production_renewal_scheduler_put_handler(httpd_req_t *requ
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "expected {\"enabled\":true|false}");
     char body[96]; size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int result = httpd_req_recv(request, body + received,
+        const int result = web_req_recv_bounded(request, body + received,
                                           (size_t)request->content_len - received);
         if (result == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (result <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
@@ -2386,7 +2402,7 @@ static esp_err_t peer_monitor_put_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
     char body[APP_WEB_CONFIG_BODY_MAX]; size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        const int r = web_req_recv_bounded(request, body + received, (size_t)request->content_len - received);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (r <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
         received += (size_t)r;
@@ -2422,7 +2438,7 @@ static esp_err_t redundant_server_put_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
     char body[APP_WEB_CONFIG_BODY_MAX]; size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        const int r = web_req_recv_bounded(request, body + received, (size_t)request->content_len - received);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (r <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
         received += (size_t)r;
@@ -2466,7 +2482,7 @@ static esp_err_t network_put_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
     char body[APP_WEB_CONFIG_BODY_MAX]; size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        const int r = web_req_recv_bounded(request, body + received, (size_t)request->content_len - received);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (r <= 0) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "request body receive failed");
         received += (size_t)r;
@@ -2507,7 +2523,7 @@ static esp_err_t hostname_put_handler(httpd_req_t *request)
     size_t received = 0U;
 
     while (received < (size_t)request->content_len) {
-        const int result = httpd_req_recv(request,
+        const int result = web_req_recv_bounded(request,
                                           body + received,
                                           (size_t)request->content_len - received);
         if (result == HTTPD_SOCK_ERR_TIMEOUT) {
@@ -2578,7 +2594,7 @@ static esp_err_t receive_request_body(httpd_req_t *request, char *body, size_t b
         (size_t)request->content_len >= body_size) return ESP_ERR_INVALID_ARG;
     size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int result = httpd_req_recv(request, body + received,
+        const int result = web_req_recv_bounded(request, body + received,
                                           (size_t)request->content_len - received);
         if (result == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (result <= 0) return ESP_FAIL;
@@ -3846,8 +3862,9 @@ static esp_err_t firmware_page_handler(httpd_req_t *request)
         "<header><nav><a class=\"btn\" href=\"/\">Dashboard</a><a class=\"btn\" href=\"/system\">System</a><a class=\"btn\" href=\"/management\">Management</a><a class=\"btn\" href=\"/diagnostics\">Diagnostics</a></nav><h1>OTA Firmware Update</h1><p>Authenticated A/B OTA. Upload is staged to the inactive partition and activation is a separate reboot action.</p></header><main>"
         "<section class=\"card\"><h2>Firmware Status</h2><div class=\"grid\"><div id=\"versions\"></div><div id=\"lifecycle\"></div></div></section>"
         "<section class=\"card\"><h2>Stage Firmware</h2><input id=\"fw\" type=\"file\" accept=\".bin,application/octet-stream\"><p id=\"selected\">No image selected.</p><button id=\"upload\" onclick=\"upload()\">Upload &amp; Validate</button><div id=\"msg\" class=\"status\"></div></section>"
-        "<section class=\"card\"><h2>Activation</h2><p>The currently running image remains authoritative until a complete image has been validated and selected for boot.</p><button class=\"danger\" onclick=\"reboot()\">Activate Staged Image &amp; Reboot</button></section></main>"
-        "<script>const E=x=>String(x == null ? '--' : x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const R=(k,v)=>'<div class=\"row\"><span>'+E(k)+'</span><span class=\"v\">'+E(v)+'</span></div>';async function status(){const r=await fetch('/api/v1/ota/status',{cache:'no-store'}),o=await r.json();versions.innerHTML=R('Current Version',o.running_version)+R('Previous Version',o.previous_version||'--')+R('Running',o.running_partition)+R('Next Target',o.next_partition);lifecycle.innerHTML=R('Last Result',o.last_result)+R('Uploads',o.attempts)+R('Staged',o.successes)+R('Confirmed',o.confirmations)+R('Failures',o.failures)+R('Rollbacks',o.rollbacks_detected)}fw.onchange=()=>selected.textContent=fw.files[0]?fw.files[0].name+' ('+fw.files[0].size+' bytes)':'No image selected.';async function upload(){const f=fw.files[0];if(!f){msg.textContent='Choose a firmware .bin first.';return}upload.disabled=true;msg.textContent='Uploading and validating...';try{const r=await fetch('/api/v1/ota/image',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});const t=await r.text();msg.textContent=(r.ok?'Staged successfully. ':'Rejected. ')+t;await status()}catch(x){msg.textContent='Upload failed: '+x.message}upload.disabled=false}async function reboot(){if(!confirm('Activate the staged image and reboot now?'))return;msg.textContent='Reboot scheduled...';try{const r=await fetch('/api/v1/system/reboot',{method:'POST'});msg.textContent=await r.text()}catch(x){msg.textContent='Reboot request: '+x.message}}status();setInterval(status,5000);</script></body></html>";
+        "<section class=\"card\"><h2>Activation</h2><p>The currently running image remains authoritative until a complete image has been validated and selected for boot.</p><button class=\"danger\" onclick=\"reboot()\">Activate Staged Image &amp; Reboot</button></section>"
+        "<section class=\"card\"><h2>Rollback</h2><p>Boots the image in the other OTA slot after verifying it. The restored image must pass the same 5-minute soak; if it fails, the bootloader returns to the current image.</p><p id=\"rbinfo\">Checking previous image...</p><button id=\"rbbtn\" class=\"danger\" onclick=\"rollback()\" disabled>Roll Back &amp; Reboot</button></section></main>"
+        "<script>const E=x=>String(x == null ? '--' : x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const R=(k,v)=>'<div class=\"row\"><span>'+E(k)+'</span><span class=\"v\">'+E(v)+'</span></div>';async function status(){const r=await fetch('/api/v1/ota/status',{cache:'no-store'}),o=await r.json();versions.innerHTML=R('Current Version',o.running_version)+R('Previous Version',o.previous_version||'--')+R('Running',o.running_partition)+R('Next Target',o.next_partition);lifecycle.innerHTML=R('Last Result',o.last_result)+R('Uploads',o.attempts)+R('Staged',o.successes)+R('Confirmed',o.confirmations)+R('Failures',o.failures)+R('Rollbacks',o.rollbacks_detected);rbbtn.disabled=!o.rollback_available;rbinfo.textContent=o.rollback_available?'Previous image: '+o.rollback_version+' on '+o.rollback_partition:(o.boot_partition!==o.running_partition?'Unavailable: a staged image is waiting for a reboot.':'No previous image available.')}async function rollback(){if(!confirm('Roll back to the previous firmware and reboot now? NTP and NTS will be unavailable for about a minute.'))return;rbbtn.disabled=true;msg.textContent='Verifying previous image...';try{const r=await fetch('/api/v1/ota/rollback',{method:'POST',headers:{'X-Confirm-Rollback':'ROLLBACK'}});msg.textContent=(r.ok?'Rollback scheduled. ':'Rollback refused. ')+await r.text()}catch(x){msg.textContent='Rollback request: '+x.message}}fw.onchange=()=>selected.textContent=fw.files[0]?fw.files[0].name+' ('+fw.files[0].size+' bytes)':'No image selected.';async function upload(){const f=fw.files[0];if(!f){msg.textContent='Choose a firmware .bin first.';return}upload.disabled=true;msg.textContent='Uploading and validating...';try{const r=await fetch('/api/v1/ota/image',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});const t=await r.text();msg.textContent=(r.ok?'Staged successfully. ':'Rejected. ')+t;await status()}catch(x){msg.textContent='Upload failed: '+x.message}upload.disabled=false}async function reboot(){if(!confirm('Activate the staged image and reboot now?'))return;msg.textContent='Reboot scheduled...';try{const r=await fetch('/api/v1/system/reboot',{method:'POST'});msg.textContent=await r.text()}catch(x){msg.textContent='Reboot request: '+x.message}}status();setInterval(status,5000);</script></body></html>";
     httpd_resp_set_type(request, "text/html; charset=utf-8"); set_security_headers(request);
     return httpd_resp_send(request, html, HTTPD_RESP_USE_STRLEN);
 }
@@ -4045,7 +4062,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "  col2.push(card('API Locations',[\n"
         "   row('Status','/api/v1/status'),row('Health','/api/v1/health'),row('Metrics','/metrics'),row('Operations History','/api/v1/operations/history'),\n"
         "   row('Configuration','GET /api/v1/config'),row('Backup / Restore','GET/POST /api/v1/config/backup'),row('Hostname','PUT /api/v1/config/hostname'),\n"
-        "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare'),row('Peer Monitor','PUT /api/v1/config/peer-monitor'),row('SD Storage','GET /api/v1/storage/status'),row('OTA Status','GET /api/v1/ota/status'),row('OTA Upload','POST /api/v1/ota/image')]));\n"
+        "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare'),row('Peer Monitor','PUT /api/v1/config/peer-monitor'),row('SD Storage','GET /api/v1/storage/status'),row('OTA Status','GET /api/v1/ota/status'),row('OTA Upload','POST /api/v1/ota/image'),row('OTA Rollback','POST /api/v1/ota/rollback (X-Confirm-Rollback: ROLLBACK)')]));\n"
         "  const resetc=ops.reset_counts||{};let recent='';for(const e of (ops.events||[]).slice(-6).reverse()){recent+='<div class=\"peerbox\"><div class=\"peerhead\"><span class=\"peername\">#'+esc(e.sequence)+' '+esc(e.type)+'</span><span class=\"peerhealth\">boot '+esc(e.boot_id)+'</span></div><div class=\"peerstats\">'+row('Detail',e.detail)+row('Uptime',e.uptime_seconds+' s')+'</div></div>';};\n"
         "  col4.push(card('Operations & Reset History',[row('Boot Count',ops.boot_count),row('Retained Events',ops.event_count+' / '+ops.capacity),row('Overwritten',ops.overwritten_events),row('Last Reset Class',ops.last_reset_class),row('Raw Reset Reason',ops.last_reset_reason),row('Power-on Resets',resetc.power_on||0),row('Software Resets',resetc.software||0),row('Watchdog Resets',resetc.watchdog||0),row('Panic Resets',resetc.panic||0),row('Brownout Resets',resetc.brownout||0)],'<div class=\"peers\">'+recent+'</div>'));\n"
         "  const sd=storage||{};col4.push(card('SD Card / Operational Storage',[row('State',sd.state||'--'),row('Configured',yesNo(!!sd.configured)),row('Mounted',yesNo(!!sd.mounted)),row('Desired Mounted',yesNo(!!sd.desired_mounted)),row('Archive Worker',yesNo(!!sd.worker_running)),row('Card',sd.card_name||'--'),row('Capacity',sd.capacity_bytes?Math.round(sd.capacity_bytes/1048576)+' MiB':'--'),row('Free',sd.free_bytes?Math.round(sd.free_bytes/1048576)+' MiB':'--'),row('Free-space Reserve',sd.reserve_bytes?Math.round(sd.reserve_bytes/1048576)+' MiB':'--'),row('Low Space',yesNo(!!sd.low_space)),row('Archived Events',sd.archived_events||0),row('Bytes Written',sd.bytes_written||0),row('Mount Successes',sd.mount_successes||0),row('Mount Failures',sd.mount_failures||0),row('Remount Attempts',sd.remount_attempts||0),row('Write Failures',sd.write_failures||0),row('Command Queue Drops',sd.command_queue_drops||0),row('Retention Deletes',sd.retention_deleted_files||0),row('Formats',sd.format_count||0),row('Format Failures',sd.format_failures||0),row('Log Erases',sd.erase_count||0),row('Last Error',sd.last_error_name||String(sd.last_error||'OK'))],'<div class=\"actions\"><button onclick=\"flushStorage()\">Flush Archive</button><button onclick=\"mountStorage()\">Mount / Retry</button><button class=\"danger\" onclick=\"unmountStorage()\">Safe Unmount</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button class=\"danger\" onclick=\"eraseStorageLogs()\">Erase Operational Logs</button></div><h3>Danger Zone</h3><div class=\"actions\"><button class=\"danger\" onclick=\"formatStorage()\">Format SD Card</button></div><div id=\"sdmsg\" class=\"actionmsg\">Operations storage only; never timing authority. Formatting requires explicit FORMAT confirmation.</div>'));\n"
@@ -4117,7 +4134,7 @@ static esp_err_t provisioning_claim_handler(httpd_req_t *request)
     if (body == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
     size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        const int r = web_req_recv_bounded(request, body + received, (size_t)request->content_len - received);
         if (r <= 0) { memset(body, 0, (size_t)request->content_len + 1U); free(body); return ESP_FAIL; }
         received += (size_t)r;
     }
@@ -4248,48 +4265,67 @@ static esp_err_t operations_history_handler(httpd_req_t *request)
     return send_err;
 }
 
-static esp_err_t config_backup_get_handler(httpd_req_t *request)
-{
+typedef struct {
     device_config_backup_t backup;
-    const esp_err_t err = device_config_export_backup(&backup);
-    if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration backup unavailable");
-
     char hostname[(APP_DEVICE_HOSTNAME_MAX_LENGTH * 6U) + 1U];
     char zone[(APP_CLOUDFLARE_ZONE_NAME_MAX_LENGTH * 6U) + 1U];
     char zone_id[(APP_CLOUDFLARE_ZONE_ID_LENGTH * 6U) + 1U];
     char token[(APP_CLOUDFLARE_API_TOKEN_MAX_LENGTH * 6U) + 1U];
-    (void)json_escape_string(hostname, sizeof(hostname), backup.config.hostname);
-    (void)json_escape_string(zone, sizeof(zone), backup.config.cloudflare_zone_name);
-    (void)json_escape_string(zone_id, sizeof(zone_id), backup.config.cloudflare_zone_id);
-    (void)json_escape_string(token, sizeof(token), backup.cloudflare_api_token);
+    char fqdn[(COMMISSIONING_FQDN_MAX * 6U) + 1U];
+    char ext1[(COMMISSIONING_NTP_SERVER_MAX * 6U) + 1U];
+    char ext2[(COMMISSIONING_NTP_SERVER_MAX * 6U) + 1U];
+} backup_scratch_t;
+
+static void backup_scratch_free(backup_scratch_t *sc)
+{
+    if (sc == NULL) return;
+    volatile uint8_t *p = (volatile uint8_t *)sc;
+    for (size_t i = 0U; i < sizeof(*sc); ++i) p[i] = 0U;
+    free(sc);
+}
+
+static esp_err_t config_backup_get_handler(httpd_req_t *request)
+{
+    /* Everything large lives in one heap block: as locals these buffers
+     * made a 12.7 KB frame on the 12 KB httpd stack. The block holds the
+     * Cloudflare token, so it is wiped before it is freed. */
+    backup_scratch_t *sc = calloc(1U, sizeof(*sc));
+    if (sc == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    const esp_err_t err = device_config_export_backup(&sc->backup);
+    if (err != ESP_OK) { backup_scratch_free(sc); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration backup unavailable"); }
+
+    (void)json_escape_string(sc->hostname, sizeof(sc->hostname), sc->backup.config.hostname);
+    (void)json_escape_string(sc->zone, sizeof(sc->zone), sc->backup.config.cloudflare_zone_name);
+    (void)json_escape_string(sc->zone_id, sizeof(sc->zone_id), sc->backup.config.cloudflare_zone_id);
+    (void)json_escape_string(sc->token, sizeof(sc->token), sc->backup.cloudflare_api_token);
 
     char *response = calloc(1U, 8192U);
-    if (response == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    if (response == NULL) { backup_scratch_free(sc); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); }
     int length = snprintf(response, 8192U,
         "{\"backup_schema_version\":%u,\"device_config_schema_version\":%" PRIu32
         ",\"hostname\":\"%s\",\"cloudflare_configured\":%s,\"cloudflare_zone_name\":\"%s\""
         ",\"cloudflare_zone_id\":\"%s\",\"cloudflare_api_token\":\"%s\""
         ",\"peer_monitor_enabled\":%s,\"peer_poll_interval_seconds\":%" PRIu32
         ",\"peer_response_timeout_ms\":%" PRIu32 ",\"redundant_peer_warning_ns\":%" PRIu32 ",\"redundant_peer_critical_ns\":%" PRIu32,
-        (unsigned)backup.backup_schema_version, backup.config.schema_version, hostname,
-        backup.config.cloudflare_configured ? "true" : "false", zone, zone_id, token,
-        backup.config.ntp_peer_monitor_enabled ? "true" : "false",
-        backup.config.ntp_peer_poll_interval_seconds, backup.config.ntp_peer_response_timeout_ms,
-        backup.config.redundant_peer_warning_ns, backup.config.redundant_peer_critical_ns);
+        (unsigned)sc->backup.backup_schema_version, sc->backup.config.schema_version, sc->hostname,
+        sc->backup.config.cloudflare_configured ? "true" : "false", sc->zone, sc->zone_id, sc->token,
+        sc->backup.config.ntp_peer_monitor_enabled ? "true" : "false",
+        sc->backup.config.ntp_peer_poll_interval_seconds, sc->backup.config.ntp_peer_response_timeout_ms,
+        sc->backup.config.redundant_peer_warning_ns, sc->backup.config.redundant_peer_critical_ns);
     if (length >= 0 && length < 8192) {
-        const esp_ip4_addr_t b_addr = {.addr = backup.config.static_ipv4_address};
-        const esp_ip4_addr_t b_mask = {.addr = backup.config.static_ipv4_netmask};
-        const esp_ip4_addr_t b_gw = {.addr = backup.config.static_ipv4_gateway};
-        const esp_ip4_addr_t b_dns = {.addr = backup.config.static_ipv4_dns};
+        const esp_ip4_addr_t b_addr = {.addr = sc->backup.config.static_ipv4_address};
+        const esp_ip4_addr_t b_mask = {.addr = sc->backup.config.static_ipv4_netmask};
+        const esp_ip4_addr_t b_gw = {.addr = sc->backup.config.static_ipv4_gateway};
+        const esp_ip4_addr_t b_dns = {.addr = sc->backup.config.static_ipv4_dns};
         const int n = snprintf(response + length, 8192U - (size_t)length,
             ",\"static_ipv4_enabled\":%s,\"static_ipv4_address\":\"" IPSTR "\",\"static_ipv4_netmask\":\"" IPSTR "\""
             ",\"static_ipv4_gateway\":\"" IPSTR "\",\"static_ipv4_dns\":\"" IPSTR "\"",
-            backup.config.static_ipv4_enabled ? "true" : "false",
+            sc->backup.config.static_ipv4_enabled ? "true" : "false",
             IP2STR(&b_addr), IP2STR(&b_mask), IP2STR(&b_gw), IP2STR(&b_dns));
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
     }
     hardware_profile_status_t hw_status;
-    if (hardware_profile_get_status(&hw_status) != ESP_OK) { free(response); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "hardware profile backup unavailable"); }
+    if (hardware_profile_get_status(&hw_status) != ESP_OK) { free(response); backup_scratch_free(sc); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "hardware profile backup unavailable"); }
     hardware_profile_config_t hw = hw_status.config;
     if (length >= 0 && length < 8192) {
         const int n = snprintf(response + length, 8192U - (size_t)length,
@@ -4302,32 +4338,29 @@ static esp_err_t config_backup_get_handler(httpd_req_t *request)
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
     }
     commissioning_config_t cm_backup;
-    if (commissioning_get_config(&cm_backup) != ESP_OK) { free(response); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "commissioning backup unavailable"); }
+    if (commissioning_get_config(&cm_backup) != ESP_OK) { free(response); backup_scratch_free(sc); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "commissioning backup unavailable"); }
     if (length >= 0 && length < 8192) {
-        char fqdn[(COMMISSIONING_FQDN_MAX * 6U) + 1U];
-        char ext1[(COMMISSIONING_NTP_SERVER_MAX * 6U) + 1U];
-        char ext2[(COMMISSIONING_NTP_SERVER_MAX * 6U) + 1U];
-        (void)json_escape_string(fqdn, sizeof(fqdn), cm_backup.certificate_fqdn);
-        (void)json_escape_string(ext1, sizeof(ext1), cm_backup.ntp_servers[0]);
-        (void)json_escape_string(ext2, sizeof(ext2), cm_backup.ntp_servers[1]);
+        (void)json_escape_string(sc->fqdn, sizeof(sc->fqdn), cm_backup.certificate_fqdn);
+        (void)json_escape_string(sc->ext1, sizeof(sc->ext1), cm_backup.ntp_servers[0]);
+        (void)json_escape_string(sc->ext2, sizeof(sc->ext2), cm_backup.ntp_servers[1]);
         const int n = snprintf(response + length, 8192U - (size_t)length,
             ",\"certificate_fqdn\":\"%s\",\"external_ntp_1\":\"%s\",\"external_ntp_2\":\"%s\"",
-            fqdn, ext1, ext2);
+            sc->fqdn, sc->ext1, sc->ext2);
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
     }
     for (size_t i = 0; length >= 0 && length < 8192 && i < APP_NTP_GENERAL_PEER_COUNT; ++i) {
         char peer[(APP_NTP_PEER_SERVER_MAX_LENGTH * 6U) + 1U];
-        (void)json_escape_string(peer, sizeof(peer), backup.config.ntp_peers[i].server);
+        (void)json_escape_string(peer, sizeof(peer), sc->backup.config.ntp_peers[i].server);
         const int n = snprintf(response + length, 8192U - (size_t)length,
                                ",\"peer%u_enabled\":%s,\"peer%u\":\"%s\"",
-                               (unsigned)i, backup.config.ntp_peers[i].enabled ? "true" : "false",
+                               (unsigned)i, sc->backup.config.ntp_peers[i].enabled ? "true" : "false",
                                (unsigned)i, peer);
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) { length = 8192; break; }
         length += n;
     }
     if (length >= 0 && length < 8192) {
         char peer[(APP_NTP_PEER_SERVER_MAX_LENGTH * 6U) + 1U];
-        const device_config_ntp_peer_t *redundant = &backup.config.ntp_peers[APP_REDUNDANT_PEER_INDEX];
+        const device_config_ntp_peer_t *redundant = &sc->backup.config.ntp_peers[APP_REDUNDANT_PEER_INDEX];
         (void)json_escape_string(peer, sizeof(peer), redundant->server);
         const int n = snprintf(response + length, 8192U - (size_t)length,
                                ",\"peer4_enabled\":%s,\"peer4\":\"%s\"",
@@ -4338,7 +4371,7 @@ static esp_err_t config_backup_get_handler(httpd_req_t *request)
         const int n = snprintf(response + length, 8192U - (size_t)length, "}\n");
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
     }
-    if (length < 0 || length >= 8192) { free(response); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "backup serialization failed"); }
+    if (length < 0 || length >= 8192) { free(response); backup_scratch_free(sc); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "backup serialization failed"); }
     (void)operations_history_record(OPERATIONS_EVENT_SECURITY, 0, "config_backup_exported");
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=esp32p4-config-backup.json");
@@ -4346,6 +4379,7 @@ static esp_err_t config_backup_get_handler(httpd_req_t *request)
     set_security_headers(request);
     const esp_err_t send_err = httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
     free(response);
+    backup_scratch_free(sc);
     return send_err;
 }
 
@@ -4356,7 +4390,7 @@ static esp_err_t config_backup_restore_handler(httpd_req_t *request)
     if (body == NULL) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
     size_t received = 0U;
     while (received < (size_t)request->content_len) {
-        const int r = httpd_req_recv(request, body + received, (size_t)request->content_len - received);
+        const int r = web_req_recv_bounded(request, body + received, (size_t)request->content_len - received);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (r <= 0) { free(body); return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "backup receive failed"); }
         received += (size_t)r;
@@ -4749,7 +4783,7 @@ static esp_err_t hardware_profile_put_handler(httpd_req_t *request)
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid request body");
     char body[APP_WEB_CONFIG_BODY_MAX]; size_t received=0U;
     while (received < (size_t)request->content_len) {
-        const int r=httpd_req_recv(request,body+received,(size_t)request->content_len-received);
+        const int r=web_req_recv_bounded(request,body+received,(size_t)request->content_len-received);
         if (r==HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (r<=0) return httpd_resp_send_err(request,HTTPD_400_BAD_REQUEST,"request body receive failed");
         received+=(size_t)r;
@@ -5048,14 +5082,23 @@ static esp_err_t ota_status_handler(httpd_req_t *request)
     ota_manager_status_t status;
     esp_err_t err = ota_manager_get_status(&status);
     if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA status unavailable");
-    char body[768];
+    char rollback_partition[17];
+    char rollback_version[33];
+    const bool rollback_available =
+        ota_manager_get_rollback_target(rollback_partition, sizeof(rollback_partition),
+                                        rollback_version, sizeof(rollback_version)) == ESP_OK &&
+        !status.update_in_progress;
+    char body[1024];
     snprintf(body, sizeof(body),
-             "{\"initialized\":%s,\"update_in_progress\":%s,\"pending_verify\":%s,"
+             "{\"rollback_available\":%s,\"rollback_partition\":\"%s\",\"rollback_version\":\"%s\","
+             "\"initialized\":%s,\"update_in_progress\":%s,\"pending_verify\":%s,"
              "\"last_boot_confirmed\":%s,\"attempts\":%" PRIu32 ",\"successes\":%" PRIu32 ","
              "\"failures\":%" PRIu32 ",\"confirmations\":%" PRIu32 ",\"rollbacks_detected\":%" PRIu32 ","
              "\"bytes_written\":%u,\"running_partition\":\"%s\","
              "\"boot_partition\":\"%s\",\"next_partition\":\"%s\",\"running_version\":\"%s\","
              "\"previous_version\":\"%s\",\"running_project\":\"%s\",\"last_result\":\"%s\"}\n",
+             rollback_available ? "true" : "false", rollback_available ? rollback_partition : "",
+             rollback_available ? rollback_version : "",
              status.initialized ? "true" : "false", status.update_in_progress ? "true" : "false",
              status.pending_verify ? "true" : "false", status.last_boot_confirmed ? "true" : "false",
              status.attempts, status.successes, status.failures, status.confirmations,
@@ -5075,7 +5118,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     int remaining = request->content_len;
     while (remaining > 0) {
         const size_t want = remaining > (int)sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
-        int received = httpd_req_recv(request, (char *)buffer, want);
+        int received = web_req_recv_bounded(request, (char *)buffer, want);
         if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (received <= 0) { ota_manager_abort(); return ESP_FAIL; }
         err = ota_manager_write(buffer, (size_t)received);
@@ -5099,6 +5142,42 @@ static esp_err_t ota_confirm_handler(httpd_req_t *request)
     return httpd_resp_send(request, "{\"confirmed\":true}\n", HTTPD_RESP_USE_STRLEN);
 }
 
+/* Boots the image in the other OTA slot. Requires an explicit confirmation
+ * header like the other destructive actions; the reboot is deferred so the
+ * response reaches the client. */
+static esp_err_t ota_rollback_handler(httpd_req_t *request)
+{
+    char confirm[16] = {0};
+    if (httpd_req_get_hdr_value_str(request, "X-Confirm-Rollback", confirm, sizeof(confirm)) != ESP_OK ||
+        strcmp(confirm, "ROLLBACK") != 0) {
+        httpd_resp_set_status(request, "412 Precondition Failed");
+        return httpd_resp_send(request, "explicit ROLLBACK confirmation required", HTTPD_RESP_USE_STRLEN);
+    }
+    char version[33];
+    if (ota_manager_get_rollback_target(NULL, 0, version, sizeof(version)) != ESP_OK) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "no previous image available for rollback", HTTPD_RESP_USE_STRLEN);
+    }
+    const esp_err_t err = ota_manager_rollback_to_previous();
+    if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_NOT_FOUND || err == ESP_ERR_TIMEOUT) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "rollback unavailable (OTA busy or no previous image)", HTTPD_RESP_USE_STRLEN);
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "previous image failed verification");
+    }
+    if (xTaskCreate(delayed_reboot_task, "web_reboot", 2048U, NULL, 5U, NULL) != pdPASS) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "rollback staged; reboot to activate");
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"scheduled\":true,\"action\":\"rollback\",\"version\":\"%s\"}\n", version);
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    return httpd_resp_send(request, body, HTTPD_RESP_USE_STRLEN);
+}
+
 static const httpd_uri_t s_ota_status_uri = {
     .uri = "/api/v1/ota/status", .method = HTTP_GET, .handler = ota_status_handler, .user_ctx = NULL,
 };
@@ -5107,6 +5186,9 @@ static const httpd_uri_t s_ota_upload_uri = {
 };
 static const httpd_uri_t s_ota_confirm_uri = {
     .uri = "/api/v1/ota/confirm", .method = HTTP_POST, .handler = ota_confirm_handler, .user_ctx = NULL,
+};
+static const httpd_uri_t s_ota_rollback_uri = {
+    .uri = "/api/v1/ota/rollback", .method = HTTP_POST, .handler = ota_rollback_handler, .user_ctx = NULL,
 };
 
 static esp_err_t register_provisioning_handlers(httpd_handle_t server)
@@ -5136,7 +5218,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
         &s_acme_certificate_activate_test_uri,
         &s_acme_production_certificate_activate_uri,
         &s_acme_certificate_rollback_uri,
-        &s_ota_status_uri, &s_ota_upload_uri, &s_ota_confirm_uri,
+        &s_ota_status_uri, &s_ota_upload_uri, &s_ota_confirm_uri, &s_ota_rollback_uri,
     };
     _Static_assert((sizeof(handlers) / sizeof(handlers[0])) <= APP_WEB_CONSOLE_MAX_HANDLERS,
                    "APP_WEB_CONSOLE_MAX_HANDLERS is too small for registered management URI handlers");

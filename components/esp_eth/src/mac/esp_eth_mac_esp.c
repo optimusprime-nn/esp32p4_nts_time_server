@@ -424,7 +424,14 @@ static esp_err_t emac_esp32_set_link(esp_eth_mac_t *mac, eth_link_t link)
         } else {
             ESP_LOGI(TAG, "B6A: MAC stop succeeded");
         }
-        return ret;
+        /* Report the link change as done even if the stop timed out (the
+         * TX frame-control state machine can stay busy for >2.5 ms). An
+         * error here makes esp_eth abort before recording link-down, so
+         * no later link-up ever runs emac_esp32_start(): TX DMA stays
+         * stopped while RX keeps counting, the board goes silent, and the
+         * RX watchdog cannot see it. The next link-up's start resets the
+         * descriptors and DMA, which is what recovers a failed stop. */
+        return ESP_OK;
     default:
         ESP_LOGE(TAG, "B6A: invalid MAC link state %d", (int)link);
         return ESP_ERR_INVALID_ARG;

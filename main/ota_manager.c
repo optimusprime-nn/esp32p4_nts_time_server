@@ -211,6 +211,25 @@ esp_err_t ota_manager_finish(void)
     return err;
 }
 
+esp_err_t ota_manager_reject_running_image(const char *reason)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) return ESP_ERR_NOT_FOUND;
+    esp_ota_img_states_t state;
+    esp_err_t err = esp_ota_get_state_partition(running, &state);
+    if (err != ESP_OK) return err;
+    /* Only an unconfirmed image can be rolled back; an image that has
+     * already proven itself is left alone. */
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) return ESP_ERR_INVALID_STATE;
+    ESP_LOGE(TAG, "Rejecting pending OTA image: %s", reason ? reason : "unspecified");
+    set_result("running_image_rejected");
+    operations_history_record(OPERATIONS_EVENT_FAULT, 0,
+                              reason ? reason : "OTA image rejected");
+    /* Does not return on success: marks the image invalid and reboots into
+     * the previous one. */
+    return esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
 esp_err_t ota_manager_confirm_running_image(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -236,6 +255,73 @@ esp_err_t ota_manager_confirm_running_image(void)
         operations_history_record(OPERATIONS_EVENT_RECOVERY, 0, "OTA running image confirmed");
         ESP_LOGI(TAG, "Running OTA image confirmed valid");
     }
+    return err;
+}
+
+/* The other OTA slot: never the factory image and never the running one. */
+static const esp_partition_t *rollback_partition(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running || running->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
+        running->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+        return NULL;
+    }
+    /* A staged upload (or an already staged rollback) has overwritten or
+     * selected the other slot; it is activated by rebooting, not rolled to. */
+    if (esp_ota_get_boot_partition() != running) return NULL;
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    if (!other || other == running) return NULL;
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(other, &state) == ESP_OK &&
+        (state == ESP_OTA_IMG_INVALID || state == ESP_OTA_IMG_ABORTED)) {
+        return NULL;
+    }
+    return other;
+}
+
+esp_err_t ota_manager_get_rollback_target(char *partition, size_t partition_len,
+                                          char *version, size_t version_len)
+{
+    if (partition && partition_len) partition[0] = '\0';
+    if (version && version_len) version[0] = '\0';
+    const esp_partition_t *target = rollback_partition();
+    if (!target) return ESP_ERR_NOT_FOUND;
+    esp_app_desc_t desc;
+    if (esp_ota_get_partition_description(target, &desc) != ESP_OK) return ESP_ERR_NOT_FOUND;
+    if (partition && partition_len) copy_label(partition, partition_len, target);
+    if (version && version_len) snprintf(version, version_len, "%s", desc.version);
+    return ESP_OK;
+}
+
+esp_err_t ota_manager_rollback_to_previous(void)
+{
+    if (!s_status.initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (s_status.update_in_progress) { xSemaphoreGive(s_lock); return ESP_ERR_INVALID_STATE; }
+    const esp_partition_t *target = rollback_partition();
+    esp_app_desc_t desc;
+    if (!target || esp_ota_get_partition_description(target, &desc) != ESP_OK) {
+        set_result("rollback_unavailable"); xSemaphoreGive(s_lock); return ESP_ERR_NOT_FOUND;
+    }
+    /* Full image verification happens here; a corrupt slot is refused and the
+     * boot selection is left unchanged. */
+    esp_err_t err = esp_ota_set_boot_partition(target);
+    if (err == ESP_OK) {
+        if (s_status.running_version[0]) {
+            snprintf(s_status.previous_version, sizeof(s_status.previous_version), "%s", s_status.running_version);
+        }
+        copy_label(s_status.boot_partition, sizeof(s_status.boot_partition), target);
+        set_result("manual_rollback_staged");
+        (void)persist_history(target->label);
+        operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, "OTA manual rollback staged");
+        ESP_LOGW(TAG, "Manual rollback: %s -> %s (%s); reboot required",
+                 s_status.running_partition, target->label, desc.version);
+    } else {
+        set_result("rollback_validation_failed");
+        operations_history_record(OPERATIONS_EVENT_FAULT, (int32_t)err, "OTA manual rollback refused");
+        ESP_LOGE(TAG, "Manual rollback to %s refused: %s", target->label, esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_lock);
     return err;
 }
 

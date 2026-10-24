@@ -483,7 +483,7 @@ esp_err_t nts_storage_maintain_cookie_keyring(void)
     clock_ntp_timestamp_t now;
 
     if (!clock_discipline_get_ntp_timestamp(&now)) {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_TIMEOUT; /* clock unavailable: transient, never NAK-eligible */
     }
 
     const uint64_t now_ntp =

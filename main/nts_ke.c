@@ -55,6 +55,9 @@ static const char *TAG = "NTS_KE";
 /* Internal heap that must remain free to admit an additional parallel
  * session (~40 KB per TLS 1.3 session plus headroom for HTTPS/lwIP). */
 #define NTS_KE_MIN_FREE_INTERNAL_BYTES      (72U * 1024U)
+/* Internal heap one TLS 1.3 session takes once set up: 16 KB in + 4 KB out
+ * record buffers plus handshake state (internal-only mbedTLS allocation). */
+#define NTS_KE_SESSION_HEAP_BYTES           (40U * 1024U)
 #define NTS_KE_REQUEST_MAX                  2048U
 #define NTS_KE_RESPONSE_MAX                 4096U
 #define NTS_KE_COOKIE_COUNT                    8U
@@ -1120,13 +1123,20 @@ static void nts_ke_worker_task(void *arg)
  * degrades below the old one-at-a-time service. */
 static bool memory_allows_connection(void)
 {
-    if (__atomic_load_n(&s_active_connections, __ATOMIC_RELAXED) == 0U &&
-        uxQueueMessagesWaiting(s_jobs) == 0U) {
+    const uint32_t in_flight =
+        __atomic_load_n(&s_active_connections, __ATOMIC_RELAXED) +
+        (uint32_t)uxQueueMessagesWaiting(s_jobs);
+
+    if (in_flight == 0U) {
         return true;
     }
 
-    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >=
-           NTS_KE_MIN_FREE_INTERNAL_BYTES;
+    /* Sessions that are queued or just starting have not allocated their
+     * TLS buffers yet, so the current free heap overstates what is left.
+     * Reserve a session's worth for each one already in flight. */
+    const size_t needed = NTS_KE_MIN_FREE_INTERNAL_BYTES +
+                          (size_t)in_flight * NTS_KE_SESSION_HEAP_BYTES;
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= needed;
 }
 
 static size_t start_workers(void)

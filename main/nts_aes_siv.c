@@ -667,7 +667,7 @@ esp_err_t nts_aes_siv_encrypt(
     }
 
     if (siv_disabled()) {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     esp_err_t err = nts_aes_siv_init();
@@ -743,7 +743,7 @@ esp_err_t nts_aes_siv_decrypt(
     }
 
     if (siv_disabled()) {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     esp_err_t err = nts_aes_siv_init();

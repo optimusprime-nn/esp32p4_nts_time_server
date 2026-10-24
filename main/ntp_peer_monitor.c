@@ -164,7 +164,13 @@ static void reference_id_to_text(const uint8_t *packet, uint8_t stratum, char ou
     if (stratum <= 1U) {
         for (size_t i = 0; i < 4U; ++i) {
             const uint8_t c = packet[12U + i];
-            out[i] = (c >= 0x20U && c <= 0x7eU) ? (char)c : '.';
+            /* This text is embedded unescaped in the status JSON, so keep
+             * to characters that can never break it ('"' or '\\' from one
+             * odd upstream reply would take the whole dashboard down). */
+            const bool safe = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                              (c >= 'a' && c <= 'z') || c == ' ' || c == '.' ||
+                              c == '-' || c == '_';
+            out[i] = safe ? (char)c : '.';
         }
         out[4] = '\0';
         return;

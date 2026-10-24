@@ -43,6 +43,7 @@ esp_err_t clock_discipline_init(void);
  */
 esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_ns,
                                          int64_t utc_seconds,
+                                         int8_t leap_seconds,
                                          int32_t timing_quantization_error_ns,
                                          app_leap_indicator_t leap_indicator);
 
