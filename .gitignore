@@ -25,3 +25,15 @@ serial_output.log
 # Phase 9A local provisioning outputs (board-specific directories are recommended).
 /management-credentials/
 /management-credentials-*/
+
+# Local firmware archive (OTA images and ELFs, kept per version).
+/artifacts/
+
+# Local backup copies made while working on a file.
+*.pre_*
+*.b6d-original
+* - Copy.c
+* - Copy (*).c
+/components/esp_eth/src/mac/backup/
+/components/esp_eth/**/*.diff
+/Phase9B_Backup_*/
