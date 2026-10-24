@@ -415,7 +415,13 @@ static esp_err_t archive_current_boot_events(void)
     static operations_event_t events[OPERATIONS_HISTORY_CAPACITY];
     size_t count = 0;
     esp_err_t err = operations_history_read(events, OPERATIONS_HISTORY_CAPACITY, &count);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        /* An NVS fault is not an SD fault: returning it would unmount the
+         * card. Retry when the next event is recorded. */
+        ESP_LOGW(TAG, "Operations history unavailable: %s; SD archive deferred", esp_err_to_name(err));
+        if (hist_ok) { s_seen_next_sequence = hist.next_sequence; s_seen_valid = true; }
+        return ESP_OK;
+    }
 
     uint32_t committed_sequence = s_last_sequence;
     bool wrote_any = false;

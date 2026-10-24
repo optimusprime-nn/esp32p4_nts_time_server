@@ -262,12 +262,15 @@ esp_err_t operations_history_read(operations_event_t *events, size_t capacity, s
             if (read_err == ESP_OK && length == sizeof(events[got]) && events[got].sequence == sequence) {
                 got++;
             } else {
+                /* Skip a damaged slot and keep reading: failing the whole read
+                 * would make one bad record permanently break the history API
+                 * and the SD archive (which unmounts on error). The fault stays
+                 * visible in read_failures / last_storage_error. */
+                const esp_err_t slot_err = read_err == ESP_OK ? ESP_ERR_INVALID_SIZE : read_err;
                 s_status.read_failures++;
-                s_status.last_storage_error = (int32_t)(read_err == ESP_OK ? ESP_ERR_INVALID_SIZE : read_err);
-                err = read_err == ESP_OK ? ESP_ERR_INVALID_SIZE : read_err;
-                ESP_LOGW(TAG, "History event read failed: seq=%" PRIu32 " error=%s",
-                         sequence, esp_err_to_name(err));
-                break;
+                s_status.last_storage_error = (int32_t)slot_err;
+                ESP_LOGW(TAG, "History event read failed: seq=%" PRIu32 " error=%s; skipped",
+                         sequence, esp_err_to_name(slot_err));
             }
         }
         nvs_close(handle);
