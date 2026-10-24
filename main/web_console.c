@@ -1,6 +1,9 @@
+#include <sys/stat.h>
 #include "web_console.h"
 
 #include <inttypes.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -3968,9 +3971,11 @@ static esp_err_t management_handler(httpd_req_t *request)
         "async function storageAction(a,msg,headers){const m=document.getElementById('sdmsg');if(m)m.textContent=msg;try{const r=await fetch('/api/v1/storage/'+a,{method:'POST',headers:headers||{}});const t=await r.text();if(!r.ok)throw new Error(t);if(m)m.textContent=t;setTimeout(refresh,750);}catch(e){if(m)m.textContent='Storage action failed: '+e.message;} }\n"
         "function flushStorage(){storageAction('flush','Queueing archive flush...');}\n"
         "function mountStorage(){storageAction('mount','Requesting mount/retry...');}\n"
-        "function unmountStorage(){if(confirm('Safely unmount the SD card? Logging will pause until Mount / Retry is selected.'))storageAction('unmount','Requesting safe unmount...');}\n"
+        "function unmountStorage(){if(confirm('Safely unmount the SD card? The card will remount on reboot while SD storage is enabled.'))storageAction('unmount','Requesting safe unmount...');}\n"
+        "function disableStorage(){if(confirm('Disable SD storage persistently? It will stay disabled after reboot until Mount / Enable is selected.'))storageAction('disable','Disabling SD storage...');}\n"
         "function eraseStorageLogs(){const v=prompt('Erase ALL operational log files from the SD card. Type ERASE to continue:');if(v!=='ERASE'){const m=document.getElementById('sdmsg');if(m)m.textContent='Erase cancelled.';return;}storageAction('erase-logs','Erasing operational logs...',{'X-Confirm-Erase':'ERASE'});}\n"
         "function formatStorage(){const v=prompt('Formatting destroys ALL data on the SD card. Type FORMAT to continue:');if(v!=='FORMAT'){const m=document.getElementById('sdmsg');if(m)m.textContent='Format cancelled.';return;}storageAction('format','Formatting SD card...',{'X-Confirm-Format':'FORMAT'});}\n"
+        "async function downloadSDLogs(){try{const r=await fetch('/api/v1/storage/logs',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const data=await r.json();const files=(data.files||[]).map(f=>typeof f==='string'?{name:f,size:null}:f).sort((a,b)=>b.name.localeCompare(a.name));if(!files.length){alert('No SD logs available');return;}let old=document.getElementById('sdlogpicker');if(old)old.remove();const panel=document.createElement('div');panel.id='sdlogpicker';panel.style.cssText='position:fixed;top:5%;bottom:5%;left:50%;transform:translateX(-50%);width:min(760px,90vw);box-sizing:border-box;z-index:10000;background:#152332;color:white;padding:20px;overflow:auto;border:2px solid #8ca6b8;border-radius:8px';const title=document.createElement('h3');title.textContent='SD Operational Logs';panel.appendChild(title);const info=document.createElement('p');info.textContent='Select logs to include in ZIP. Empty files are retained for diagnosis.';panel.appendChild(info);const list=document.createElement('div');panel.appendChild(list);const selected=[];for(const f of files){const line=document.createElement('div');line.style.cssText='display:grid;grid-template-columns:24px minmax(0,1fr) auto;align-items:center;gap:12px;padding:8px 4px;border-bottom:1px solid #53677a';const cb=document.createElement('input');cb.type='checkbox';cb.checked=true;cb.style.cssText='width:16px;height:16px;margin:0;min-width:16px;justify-self:start;';selected.push({cb,f});line.appendChild(cb);const name=document.createElement('span');name.textContent=f.name+' ('+(f.size===null?'size unknown':f.size+' bytes')+')'+(f.size===0?' \u2014 EMPTY':'');name.style.cssText='min-width:0;overflow-wrap:anywhere;text-align:left;';line.appendChild(name);const one=document.createElement('button');one.textContent='Download';one.style.cssText='width:auto;min-width:86px;justify-self:end;';one.onclick=()=>{const boot=Number(f.name.slice(5,13));window.location='/api/v1/storage/log?boot='+boot;};line.appendChild(one);list.appendChild(line);}const controls=document.createElement('div');controls.style.cssText='display:flex;gap:10px;flex-wrap:wrap;margin-top:16px';const add=(text,fn)=>{const b=document.createElement('button');b.textContent=text;b.onclick=fn;controls.appendChild(b);};const downloadZip=all=>{const chosen=all?selected:selected.filter(x=>x.cb.checked);if(!chosen.length){alert('Select at least one log');return;}const boots=chosen.map(x=>String(Number(x.f.name.slice(5,13))));const q=all?'all=1':'boots='+boots.join(',');window.location='/api/v1/storage/logs.zip?'+q;};add('Download Selected (ZIP)',()=>downloadZip(false));add('Download All (ZIP)',()=>downloadZip(true));add('Select All',()=>selected.forEach(x=>x.cb.checked=true));add('Select None',()=>selected.forEach(x=>x.cb.checked=false));add('Close',()=>panel.remove());panel.appendChild(controls);document.body.appendChild(panel);}catch(e){alert('SD log listing failed: '+e.message);}}\n"
         "function downloadStorageDiagnostics(){window.location='/api/v1/storage/diagnostics';}\n"
         "async function copyDiagnosticSummary(){try{const [d,cfg,sd]=await Promise.all([getJson('/api/v1/status'),getJson('/api/v1/config'),getOptionalJson('/api/v1/storage/status',[404])]);const p=d.peer_monitor&&d.peer_monitor.peers?d.peer_monitor.peers[0]:null;const lines=['ESP32-P4 GNSS NTP/NTS Server diagnostic summary','Host: '+(cfg.hostname||'--'),'Uptime: '+(d.system?d.system.uptime_seconds:'--')+' s','GNSS: '+(d.gnss?JSON.stringify(d.gnss):'--'),'PPS: '+(d.pps?JSON.stringify(d.pps):'--'),'NTP: '+(d.ntp?JSON.stringify(d.ntp):'--'),'Redundant peer: '+(p&&p.configured?p.server+' '+p.health+' offset='+p.offset_ns+'ns reach=0x'+Number(p.reachability).toString(16):'disabled'),'Storage: '+(sd?sd.state+' free='+sd.free_bytes:'--'),'Peer timing authority: NONE'];await navigator.clipboard.writeText(lines.join('\\n'));alert('Sanitized diagnostic summary copied.');}catch(e){alert('Copy failed: '+e.message);}}\n"
         "let lastCardInteraction=0;\n"
@@ -4064,8 +4069,8 @@ static esp_err_t management_handler(httpd_req_t *request)
         "   row('Configuration','GET /api/v1/config'),row('Backup / Restore','GET/POST /api/v1/config/backup'),row('Hostname','PUT /api/v1/config/hostname'),\n"
         "   row('Cloudflare','PUT/DELETE /api/v1/config/cloudflare'),row('Peer Monitor','PUT /api/v1/config/peer-monitor'),row('SD Storage','GET /api/v1/storage/status'),row('OTA Status','GET /api/v1/ota/status'),row('OTA Upload','POST /api/v1/ota/image'),row('OTA Rollback','POST /api/v1/ota/rollback (X-Confirm-Rollback: ROLLBACK)')]));\n"
         "  const resetc=ops.reset_counts||{};let recent='';for(const e of (ops.events||[]).slice(-6).reverse()){recent+='<div class=\"peerbox\"><div class=\"peerhead\"><span class=\"peername\">#'+esc(e.sequence)+' '+esc(e.type)+'</span><span class=\"peerhealth\">boot '+esc(e.boot_id)+'</span></div><div class=\"peerstats\">'+row('Detail',e.detail)+row('Uptime',e.uptime_seconds+' s')+'</div></div>';};\n"
-        "  col4.push(card('Operations & Reset History',[row('Boot Count',ops.boot_count),row('Retained Events',ops.event_count+' / '+ops.capacity),row('Overwritten',ops.overwritten_events),row('Last Reset Class',ops.last_reset_class),row('Raw Reset Reason',ops.last_reset_reason),row('Power-on Resets',resetc.power_on||0),row('Software Resets',resetc.software||0),row('Watchdog Resets',resetc.watchdog||0),row('Panic Resets',resetc.panic||0),row('Brownout Resets',resetc.brownout||0)],'<div class=\"peers\">'+recent+'</div>'));\n"
-        "  const sd=storage||{};col4.push(card('SD Card / Operational Storage',[row('State',sd.state||'--'),row('Configured',yesNo(!!sd.configured)),row('Mounted',yesNo(!!sd.mounted)),row('Desired Mounted',yesNo(!!sd.desired_mounted)),row('Archive Worker',yesNo(!!sd.worker_running)),row('Card',sd.card_name||'--'),row('Capacity',sd.capacity_bytes?Math.round(sd.capacity_bytes/1048576)+' MiB':'--'),row('Free',sd.free_bytes?Math.round(sd.free_bytes/1048576)+' MiB':'--'),row('Free-space Reserve',sd.reserve_bytes?Math.round(sd.reserve_bytes/1048576)+' MiB':'--'),row('Low Space',yesNo(!!sd.low_space)),row('Archived Events',sd.archived_events||0),row('Bytes Written',sd.bytes_written||0),row('Mount Successes',sd.mount_successes||0),row('Mount Failures',sd.mount_failures||0),row('Remount Attempts',sd.remount_attempts||0),row('Write Failures',sd.write_failures||0),row('Command Queue Drops',sd.command_queue_drops||0),row('Retention Deletes',sd.retention_deleted_files||0),row('Formats',sd.format_count||0),row('Format Failures',sd.format_failures||0),row('Log Erases',sd.erase_count||0),row('Last Error',sd.last_error_name||String(sd.last_error||'OK'))],'<div class=\"actions\"><button onclick=\"flushStorage()\">Flush Archive</button><button onclick=\"mountStorage()\">Mount / Retry</button><button class=\"danger\" onclick=\"unmountStorage()\">Safe Unmount</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button class=\"danger\" onclick=\"eraseStorageLogs()\">Erase Operational Logs</button></div><h3>Danger Zone</h3><div class=\"actions\"><button class=\"danger\" onclick=\"formatStorage()\">Format SD Card</button></div><div id=\"sdmsg\" class=\"actionmsg\">Operations storage only; never timing authority. Formatting requires explicit FORMAT confirmation.</div>'));\n"
+        "  col4.push(card('Operations & Reset History',[row('Boot Count',ops.boot_count),row('Retained Events',ops.event_count+' / '+ops.capacity),row('Overwritten',ops.overwritten_events),row('History Write Failures',ops.storage_write_failures||0),row('History Read Failures',ops.storage_read_failures||0),row('Last Storage Error',ops.last_storage_error||0),row('Last Reset Class',ops.last_reset_class),row('Raw Reset Reason',ops.last_reset_reason),row('Power-on Resets',resetc.power_on||0),row('Software Resets',resetc.software||0),row('Watchdog Resets',resetc.watchdog||0),row('Panic Resets',resetc.panic||0),row('Brownout Resets',resetc.brownout||0)],'<div class=\"peers\">'+recent+'</div>'));\n"
+        "  const sd=storage||{};col4.push(card('SD Card / Operational Storage',[row('State',sd.state||'--'),row('Configured',yesNo(!!sd.configured)),row('Mounted',yesNo(!!sd.mounted)),row('Desired Mounted',yesNo(!!sd.desired_mounted)),row('Archive Worker',yesNo(!!sd.worker_running)),row('Card',sd.card_name||'--'),row('Capacity',sd.capacity_bytes?Math.round(sd.capacity_bytes/1048576)+' MiB':'--'),row('Free',sd.free_bytes?Math.round(sd.free_bytes/1048576)+' MiB':'--'),row('Free-space Reserve',sd.reserve_bytes?Math.round(sd.reserve_bytes/1048576)+' MiB':'--'),row('Low Space',yesNo(!!sd.low_space)),row('Archived Events',sd.archived_events||0),row('Bytes Written',sd.bytes_written||0),row('Mount Successes',sd.mount_successes||0),row('Mount Failures',sd.mount_failures||0),row('Remount Attempts',sd.remount_attempts||0),row('Write Failures',sd.write_failures||0),row('Command Queue Drops',sd.command_queue_drops||0),row('Retention Deletes',sd.retention_deleted_files||0),row('Formats',sd.format_count||0),row('Format Failures',sd.format_failures||0),row('Log Erases',sd.erase_count||0),row('Last Error',sd.last_error_name||String(sd.last_error||'OK'))],'<div class=\"actions\"><button onclick=\"flushStorage()\">Flush Archive</button><button onclick=\"mountStorage()\">Mount / Enable</button><button class=\"danger\" onclick=\"unmountStorage()\">Safe Unmount</button><button class=\"danger\" onclick=\"disableStorage()\">Disable SD Storage</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button onclick=\"downloadSDLogs()\">Download SD Logs</button><button class=\"danger\" onclick=\"eraseStorageLogs()\">Erase Operational Logs</button></div><h3>Danger Zone</h3><div class=\"actions\"><button class=\"danger\" onclick=\"formatStorage()\">Format SD Card</button></div><div id=\"sdmsg\" class=\"actionmsg\">Operations storage only; never timing authority. Formatting requires explicit FORMAT confirmation.</div>'));\n"
         "  col4.push(card('System Actions',[\n"
         "   row('Uptime',duration(d.system.uptime_seconds)),row('Last Reset',hst(d.system.boot_time_unix,d.system.boot_time_valid)),\n"
         "   row('Reset Reason',d.system.reset_reason),row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
@@ -4074,7 +4079,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "  const diagTiming=card('Timing Capture — Diagnostics',[row('Clock State',d.clock.state),row('Solution Valid',yesNo(d.clock.solution_valid)),row('Phase Error',d.clock.phase_error_ns+' ns'),row('Frequency',d.clock.frequency_ppm+' ppm'),row('Accepted / Rejected',d.clock.accepted_samples+' / '+d.clock.rejected_samples),row('Holdover',d.clock.holdover_seconds+' s'),row('PPS Valid',yesNo(d.pps.valid)),row('PPS Period',d.pps.period_us+' us'),row('PPS Jitter',d.pps.jitter_us+' us'),row('PPS Age',d.pps.age_us+' us'),row('PPS Edges',d.pps.edge_count),row('PPS Queue Drops',d.pps.queue_drops)]);\n"
         "  const diagServices=card('NTP / NTS — Diagnostics',[row('NTP Requests',d.ntp.requests),row('NTP Responses',d.ntp.responses),row('Invalid NTP',d.ntp.invalid_requests),row('Unsync Drops',d.ntp.unsynchronized_drops),row('RATE KoD',d.ntp.rate_kod),row('Send Failures',d.ntp.send_failures),row('Socket Failures',d.ntp.socket_failures),row('NTS-KE Exchanges',d.nts.ke_exchanges),row('NTS-KE Failures',d.nts.ke_exchange_failures),row('NTS TLS Failures',d.nts.ke_tls_handshake_failures),row('NTS Verify Failures',d.nts.verification_failures),row('NTS Protection Failures',d.nts.protection_failures),row('NTS NAKs Sent',d.nts.naks_sent),row('Rate-Limited Drops',d.ntp.rate_limited_drops),row('HW RX Drops',d.ntp.hw_rx_drops),row('NTS-KE Deadline Expiries',d.nts.ke_deadline_expirations),row('NTS-KE Rejected (per client / busy / memory)',d.nts.ke_per_client_rejections+' / '+d.nts.ke_busy_rejections+' / '+d.nts.ke_low_memory_rejections),row('NTS-KE Active',d.nts.ke_active_connections),row('TLS Certificate Reloads',d.nts.ke_certificate_reloads),row('TX Compensation',(d.ntp.tx_compensation_ns/1000).toFixed(1)+' \\u00b5s'),row('NTS T3 Bias',(d.ntp.nts_tx_bias_ns/1000).toFixed(1)+' \\u00b5s')]);\n"
         "  const recentDiag=(ops&&ops.events?ops.events.slice(-20).reverse():[]);let recentHtml='<div class=\"peers\">';for(const e of recentDiag){recentHtml+='<div class=\"peerbox diag-event\"><div class=\"peerhead\"><span class=\"peername\">'+esc(e.type)+' #'+e.sequence+'</span><span class=\"event-time\">'+esc(e.unix_time_valid?new Date(e.unix_time*1000).toISOString():'uptime '+e.uptime_seconds+'s')+'</span></div><div class=\"event-detail\">'+esc(e.detail||'')+'</div></div>';}recentHtml+='</div><div class=\"actions\"><button onclick=\"refresh()\">Refresh Now</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button onclick=\"copyDiagnosticSummary()\">Copy Summary</button></div>';const diagRecent=card('Recent Faults / State Changes',[row('Events retained',ops?ops.event_count:'--'),row('Overwritten',ops?ops.overwritten_events:'--')],recentHtml);\n"
-        "  let pageCols; if(pageMode==='dashboard'){pageCols=[[col1[0],col1[1]],[col2[0],col2[1]],[col3[0],redCompact],[peerLive]];}else if(pageMode==='system'){pageCols=[[col4[3],col4[2]],[col4[1]],[col4[0]],[col2[2]]];}else if(pageMode==='management'){pageCols=[[col3[1]],[col3[2]],[],[]];}else{pageCols=[[diagGnss],[diagTiming],[diagServices,redDiag],[diagRecent]];}\n"
+        "  let pageCols; if(pageMode==='dashboard'){pageCols=[[col1[0],col1[1]],[col2[0],col2[1]],[col3[0],redCompact],[peerLive]];}else if(pageMode==='system'){pageCols=[[col4[3],col2[2]],[col4[1]],[col4[2]],[col4[0]]];}else if(pageMode==='management'){pageCols=[[col3[1]],[col3[2]],[],[]];}else{pageCols=[[diagGnss],[diagTiming],[diagServices,redDiag],[diagRecent]];}\n"
         "  if(Date.now()-lastCardInteraction<8000||document.querySelector('#cards input:focus,#cards button:focus,#cards select:focus,#cards textarea:focus'))return;\n"
         "  document.getElementById('cards').innerHTML=pageCols.length?'<div class=\"cardcolumns\">'+pageCols.map(x=>'<div class=\"cardcol\">'+x.join('')+'</div>').join('')+'</div>':'';\n"
         " }catch(e){\n"
@@ -4226,12 +4231,15 @@ static esp_err_t operations_history_handler(httpd_req_t *request)
     int length = snprintf(response, response_size,
         "{\"capacity\":%u,\"boot_count\":%" PRIu32 ",\"next_sequence\":%" PRIu32
         ",\"event_count\":%" PRIu32 ",\"overwritten_events\":%" PRIu32
+        ",\"storage_write_failures\":%" PRIu32 ",\"storage_read_failures\":%" PRIu32
+        ",\"last_storage_error\":%" PRId32
         ",\"last_reset_reason\":%" PRId32 ",\"last_reset_class\":\"%s\""
         ",\"reset_counts\":{\"power_on\":%" PRIu32 ",\"external\":%" PRIu32
         ",\"software\":%" PRIu32 ",\"panic\":%" PRIu32 ",\"watchdog\":%" PRIu32
         ",\"deep_sleep\":%" PRIu32 ",\"brownout\":%" PRIu32 ",\"other\":%" PRIu32 "},\"events\":[",
         (unsigned)OPERATIONS_HISTORY_CAPACITY, status.boot_count, status.next_sequence,
-        status.event_count, status.dropped_events, status.last_reset_reason,
+        status.event_count, status.dropped_events, status.write_failures,
+        status.read_failures, status.last_storage_error, status.last_reset_reason,
         operations_reset_class_name(status.last_reset_class), status.reset_power_on_count,
         status.reset_external_count, status.reset_software_count, status.reset_panic_count,
         status.reset_watchdog_count, status.reset_deep_sleep_count, status.reset_brownout_count,
@@ -4571,6 +4579,15 @@ static esp_err_t storage_unmount_handler(httpd_req_t *request)
     return httpd_resp_send(request, "{\"accepted\":true,\"action\":\"unmount\"}\n", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t storage_disable_handler(httpd_req_t *request)
+{
+    const esp_err_t err = sd_storage_request_disable();
+    if (err != ESP_OK) { httpd_resp_set_status(request, "409 Conflict"); return httpd_resp_send(request, "disable request not accepted", HTTPD_RESP_USE_STRLEN); }
+    (void)operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, "sd_disable_requested");
+    httpd_resp_set_type(request, "application/json"); set_security_headers(request);
+    return httpd_resp_send(request, "{\"accepted\":true,\"action\":\"disable\"}\n", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t storage_erase_logs_handler(httpd_req_t *request)
 {
     char confirm[16] = {0};
@@ -4607,6 +4624,241 @@ static esp_err_t storage_format_handler(httpd_req_t *request)
     (void)operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, "sd_format_requested_by_authenticated_admin");
     httpd_resp_set_status(request, "202 Accepted"); httpd_resp_set_type(request, "application/json"); set_security_headers(request);
     return httpd_resp_send(request, "{\"accepted\":true,\"action\":\"format\",\"destructive\":true}\n", HTTPD_RESP_USE_STRLEN);
+}
+
+/* Authenticated HTTPS management endpoint: bounded SD log listing and download.
+ * The URI is fixed and the boot identifier is parsed as a decimal integer;
+ * clients cannot supply a filesystem path. No log file is buffered in RAM.
+ */
+#define SD_LOG_EXPORT_MAX 64U
+
+typedef struct { uint32_t boot; uint32_t size; } sd_export_file_t;
+
+static bool parse_sd_log_name(const char *name, uint32_t *boot)
+{
+    if (strlen(name) != 19 || strncmp(name, "boot-", 5) != 0 || strcmp(name + 13, ".jsonl") != 0) return false;
+    uint32_t n = 0;
+    for (int i = 5; i < 13; ++i) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        n = n * 10U + (uint32_t)(name[i] - '0');
+    }
+    *boot = n;
+    return true;
+}
+
+static esp_err_t storage_logs_handler(httpd_req_t *request)
+{
+    sd_storage_status_t st;
+    if (sd_storage_get_status(&st) != ESP_OK || !st.mounted) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_send(request, "SD card not mounted", HTTPD_RESP_USE_STRLEN);
+    }
+    DIR *dir = opendir("/sdcard/logs");
+    if (!dir) return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "No SD logs");
+    httpd_resp_set_type(request, "application/json");
+    set_security_headers(request);
+    if (httpd_resp_send_chunk(request, "{\"files\":[", 10) != ESP_OK) { closedir(dir); return ESP_FAIL; }
+    bool first = true;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t boot;
+        if (!parse_sd_log_name(entry->d_name, &boot)) continue;
+        char path[96];
+        snprintf(path, sizeof(path), "/sdcard/logs/boot-%08" PRIu32 ".jsonl", boot);
+        struct stat statbuf;
+        if (stat(path, &statbuf) != 0 || !S_ISREG(statbuf.st_mode)) continue;
+        char item[144];
+        int n = snprintf(item, sizeof(item), "%s{\"name\":\"boot-%08" PRIu32 ".jsonl\",\"size\":%" PRIu64 "}",
+                         first ? "" : ",", boot, (uint64_t)statbuf.st_size);
+        if (n < 0 || n >= (int)sizeof(item) || httpd_resp_send_chunk(request, item, n) != ESP_OK) {
+            closedir(dir); return ESP_FAIL;
+        }
+        first = false;
+    }
+    closedir(dir);
+    if (httpd_resp_send_chunk(request, "]}\n", 3) != ESP_OK) return ESP_FAIL;
+    return httpd_resp_send_chunk(request, NULL, 0);
+}
+
+/* ZIP32 store-only streaming with data descriptors: no SD log buffering in RAM. */
+static uint32_t sd_zip_crc32(uint32_t crc, const uint8_t *data, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+    return crc;
+}
+
+static void sd_zip_le16(uint8_t *p, uint16_t n) { p[0] = n & 255; p[1] = n >> 8; }
+static void sd_zip_le32(uint8_t *p, uint32_t n) { sd_zip_le16(p, n & 65535U); sd_zip_le16(p + 2, n >> 16); }
+static esp_err_t sd_zip_send(httpd_req_t *req, const void *p, size_t n, uint32_t *offset)
+{
+    if (UINT32_MAX - *offset < n) return ESP_FAIL;
+    esp_err_t err = httpd_resp_send_chunk(req, p, n);
+    if (err == ESP_OK) *offset += (uint32_t)n;
+    return err;
+}
+
+static esp_err_t storage_logs_zip_handler(httpd_req_t *request)
+{
+    sd_storage_status_t st;
+    if (sd_storage_get_status(&st) != ESP_OK || !st.mounted) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_send(request, "SD card not mounted", HTTPD_RESP_USE_STRLEN);
+    }
+    char query[512] = {0}, chosen[440] = {0};
+    bool all = false;
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        char v[8];
+        all = httpd_query_key_value(query, "all", v, sizeof(v)) == ESP_OK && strcmp(v, "1") == 0;
+        if (!all && httpd_query_key_value(query, "boots", chosen, sizeof(chosen)) != ESP_OK)
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "boots or all required");
+    } else return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "query required");
+    uint32_t requested[SD_LOG_EXPORT_MAX]; size_t requested_count = 0;
+    if (!all) {
+        char *cursor = chosen;
+        while (*cursor) {
+            if (requested_count == SD_LOG_EXPORT_MAX) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "too many logs");
+            errno = 0; char *end; unsigned long n = strtoul(cursor, &end, 10);
+            if (errno || end == cursor || n > UINT32_MAX || (*end != ',' && *end != '\0'))
+                return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid boot list");
+            requested[requested_count++] = (uint32_t)n;
+            cursor = *end ? end + 1 : end;
+        }
+        if (!requested_count) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "empty selection");
+    }
+    sd_export_file_t *files = calloc(SD_LOG_EXPORT_MAX, sizeof(*files));
+    if (!files) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    size_t count = 0;
+    DIR *dir = opendir("/sdcard/logs");
+    if (!dir) { free(files); return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "No SD logs"); }
+    struct dirent *de;
+    bool overflow = false;
+    while ((de = readdir(dir))) {
+        uint32_t boot;
+        if (!parse_sd_log_name(de->d_name, &boot)) continue;
+        bool include = all;
+        for (size_t i = 0; !include && i < requested_count; ++i) include = requested[i] == boot;
+        if (!include) continue;
+        char path[96]; snprintf(path, sizeof(path), "/sdcard/logs/boot-%08" PRIu32 ".jsonl", boot);
+        struct stat sb;
+        if (stat(path, &sb) || !S_ISREG(sb.st_mode) || sb.st_size < 0 || (uint64_t)sb.st_size > UINT32_MAX) continue;
+        if (count == SD_LOG_EXPORT_MAX) { overflow = true; break; }
+        files[count++] = (sd_export_file_t){.boot = boot, .size = (uint32_t)sb.st_size};
+    }
+    closedir(dir);
+    if (overflow || count == 0) {
+        free(files);
+        return httpd_resp_send_err(request, overflow ? HTTPD_500_INTERNAL_SERVER_ERROR : HTTPD_404_NOT_FOUND,
+                                   overflow ? "Too many logs for ZIP export" : "No matching logs");
+    }
+    /* Sort for reproducible ZIP entry order. */
+    for (size_t i = 0; i < count; ++i)
+        for (size_t j = i + 1; j < count; ++j)
+            if (files[j].boot < files[i].boot) { sd_export_file_t tmp = files[i]; files[i] = files[j]; files[j] = tmp; }
+    /* Preflight all files before sending headers, to avoid a silently partial ZIP. */
+    for (size_t i = 0; i < count; ++i) {
+        char path[96]; snprintf(path, sizeof(path), "/sdcard/logs/boot-%08" PRIu32 ".jsonl", files[i].boot);
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { free(files); return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Log unavailable"); }
+        fclose(fp);
+    }
+    httpd_resp_set_type(request, "application/zip");
+    httpd_resp_set_hdr(request, "Content-Disposition", "attachment; filename=ts2-sd-logs.zip");
+    set_security_headers(request);
+    uint32_t offset = 0;
+    uint32_t *positions = calloc(count, sizeof(uint32_t));
+    uint32_t *crcs = calloc(count, sizeof(uint32_t));
+    if (!positions || !crcs) { free(positions); free(crcs); free(files); return ESP_ERR_NO_MEM; }
+    esp_err_t err = ESP_OK;
+    uint8_t header[46], buf[1024];
+    for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+        char name[32], path[96];
+        int len = snprintf(name, sizeof(name), "boot-%08" PRIu32 ".jsonl", files[i].boot);
+        snprintf(path, sizeof(path), "/sdcard/logs/%s", name);
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { err = ESP_FAIL; break; }
+        positions[i] = offset;
+        memset(header, 0, 30); sd_zip_le32(header, 0x04034b50U);
+        sd_zip_le16(header + 4, 20); sd_zip_le16(header + 6, 8); /* descriptor */
+        sd_zip_le16(header + 26, (uint16_t)len);
+        err = sd_zip_send(request, header, 30, &offset);
+        if (err == ESP_OK) err = sd_zip_send(request, name, len, &offset);
+        uint32_t crc = 0xffffffffU, bytes = 0;
+        size_t n;
+        while (err == ESP_OK && (n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+            crc = sd_zip_crc32(crc, buf, n);
+            bytes += (uint32_t)n;
+            err = sd_zip_send(request, buf, n, &offset);
+        }
+        if (ferror(fp)) err = ESP_FAIL;
+        fclose(fp);
+        if (bytes != files[i].size) err = ESP_FAIL; /* log changed while downloading */
+        crcs[i] = crc ^ 0xffffffffU;
+        if (err != ESP_OK) break;
+        uint8_t dd[16]; sd_zip_le32(dd, 0x08074b50U); sd_zip_le32(dd + 4, crcs[i]);
+        sd_zip_le32(dd + 8, bytes); sd_zip_le32(dd + 12, bytes);
+        err = sd_zip_send(request, dd, sizeof(dd), &offset);
+    }
+    uint32_t central_start = offset;
+    for (size_t i = 0; i < count && err == ESP_OK; ++i) {
+        char name[32]; int len = snprintf(name, sizeof(name), "boot-%08" PRIu32 ".jsonl", files[i].boot);
+        memset(header, 0, sizeof(header)); sd_zip_le32(header, 0x02014b50U);
+        sd_zip_le16(header + 4, 20); sd_zip_le16(header + 6, 20); sd_zip_le16(header + 8, 8);
+        sd_zip_le32(header + 16, crcs[i]); sd_zip_le32(header + 20, files[i].size);
+        sd_zip_le32(header + 24, files[i].size); sd_zip_le16(header + 28, (uint16_t)len);
+        sd_zip_le32(header + 42, positions[i]);
+        err = sd_zip_send(request, header, sizeof(header), &offset);
+        if (err == ESP_OK) err = sd_zip_send(request, name, len, &offset);
+    }
+    if (err == ESP_OK) {
+        uint8_t eocd[22] = {0}; sd_zip_le32(eocd, 0x06054b50U);
+        sd_zip_le16(eocd + 8, (uint16_t)count); sd_zip_le16(eocd + 10, (uint16_t)count);
+        sd_zip_le32(eocd + 12, offset - central_start); sd_zip_le32(eocd + 16, central_start);
+        err = sd_zip_send(request, eocd, sizeof(eocd), &offset);
+    }
+    if (err == ESP_OK) err = httpd_resp_send_chunk(request, NULL, 0);
+    free(positions); free(crcs); free(files);
+    return err;
+}
+
+static esp_err_t storage_log_download_handler(httpd_req_t *request)
+{
+    sd_storage_status_t st;
+    if (sd_storage_get_status(&st) != ESP_OK || !st.mounted)
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card not mounted");
+    char query[64];
+    char boot_str[20];
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "boot", boot_str, sizeof(boot_str)) != ESP_OK)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "boot query required");
+    if (!boot_str[0]) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid boot");
+    for (const char *p = boot_str; *p; ++p)
+        if (*p < '0' || *p > '9') return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid boot");
+    errno = 0;
+    char *end = NULL;
+    unsigned long boot = strtoul(boot_str, &end, 10);
+    if (errno != 0 || *end || boot > UINT32_MAX)
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid boot");
+    char path[96], disposition[96];
+    snprintf(path, sizeof(path), "/sdcard/logs/boot-%08" PRIu32 ".jsonl", (uint32_t)boot);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "log not found");
+    snprintf(disposition, sizeof(disposition), "attachment; filename=boot-%08" PRIu32 ".jsonl", (uint32_t)boot);
+    httpd_resp_set_type(request, "application/x-ndjson");
+    httpd_resp_set_hdr(request, "Content-Disposition", disposition);
+    set_security_headers(request);
+    char buf[1024];
+    size_t n;
+    esp_err_t result = ESP_OK;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        if (httpd_resp_send_chunk(request, buf, n) != ESP_OK) { result = ESP_FAIL; break; }
+    }
+    if (ferror(fp)) result = ESP_FAIL;
+    fclose(fp);
+    if (result == ESP_OK) result = httpd_resp_send_chunk(request, NULL, 0);
+    return result;
 }
 
 static esp_err_t storage_diagnostics_handler(httpd_req_t *request)
@@ -4743,11 +4995,23 @@ static const httpd_uri_t s_storage_mount_uri = {
 static const httpd_uri_t s_storage_unmount_uri = {
     .uri = "/api/v1/storage/unmount", .method = HTTP_POST, .handler = storage_unmount_handler, .user_ctx = NULL,
 };
+static const httpd_uri_t s_storage_disable_uri = {
+    .uri = "/api/v1/storage/disable", .method = HTTP_POST, .handler = storage_disable_handler, .user_ctx = NULL,
+};
 static const httpd_uri_t s_storage_erase_logs_uri = {
     .uri = "/api/v1/storage/erase-logs", .method = HTTP_POST, .handler = storage_erase_logs_handler, .user_ctx = NULL,
 };
 static const httpd_uri_t s_storage_format_uri = {
     .uri = "/api/v1/storage/format", .method = HTTP_POST, .handler = storage_format_handler, .user_ctx = NULL,
+};
+static const httpd_uri_t s_storage_logs_uri = {
+    .uri = "/api/v1/storage/logs", .method = HTTP_GET, .handler = storage_logs_handler, .user_ctx = NULL,
+};
+static const httpd_uri_t s_storage_log_download_uri = {
+    .uri = "/api/v1/storage/log", .method = HTTP_GET, .handler = storage_log_download_handler, .user_ctx = NULL,
+};
+static const httpd_uri_t s_storage_logs_zip_uri = {
+    .uri = "/api/v1/storage/logs.zip", .method = HTTP_GET, .handler = storage_logs_zip_handler, .user_ctx = NULL,
 };
 static const httpd_uri_t s_storage_diagnostics_uri = {
     .uri = "/api/v1/storage/diagnostics", .method = HTTP_GET, .handler = storage_diagnostics_handler, .user_ctx = NULL,
@@ -5202,7 +5466,7 @@ static esp_err_t register_all_handlers(httpd_handle_t server)
 {
     const httpd_uri_t *handlers[] = {
         &s_index_uri, &s_system_page_uri, &s_management_uri, &s_diagnostics_page_uri, &s_firmware_page_uri, &s_status_uri, &s_health_uri, &s_metrics_uri,
-        &s_operations_history_uri, &s_storage_status_uri, &s_storage_flush_uri, &s_storage_mount_uri, &s_storage_unmount_uri, &s_storage_erase_logs_uri, &s_storage_format_uri, &s_storage_diagnostics_uri, &s_system_reboot_uri, &s_hardware_profile_get_uri, &s_hardware_profile_put_uri,
+        &s_operations_history_uri, &s_storage_status_uri, &s_storage_flush_uri, &s_storage_mount_uri, &s_storage_unmount_uri, &s_storage_disable_uri, &s_storage_erase_logs_uri, &s_storage_format_uri, &s_storage_diagnostics_uri, &s_storage_logs_uri, &s_storage_log_download_uri, &s_storage_logs_zip_uri, &s_system_reboot_uri, &s_hardware_profile_get_uri, &s_hardware_profile_put_uri,
         &s_commissioning_get_uri, &s_commissioning_put_uri, &s_commissioning_sync_uri,
         &s_config_get_uri, &s_config_backup_get_uri, &s_config_backup_restore_uri, &s_peer_monitor_put_uri, &s_redundant_server_put_uri, &s_hostname_put_uri, &s_network_put_uri, &s_cloudflare_put_uri,
         &s_cloudflare_delete_uri, &s_cloudflare_verify_uri,

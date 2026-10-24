@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -13,6 +14,8 @@
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "nvs.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -32,11 +35,14 @@ static const char *LOG_DIR = "/sdcard/logs";
 #define SD_STORAGE_HOUSEKEEPING_MS  60000U
 #define SD_STORAGE_RETRY_MS        10000U
 #define SD_STORAGE_CMD_DEPTH           8U
+#define SD_PREF_NS "sd_storage"
+#define SD_PREF_KEY "enabled"
 
 typedef enum {
     SD_CMD_FLUSH = 1,
     SD_CMD_MOUNT,
     SD_CMD_UNMOUNT,
+    SD_CMD_DISABLE,
     SD_CMD_FORMAT,
     SD_CMD_ERASE_LOGS,
 } sd_command_t;
@@ -52,6 +58,35 @@ static uint32_t s_boot_id;
 static uint32_t s_last_sequence;
 static bool s_have_sequence;
 static TickType_t s_next_mount_attempt;
+static bool s_manual_unmounted;
+
+/* Persist the administrator's desired state, not transient card presence. */
+static esp_err_t load_mount_preference(bool *enabled)
+{
+    if (enabled == NULL) return ESP_ERR_INVALID_ARG;
+    *enabled = false; /* Fresh devices and erased NVS default to disabled. */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SD_PREF_NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    uint8_t saved = 0;
+    err = nvs_get_u8(h, SD_PREF_KEY, &saved);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err == ESP_OK) *enabled = (saved != 0);
+    return err;
+}
+
+static esp_err_t save_mount_preference(bool enabled)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SD_PREF_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, SD_PREF_KEY, enabled ? 1U : 0U);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
 
 static void status_lock(void) { if (s_lock != NULL) (void)xSemaphoreTake(s_lock, portMAX_DELAY); }
 static void status_unlock(void) { if (s_lock != NULL) xSemaphoreGive(s_lock); }
@@ -119,29 +154,102 @@ static void unmount_card(bool faulted)
     status_unlock();
 }
 
+static esp_err_t commit_log_and_verify(void);
+
 static esp_err_t open_boot_log(void)
 {
     operations_history_status_t hs;
     esp_err_t err = operations_history_get_status(&hs);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot obtain boot ID for SD log: %s", esp_err_to_name(err));
+        return err;
+    }
 
     s_boot_id = hs.boot_count;
-    if (mkdir(LOG_DIR, 0755) != 0 && errno != EEXIST) return ESP_FAIL;
+    if (mkdir(LOG_DIR, 0755) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "Cannot create %s: errno=%d", LOG_DIR, errno);
+        return ESP_FAIL;
+    }
 
     char path[96];
     snprintf(path, sizeof(path), "%s/boot-%08" PRIu32 ".jsonl", LOG_DIR, s_boot_id);
     s_log = fopen(path, "a");
-    if (s_log == NULL) return ESP_FAIL;
+    if (s_log == NULL) {
+        ESP_LOGE(TAG, "Cannot open %s for append: errno=%d", path, errno);
+        return ESP_FAIL;
+    }
 
-    if (fseek(s_log, 0, SEEK_END) != 0) { close_log(); return ESP_FAIL; }
+    if (fseek(s_log, 0, SEEK_END) != 0) {
+        ESP_LOGE(TAG, "Cannot seek %s: errno=%d", path, errno);
+        close_log();
+        return ESP_FAIL;
+    }
     const long size = ftell(s_log);
-    if (size < 0) { close_log(); return ESP_FAIL; }
+    if (size < 0) {
+        ESP_LOGE(TAG, "Cannot determine log size for %s: errno=%d", path, errno);
+        close_log();
+        return ESP_FAIL;
+    }
     if (size == 0) {
+        /* This is the boot's first durable SD record. The reset reason is
+         * available even before civil time has been established. */
+        const time_t now = time(NULL);
+        const bool time_valid = now >= (time_t)1577836800;
         const int n = fprintf(s_log,
-            "{\"record\":\"boot\",\"boot_id\":%" PRIu32 ",\"storage_schema\":2}\n",
-            s_boot_id);
-        if (n < 0 || fflush(s_log) != 0) { close_log(); return ESP_FAIL; }
-        status_lock(); s_status.bytes_written += (uint64_t)n; status_unlock();
+            "{\"record\":\"boot\",\"boot_id\":%" PRIu32
+            ",\"storage_schema\":2,\"reset_reason\":%u"
+            ",\"unix_time\":%" PRId64 ",\"unix_time_valid\":%u}\n",
+            s_boot_id, (unsigned)esp_reset_reason(),
+            time_valid ? (int64_t)now : (int64_t)0, (unsigned)time_valid);
+        if (n < 0 || fflush(s_log) != 0) {
+            ESP_LOGE(TAG, "Failed to write/flush boot record to %s: errno=%d", path, errno);
+            close_log();
+            return ESP_FAIL;
+        }
+        if (commit_log_and_verify() != ESP_OK) {
+            close_log();
+            return ESP_FAIL;
+        }
+        status_lock();
+        s_status.bytes_written += (uint64_t)n;
+        status_unlock();
+        ESP_LOGI(TAG, "Boot record written to %s (%d bytes, reset_reason=%u, time_valid=%u)",
+                 path, n, (unsigned)esp_reset_reason(), (unsigned)time_valid);
+    } else {
+        ESP_LOGI(TAG, "Reopened existing boot log %s (%ld bytes)", path, size);
+    }
+    return ESP_OK;
+}
+
+/* FAT directory metadata may remain stale while the append stream is open.
+ * Close after each committed batch, verify the directory entry, then reopen.
+ * Only the storage worker owns s_log; HTTP readers use separate handles. */
+static esp_err_t commit_log_and_verify(void)
+{
+    if (s_log == NULL) return ESP_ERR_INVALID_STATE;
+    if (fflush(s_log) != 0) {
+        ESP_LOGE(TAG, "SD log fflush failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+    if (fclose(s_log) != 0) {
+        s_log = NULL;
+        ESP_LOGE(TAG, "SD log fclose failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+    s_log = NULL;
+    char path[96];
+    snprintf(path, sizeof(path), "%s/boot-%08" PRIu32 ".jsonl", LOG_DIR, s_boot_id);
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) {
+        ESP_LOGE(TAG, "SD log readback metadata failed: %s errno=%d size=%lld",
+                 path, errno, (long long)(stat(path, &st) == 0 ? st.st_size : -1));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "SD log committed: %s size=%lld", path, (long long)st.st_size);
+    s_log = fopen(path, "a");
+    if (s_log == NULL) {
+        ESP_LOGE(TAG, "SD log reopen failed: %s errno=%d", path, errno);
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -328,14 +436,24 @@ static esp_err_t archive_current_boot_events(void)
             ",\"type\":%u,\"code\":%" PRId32 ",\"detail\":\"%s\"}\n",
             e->sequence, e->boot_id, e->uptime_seconds, e->unix_time,
             (unsigned)e->unix_time_valid, (unsigned)e->type, e->code, detail);
-        if (n < 0) return ESP_FAIL;
+        if (n < 0) {
+            ESP_LOGE(TAG, "Failed to append operational event sequence=%" PRIu32 ": errno=%d",
+                     e->sequence, errno);
+            return ESP_FAIL;
+        }
         committed_sequence = e->sequence;
         wrote_any = true;
         written_events++;
         written_bytes += (uint64_t)n;
     }
     if (!wrote_any) { if (hist_ok) { s_seen_next_sequence = hist.next_sequence; s_seen_valid = true; } return ESP_OK; }
-    if (fflush(s_log) != 0) return ESP_FAIL;
+    if (fflush(s_log) != 0) {
+        ESP_LOGE(TAG, "Failed to flush %" PRIu32 " operational events: errno=%d",
+                 written_events, errno);
+        return ESP_FAIL;
+    }
+
+    if (commit_log_and_verify() != ESP_OK) return ESP_FAIL;
 
     s_last_sequence = committed_sequence;
     s_have_sequence = true;
@@ -448,12 +566,30 @@ static void storage_task(void *arg)
     for (;;) {
         sd_command_t cmd;
         while (xQueueReceive(s_commands, &cmd, 0) == pdTRUE) {
-            if (cmd == SD_CMD_UNMOUNT) {
+            if (cmd == SD_CMD_DISABLE) {
+                const esp_err_t pref_err = save_mount_preference(false);
+                if (pref_err != ESP_OK) {
+                    ESP_LOGE(TAG, "SD disable preference not saved: %s", esp_err_to_name(pref_err));
+                    status_lock(); s_status.last_error = (int32_t)pref_err; status_unlock();
+                    continue;
+                }
                 status_lock(); s_status.desired_mounted = false; status_unlock();
+                s_manual_unmounted = false;
                 unmount_card(false);
-                ESP_LOGI(TAG, "SD safely unmounted by management request");
+                ESP_LOGI(TAG, "SD disabled and safely unmounted by management request");
+            } else if (cmd == SD_CMD_UNMOUNT) {
+                unmount_card(false);
+                s_manual_unmounted = true;
+                ESP_LOGI(TAG, "SD safely unmounted (enabled preference retained)");
             } else if (cmd == SD_CMD_MOUNT) {
+                const esp_err_t pref_err = save_mount_preference(true);
+                if (pref_err != ESP_OK) {
+                    ESP_LOGE(TAG, "SD enable preference not saved: %s", esp_err_to_name(pref_err));
+                    status_lock(); s_status.last_error = (int32_t)pref_err; status_unlock();
+                    continue;
+                }
                 status_lock(); s_status.desired_mounted = true; status_unlock();
+                s_manual_unmounted = false;
                 s_next_mount_attempt = 0;
             } else if (cmd == SD_CMD_FLUSH) {
                 status_lock(); const bool is_mounted = s_status.mounted; status_unlock();
@@ -482,7 +618,7 @@ static void storage_task(void *arg)
         const TickType_t now = xTaskGetTickCount();
         const bool retry_due = (s_next_mount_attempt == 0) ||
                                ((int32_t)(now - s_next_mount_attempt) >= 0);
-        if (want_mount && !mounted && retry_due) {
+        if (want_mount && !mounted && !s_manual_unmounted && retry_due) {
             const esp_err_t err = mount_card(false);
             if (err != ESP_OK) {
                 status_lock(); s_status.mount_failures++; s_status.last_error = (int32_t)err; s_status.state = SD_STORAGE_STATE_DEGRADED; status_unlock();
@@ -490,7 +626,8 @@ static void storage_task(void *arg)
                 s_next_mount_attempt = xTaskGetTickCount() + pdMS_TO_TICKS(SD_STORAGE_RETRY_MS);
             }
         } else if (mounted) {
-            const esp_err_t err = archive_current_boot_events();
+            /* Current boot only: no cross-boot replay or SD archive rescans. */
+            esp_err_t err = archive_current_boot_events();
             if (err != ESP_OK) record_io_failure(err);
             else {
                 const TickType_t hk_now = xTaskGetTickCount();
@@ -531,8 +668,15 @@ esp_err_t sd_storage_start(void)
     return ESP_OK;
 #else
     s_status.configured = true;
-    s_status.desired_mounted = true;
-    s_status.state = SD_STORAGE_STATE_STARTING;
+    bool desired = false;
+    esp_err_t pref_err = load_mount_preference(&desired);
+    if (pref_err != ESP_OK) {
+        /* Fail closed: never probe SD without a readable authorization preference. */
+        ESP_LOGE(TAG, "SD mount preference read failed: %s", esp_err_to_name(pref_err));
+        s_status.last_error = (int32_t)pref_err;
+    }
+    s_status.desired_mounted = desired;
+    s_status.state = desired ? SD_STORAGE_STATE_STARTING : SD_STORAGE_STATE_DISABLED;
     s_status.reserve_bytes = (uint64_t)CONFIG_APP_SD_MIN_FREE_MIB * 1024ULL * 1024ULL;
 
     s_commands = xQueueCreate(SD_STORAGE_CMD_DEPTH, sizeof(sd_command_t));
@@ -575,5 +719,6 @@ esp_err_t sd_storage_get_status(sd_storage_status_t *out)
 esp_err_t sd_storage_request_flush(void) { return queue_command(SD_CMD_FLUSH); }
 esp_err_t sd_storage_request_mount(void) { return queue_command(SD_CMD_MOUNT); }
 esp_err_t sd_storage_request_unmount(void) { return queue_command(SD_CMD_UNMOUNT); }
+esp_err_t sd_storage_request_disable(void) { return queue_command(SD_CMD_DISABLE); }
 esp_err_t sd_storage_request_format(void) { return queue_command(SD_CMD_FORMAT); }
 esp_err_t sd_storage_request_erase_logs(void) { return queue_command(SD_CMD_ERASE_LOGS); }

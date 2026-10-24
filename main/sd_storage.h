@@ -50,6 +50,7 @@ esp_err_t sd_storage_get_status(sd_storage_status_t *out);
 esp_err_t sd_storage_request_flush(void);
 esp_err_t sd_storage_request_mount(void);
 esp_err_t sd_storage_request_unmount(void);
+esp_err_t sd_storage_request_disable(void);
 esp_err_t sd_storage_request_format(void);
 esp_err_t sd_storage_request_erase_logs(void);
 const char *sd_storage_state_name(sd_storage_state_t state);

@@ -54,6 +54,7 @@ typedef struct {
     int64_t last_success_us;
     bool config_valid;
     bool enabled;
+    int64_t kod_suppress_until_us; /* 0=none, INT64_MAX=DENY/RSTR */
     char server[APP_NTP_PEER_SERVER_MAX_LENGTH + 1U];
 } peer_runtime_t;
 
@@ -151,13 +152,64 @@ const char *ntp_peer_monitor_health_name(ntp_peer_health_t health)
 }
 
 
-static void record_health_transition(const char *server, ntp_peer_health_t old_health, ntp_peer_health_t new_health)
+/* Audit-only hysteresis: instantaneous telemetry is intentionally unchanged. */
+#define PEER_AUDIT_CONFIRM_POLLS 3U
+#define PEER_AUDIT_REPEAT_US (15LL * 60LL * 1000000LL)
+typedef struct {
+    ntp_peer_health_t committed;
+    ntp_peer_health_t candidate;
+    uint8_t candidate_count;
+    int64_t last_emit_us;
+    bool initialized;
+} peer_audit_state_t;
+static peer_audit_state_t s_peer_audit[APP_NTP_PEER_MAX_COUNT];
+
+static void record_health_transition(size_t index, const char *server,
+                                     ntp_peer_health_t old_health, ntp_peer_health_t new_health)
 {
-    if (old_health == new_health || old_health == NTP_PEER_HEALTH_UNKNOWN) return;
+    if (index >= APP_NTP_PEER_MAX_COUNT) return;
+    peer_audit_state_t *state = &s_peer_audit[index];
+    if (!state->initialized) {
+        state->initialized = true;
+        state->committed = old_health;
+        state->candidate = new_health;
+        state->candidate_count = 0U;
+    }
+    if (new_health == NTP_PEER_HEALTH_DISABLED || new_health == NTP_PEER_HEALTH_UNKNOWN) {
+        state->committed = new_health;
+        state->candidate = new_health;
+        state->candidate_count = 0U;
+        return;
+    }
+    if (new_health == state->committed) {
+        state->candidate_count = 0U;
+        state->candidate = new_health;
+        return;
+    }
+    if (new_health != state->candidate) {
+        state->candidate = new_health;
+        state->candidate_count = 1U;
+    } else if (state->candidate_count < PEER_AUDIT_CONFIRM_POLLS) {
+        state->candidate_count++;
+    }
+    /* Security-relevant invalid responses and KoD remain immediately auditable. */
+    const bool urgent = new_health == NTP_PEER_HEALTH_KOD ||
+                        new_health == NTP_PEER_HEALTH_INVALID;
+    if (!urgent && state->candidate_count < PEER_AUDIT_CONFIRM_POLLS) return;
+    const int64_t now = esp_timer_get_time();
+    const bool rate_limited = state->last_emit_us > 0 && now >= state->last_emit_us &&
+                              now - state->last_emit_us < PEER_AUDIT_REPEAT_US;
+    const ntp_peer_health_t previous = state->committed;
+    state->committed = new_health;
+    state->candidate_count = 0U;
+    if (previous == NTP_PEER_HEALTH_UNKNOWN || previous == NTP_PEER_HEALTH_DISABLED || rate_limited) return;
     char detail[OPERATIONS_EVENT_DETAIL_MAX + 1U];
-    (void)snprintf(detail, sizeof(detail), "redundant_peer:%.32s:%s", server, ntp_peer_monitor_health_name(new_health));
-    const operations_event_type_t type = new_health == NTP_PEER_HEALTH_HEALTHY ? OPERATIONS_EVENT_RECOVERY : OPERATIONS_EVENT_FAULT;
+    (void)snprintf(detail, sizeof(detail), "redundant_peer:%.32s:%s", server,
+                   ntp_peer_monitor_health_name(new_health));
+    const operations_event_type_t type = new_health == NTP_PEER_HEALTH_HEALTHY
+                                             ? OPERATIONS_EVENT_RECOVERY : OPERATIONS_EVENT_FAULT;
     (void)operations_history_record(type, (int32_t)new_health, detail);
+    state->last_emit_us = now;
 }
 static void reference_id_to_text(const uint8_t *packet, uint8_t stratum, char out[9])
 {
@@ -181,6 +233,7 @@ static void reference_id_to_text(const uint8_t *packet, uint8_t stratum, char ou
 static void reset_peer_slot(size_t index, bool configured, const char *server)
 {
     memset(&s_runtime[index], 0, sizeof(s_runtime[index]));
+    memset(&s_peer_audit[index], 0, sizeof(s_peer_audit[index]));
     s_runtime[index].config_valid = true;
     s_runtime[index].enabled = configured;
     if (server != NULL) {
@@ -265,7 +318,7 @@ static void update_failure(size_t index, ntp_peer_health_t requested,
     const ntp_peer_health_t new_health = peer->health;
     char server[APP_NTP_PEER_SERVER_MAX_LENGTH + 1U]; (void)snprintf(server, sizeof(server), "%s", peer->server);
     unlock_status();
-    record_health_transition(server, old_health, new_health);
+    record_health_transition(index, server, old_health, new_health);
 }
 
 static void compute_rolling_stats(size_t index, ntp_peer_status_t *peer)
@@ -372,7 +425,7 @@ static void update_success(size_t index, const uint8_t *packet, uint64_t server_
     const ntp_peer_health_t new_health = peer->health;
     char server[APP_NTP_PEER_SERVER_MAX_LENGTH + 1U]; (void)snprintf(server, sizeof(server), "%s", peer->server);
     unlock_status();
-    record_health_transition(server, old_health, new_health);
+    record_health_transition(index, server, old_health, new_health);
 }
 
 static bool begin_poll(size_t index, const device_config_ntp_peer_t *config,
@@ -496,6 +549,14 @@ static void process_response(size_t index, poll_context_t *ctx)
                            sizeof(s_status.peers[index].reference_id), "%s", kod);
             unlock_status();
         }
+        /* KoD is not a normal peer failure. RATE must suppress traffic to
+         * this peer; DENY/RSTR must not be retried until configuration changes.
+         * Other peers continue at their configured monitoring interval. */
+        if (strcmp(kod, "RATE") == 0) {
+            s_runtime[index].kod_suppress_until_us = esp_timer_get_time() + INT64_C(1024) * 1000000;
+        } else if (strcmp(kod, "DENY") == 0 || strcmp(kod, "RSTR") == 0) {
+            s_runtime[index].kod_suppress_until_us = INT64_MAX;
+        }
         ESP_LOGW(TAG, "Peer %u returned KoD %.4s", (unsigned)index, kod);
         update_failure(index, NTP_PEER_HEALTH_KOD, false, false, true, false);
         return;
@@ -558,6 +619,10 @@ static void poll_all_peers(const device_config_snapshot_t *config)
     for (size_t i = 0; i < APP_NTP_PEER_MAX_COUNT; ++i) {
         const bool slot_active = (i == APP_REDUNDANT_PEER_INDEX) || config->ntp_peer_monitor_enabled;
         if (!slot_active || !config->ntp_peers[i].enabled || config->ntp_peers[i].server[0] == '\0') continue;
+        /* Only a peer's explicit KoD can suppress its requests. */
+        const int64_t suppress_until = s_runtime[i].kod_suppress_until_us;
+        if (suppress_until != 0 && esp_timer_get_time() < suppress_until) continue;
+        if (suppress_until != 0) s_runtime[i].kod_suppress_until_us = 0;
 
         poll_context_t context;
         memset(&context, 0, sizeof(context));

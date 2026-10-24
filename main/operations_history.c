@@ -209,6 +209,8 @@ esp_err_t operations_history_record(operations_event_type_t type, int32_t code, 
         event_key(event.sequence, key);
         err = nvs_set_blob(handle, key, &event, sizeof(event));
     }
+    /* Publish updated metadata only after NVS commit succeeds. */
+    const operations_history_status_t committed_status = s_status;
     if (err == ESP_OK) {
         s_status.next_sequence++;
         if (s_status.event_count < OPERATIONS_HISTORY_CAPACITY) s_status.event_count++;
@@ -216,6 +218,12 @@ esp_err_t operations_history_record(operations_event_type_t type, int32_t code, 
         err = persist_meta(handle);
     }
     if (err == ESP_OK) err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        s_status = committed_status;
+        s_status.write_failures++;
+        s_status.last_storage_error = (int32_t)err;
+        ESP_LOGW(TAG, "History event persistence failed: %s", esp_err_to_name(err));
+    }
     if (handle != 0) nvs_close(handle);
     xSemaphoreGive(s_lock);
     return err;
@@ -251,10 +259,21 @@ esp_err_t operations_history_read(operations_event_t *events, size_t capacity, s
             event_key(sequence, key);
             size_t length = sizeof(events[got]);
             const esp_err_t read_err = nvs_get_blob(handle, key, &events[got], &length);
-            if (read_err == ESP_OK && length == sizeof(events[got]) && events[got].sequence == sequence) got++;
+            if (read_err == ESP_OK && length == sizeof(events[got]) && events[got].sequence == sequence) {
+                got++;
+            } else {
+                s_status.read_failures++;
+                s_status.last_storage_error = (int32_t)(read_err == ESP_OK ? ESP_ERR_INVALID_SIZE : read_err);
+                err = read_err == ESP_OK ? ESP_ERR_INVALID_SIZE : read_err;
+                ESP_LOGW(TAG, "History event read failed: seq=%" PRIu32 " error=%s",
+                         sequence, esp_err_to_name(err));
+                break;
+            }
         }
         nvs_close(handle);
-        err = ESP_OK;
+    } else {
+        s_status.read_failures++;
+        s_status.last_storage_error = (int32_t)err;
     }
     *out_count = got;
     xSemaphoreGive(s_lock);

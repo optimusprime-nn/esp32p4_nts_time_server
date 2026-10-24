@@ -51,6 +51,10 @@ typedef struct {
     uint32_t reset_other_count;
     int32_t last_reset_reason;
     uint8_t last_reset_class;
+    /* Volatile diagnostics, not persisted: storage faults since this boot. */
+    uint32_t write_failures;
+    uint32_t read_failures;
+    int32_t last_storage_error;
 } operations_history_status_t;
 esp_err_t operations_history_init(void);
 esp_err_t operations_history_record(operations_event_type_t type, int32_t code, const char *detail);
