@@ -90,6 +90,8 @@ static uint64_t timestamp_to_fixed(clock_ntp_timestamp_t t)
  * (PTP/UTC mapping error); beyond that they are rejected. */
 #define PEER_HW_STAMP_TOLERANCE_NS INT64_C(50000)
 #define PEER_HW_STAMP_MAX_SKEW_NS  INT64_C(20000000)
+/* Negative round-trip delay accepted as zero; below this a reply is invalid. */
+#define PEER_NEGATIVE_DELAY_TOLERANCE_NS INT64_C(100000)
 
 /* NTP-era nanoseconds to NTP 32.32. */
 static uint64_t ns_to_fixed(uint64_t ns)
@@ -649,10 +651,18 @@ static void process_response(size_t index, poll_context_t *ctx)
     const int64_t a = fixed_delta_ns(f2, f1);
     const int64_t b = fixed_delta_ns(f3, f4);
     const int64_t offset_ns = (a / 2) + (b / 2) + ((a % 2) + (b % 2)) / 2;
-    const int64_t delay_ns = fixed_delta_ns(f4, f1) - fixed_delta_ns(f3, f2);
+    int64_t delay_ns = fixed_delta_ns(f4, f1) - fixed_delta_ns(f3, f2);
+    /* On a LAN the true delay is only microseconds, so the peer's own
+     * timestamp error (e.g. a booting server's TX compensation still
+     * converging) can make it slightly negative. Treat that as zero, as
+     * RFC 5905 does by flooring delay at the precision; a large negative
+     * delay still means an inconsistent reply. */
     if (delay_ns < 0) {
-        update_failure(index, NTP_PEER_HEALTH_INVALID, false, false, true, false);
-        return;
+        if (delay_ns < -PEER_NEGATIVE_DELAY_TOLERANCE_NS) {
+            update_failure(index, NTP_PEER_HEALTH_INVALID, false, false, true, false);
+            return;
+        }
+        delay_ns = 0;
     }
     update_success(index, response, f3, offset_ns, delay_ns);
     if (hw_stamped && lock_status()) {
