@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "clock_discipline.h"
+#include "eth_service.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -42,6 +43,7 @@ typedef struct {
     clock_ntp_timestamp_t t1;
     int64_t deadline_us;
     bool local_time_valid;
+    uint16_t local_port; /* host order; 0 if unknown */
 } poll_context_t;
 
 typedef struct {
@@ -82,6 +84,19 @@ static void write_be32(uint8_t *p, uint32_t value)
 static uint64_t timestamp_to_fixed(clock_ntp_timestamp_t t)
 {
     return ((uint64_t)t.seconds << 32) | (uint64_t)t.fraction;
+}
+
+/* Hardware stamps may sit slightly the "wrong" side of the software ones
+ * (PTP/UTC mapping error); beyond that they are rejected. */
+#define PEER_HW_STAMP_TOLERANCE_NS INT64_C(50000)
+#define PEER_HW_STAMP_MAX_SKEW_NS  INT64_C(20000000)
+
+/* NTP-era nanoseconds to NTP 32.32. */
+static uint64_t ns_to_fixed(uint64_t ns)
+{
+    const uint64_t seconds = ns / UINT64_C(1000000000);
+    const uint64_t nanos = ns % UINT64_C(1000000000);
+    return (seconds << 32) | (((nanos << 32) + UINT64_C(500000000)) / UINT64_C(1000000000));
 }
 
 static int64_t fixed_delta_ns(uint64_t a, uint64_t b)
@@ -471,6 +486,13 @@ static bool begin_poll(size_t index, const device_config_ntp_peer_t *config,
         return false;
     }
 
+    /* The ephemeral port lwIP bound at sendto() keys the hardware stamps. */
+    struct sockaddr_in local = {0};
+    socklen_t local_len = sizeof(local);
+    if (getsockname(ctx->sock, (struct sockaddr *)&local, &local_len) == 0) {
+        ctx->local_port = ntohs(local.sin_port);
+    }
+
     ctx->active = true;
     ctx->deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
     return true;
@@ -590,10 +612,34 @@ static void process_response(size_t index, poll_context_t *ctx)
         return;
     }
 
-    const uint64_t f1 = timestamp_to_fixed(ctx->t1);
+    uint64_t f1 = timestamp_to_fixed(ctx->t1);
     const uint64_t f2 = ((uint64_t)read_be32(response + 32U) << 32) | read_be32(response + 36U);
     const uint64_t f3 = ((uint64_t)read_be32(response + 40U) << 32) | read_be32(response + 44U);
-    const uint64_t f4 = timestamp_to_fixed(t4);
+    uint64_t f4 = timestamp_to_fixed(t4);
+
+    /* Prefer the EMAC's wire times. T1 is read before sendto() and T4 after
+     * the task wakes from select(), so software stamps carry each path's
+     * stack latency; the receive side is much slower, which biased offsets
+     * by about -90 us. A hardware stamp must fall just after the software
+     * T1 and just before the software T4, or it belongs to something else. */
+    bool hw_stamped = false;
+    uint64_t hw_t1_ns = 0U;
+    uint64_t hw_t4_ns = 0U;
+    if (ctx->local_port != 0U &&
+        eth_service_take_peer_timestamps(ctx->address.sin_addr.s_addr, ctx->local_port,
+                                         &hw_t1_ns, &hw_t4_ns)) {
+        const uint64_t h1 = ns_to_fixed(hw_t1_ns);
+        const uint64_t h4 = ns_to_fixed(hw_t4_ns);
+        const int64_t t1_lag_ns = fixed_delta_ns(h1, f1);
+        const int64_t t4_lead_ns = fixed_delta_ns(f4, h4);
+        if (t1_lag_ns >= -PEER_HW_STAMP_TOLERANCE_NS && t1_lag_ns <= PEER_HW_STAMP_MAX_SKEW_NS &&
+            t4_lead_ns >= -PEER_HW_STAMP_TOLERANCE_NS && t4_lead_ns <= PEER_HW_STAMP_MAX_SKEW_NS &&
+            fixed_delta_ns(h4, h1) > 0) {
+            f1 = h1;
+            f4 = h4;
+            hw_stamped = true;
+        }
+    }
 
     if (s_runtime[index].last_server_t3_valid && s_runtime[index].last_server_t3 == f3) {
         update_failure(index, NTP_PEER_HEALTH_INVALID, false, false, true, true);
@@ -609,6 +655,10 @@ static void process_response(size_t index, poll_context_t *ctx)
         return;
     }
     update_success(index, response, f3, offset_ns, delay_ns);
+    if (hw_stamped && lock_status()) {
+        s_status.peers[index].hw_timestamped_samples++;
+        unlock_status();
+    }
 }
 
 static void poll_all_peers(const device_config_snapshot_t *config)

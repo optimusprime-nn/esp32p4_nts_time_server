@@ -55,6 +55,8 @@ typedef struct {
     uint32_t samples;
     uint32_t rolling_samples;
     uint32_t last_success_age_seconds;
+    /* Samples whose T1/T4 came from EMAC hardware stamps, not software. */
+    uint32_t hw_timestamped_samples;
 } ntp_peer_status_t;
 
 typedef struct {

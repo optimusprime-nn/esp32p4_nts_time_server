@@ -110,6 +110,15 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
  * be late-stamped because it is covered by the NTS Authenticator. */
 int32_t eth_service_get_nts_tx_bias_ns(void);
 
+/* Hardware wire times of the peer monitor's last request to peer_ipv4 sent
+ * from local_port (T1) and of its reply (T4), as disciplined time in NTP-era
+ * nanoseconds (seconds since 1900 * 1e9). Consumes both entries. Returns
+ * false, leaving the caller on software stamps, if either was not captured
+ * or the PTP/UTC mapping is not established and fresh. peer_ipv4 uses the
+ * sockaddr_in.sin_addr.s_addr representation; local_port is host order. */
+bool eth_service_take_peer_timestamps(uint32_t peer_ipv4, uint16_t local_port,
+                                      uint64_t *out_t1_ns, uint64_t *out_t4_ns);
+
 /* Stage B5: diagnostic only; call from a dedicated non-timing task. */
 esp_err_t eth_service_diag_restart_driver(void);
 

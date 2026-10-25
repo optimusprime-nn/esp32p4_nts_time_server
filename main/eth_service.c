@@ -83,6 +83,27 @@ static eth_ntp_rx_queue_entry_t s_ntp_rx_queue[ETH_NTP_RX_QUEUE_SIZE];
 static uint32_t s_ntp_rx_queue_next;
 static uint32_t s_ntp_rx_queue_sequence;
 
+/* Hardware stamps for the peer monitor's own NTP client exchanges: the
+ * request leaving (to port 123 from an ephemeral port) and the reply
+ * arriving (from port 123 to that port). Software T1/T4 taken around
+ * sendto()/recvfrom() are skewed by the lwIP and task-wakeup latency of
+ * each direction, which biased peer offsets by about -90 us. Keyed by
+ * (peer address, local port); entries are consumed once and purged by age. */
+#define ETH_PEER_TS_SLOTS                                4U
+#define ETH_PEER_TS_MAX_AGE_NS                  5000000000ULL
+
+typedef struct {
+    bool valid;
+    uint32_t peer_ipv4;
+    uint16_t local_port;
+    eth_mac_time_t ptp_time;
+} eth_peer_ts_entry_t;
+
+static eth_peer_ts_entry_t s_peer_tx_ts[ETH_PEER_TS_SLOTS];
+static eth_peer_ts_entry_t s_peer_rx_ts[ETH_PEER_TS_SLOTS];
+static uint32_t s_peer_tx_ts_next;
+static uint32_t s_peer_rx_ts_next;
+
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
 typedef struct {
     uint32_t matched;
@@ -598,9 +619,71 @@ static void eth_diag_classify_rx(const uint8_t *buffer, uint32_t length,
     *dhcp = (src == 67U && dst == 68U) || (src == 68U && dst == 67U);
 }
 
+/* IPv4/UDP addressing of a first-fragment frame. Addresses are copied as
+ * stored (the sockaddr_in.sin_addr.s_addr representation); ports are host
+ * byte order. */
+static bool eth_frame_get_udp_tuple(const uint8_t *buffer, size_t length,
+                                    uint32_t *src_ipv4, uint32_t *dst_ipv4,
+                                    uint16_t *src_port, uint16_t *dst_port)
+{
+    if (buffer == NULL || length < 14U) return false;
+    size_t l3 = 14U;
+    uint16_t type = read_be16(buffer + 12U);
+    for (unsigned i = 0; i < 2U &&
+         (type == ETHERTYPE_VLAN || type == ETHERTYPE_QINQ); ++i) {
+        if (length < l3 + 4U) return false;
+        type = read_be16(buffer + l3 + 2U);
+        l3 += 4U;
+    }
+    if (type != ETHERTYPE_IPV4 || length < l3 + 20U || (buffer[l3] >> 4) != 4U) return false;
+    const size_t ihl = (size_t)(buffer[l3] & 0x0FU) * 4U;
+    if (ihl < 20U || length < l3 + ihl + 8U || buffer[l3 + 9U] != IP_PROTOCOL_UDP) return false;
+    if ((read_be16(buffer + l3 + 6U) & 0x1FFFU) != 0U) return false;
+    memcpy(src_ipv4, buffer + l3 + 12U, sizeof(*src_ipv4));
+    memcpy(dst_ipv4, buffer + l3 + 16U, sizeof(*dst_ipv4));
+    *src_port = read_be16(buffer + l3 + ihl);
+    *dst_port = read_be16(buffer + l3 + ihl + 2U);
+    return true;
+}
+
+/* Caller holds s_eth_lock. */
+static void eth_peer_ts_store(eth_peer_ts_entry_t *table, uint32_t *next,
+                              uint32_t peer_ipv4, uint16_t local_port,
+                              const eth_mac_time_t *ptp_time)
+{
+    eth_peer_ts_entry_t *entry = &table[*next];
+    entry->valid = true;
+    entry->peer_ipv4 = peer_ipv4;
+    entry->local_port = local_port;
+    entry->ptp_time = *ptp_time;
+    *next = (*next + 1U) % ETH_PEER_TS_SLOTS;
+}
+
 static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
 {
     esp_eth_handle_t eth_handle = (esp_eth_handle_t)h;
+
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+    /* Peer-monitor request: transmit with a hardware TX stamp (T1). */
+    uint32_t tx_src_ipv4 = 0U, tx_dst_ipv4 = 0U;
+    uint16_t tx_src_port = 0U, tx_dst_port = 0U;
+    if (eth_frame_get_udp_tuple((const uint8_t *)buffer, length, &tx_src_ipv4, &tx_dst_ipv4,
+                                &tx_src_port, &tx_dst_port) &&
+        tx_dst_port == NTP_UDP_PORT && tx_src_port != NTP_UDP_PORT) {
+        eth_mac_time_t tx_timestamp = {0};
+        const esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, &tx_timestamp, 2U,
+                                                          (uint8_t *)buffer, (uint32_t)length);
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_tx_other_attempt++;
+        if (err != ESP_OK) {
+            s_status.diag_tx_other_fail++;
+        } else if (tx_timestamp.seconds != 0U || tx_timestamp.nanoseconds != 0U) {
+            eth_peer_ts_store(s_peer_tx_ts, &s_peer_tx_ts_next, tx_dst_ipv4, tx_src_port, &tx_timestamp);
+        }
+        portEXIT_CRITICAL(&s_eth_lock);
+        return err;
+    }
+#endif
 
     /* Fail open to the stock path unless this is positively identified as an
      * IPv4 UDP NTP server response. */
@@ -882,9 +965,20 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
     const bool client_valid = is_ntp &&
         eth_frame_get_ntp_client(buffer, length, &client_ipv4, &client_port);
 
+    /* Reply to the peer monitor's own request (T4). */
+    uint32_t rx_src_ipv4 = 0U, rx_dst_ipv4 = 0U;
+    uint16_t rx_src_port = 0U, rx_dst_port = 0U;
+    const bool peer_reply = !is_ntp && timestamp_valid &&
+        eth_frame_get_udp_tuple(buffer, length, &rx_src_ipv4, &rx_dst_ipv4,
+                                &rx_src_port, &rx_dst_port) &&
+        rx_src_port == NTP_UDP_PORT && rx_dst_port != NTP_UDP_PORT;
+
     uint32_t ntp_sample = 0U;
 
     portENTER_CRITICAL(&s_eth_lock);
+    if (peer_reply) {
+        eth_peer_ts_store(s_peer_rx_ts, &s_peer_rx_ts_next, rx_src_ipv4, rx_dst_port, timestamp);
+    }
     s_status.rx_hw_frames++;
     if (timestamp_valid) {
         s_status.rx_hw_timestamp_valid++;
@@ -1703,6 +1797,63 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
     s_status.rx_hw_last_map_age_us = out_timestamp->mapping_age_us;
     portEXIT_CRITICAL(&s_eth_lock);
     return true;
+#endif
+}
+
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+/* Caller holds s_eth_lock. Takes the newest matching entry no older than
+ * ETH_PEER_TS_MAX_AGE_NS and invalidates every match and every stale entry. */
+static bool eth_peer_ts_take(eth_peer_ts_entry_t *table, uint32_t peer_ipv4,
+                             uint16_t local_port, uint64_t ptp_now_ns,
+                             eth_mac_time_t *out)
+{
+    bool found = false;
+    uint64_t best_ns = 0U;
+    for (uint32_t i = 0U; i < ETH_PEER_TS_SLOTS; i++) {
+        eth_peer_ts_entry_t *entry = &table[i];
+        if (!entry->valid) continue;
+        const uint64_t entry_ns = ptp_timestamp_to_ns(&entry->ptp_time);
+        if (entry_ns < ptp_now_ns && ptp_now_ns - entry_ns > ETH_PEER_TS_MAX_AGE_NS) {
+            entry->valid = false;
+            continue;
+        }
+        if (entry->peer_ipv4 != peer_ipv4 || entry->local_port != local_port) continue;
+        if (!found || entry_ns > best_ns) {
+            *out = entry->ptp_time;
+            best_ns = entry_ns;
+            found = true;
+        }
+        entry->valid = false;
+    }
+    return found;
+}
+#endif
+
+bool eth_service_take_peer_timestamps(uint32_t peer_ipv4, uint16_t local_port,
+                                      uint64_t *out_t1_ns, uint64_t *out_t4_ns)
+{
+#ifndef SOC_EMAC_IEEE1588V2_SUPPORTED
+    (void)peer_ipv4;
+    (void)local_port;
+    (void)out_t1_ns;
+    (void)out_t4_ns;
+    return false;
+#else
+    if (out_t1_ns == NULL || out_t4_ns == NULL || s_eth_mac == NULL) return false;
+    eth_mac_time_t ptp_now = {0};
+    if (esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK) return false;
+    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+
+    eth_mac_time_t tx_ptp = {0};
+    eth_mac_time_t rx_ptp = {0};
+    portENTER_CRITICAL(&s_eth_lock);
+    const bool have_tx = eth_peer_ts_take(s_peer_tx_ts, peer_ipv4, local_port, ptp_now_ns, &tx_ptp);
+    const bool have_rx = eth_peer_ts_take(s_peer_rx_ts, peer_ipv4, local_port, ptp_now_ns, &rx_ptp);
+    portEXIT_CRITICAL(&s_eth_lock);
+    if (!have_tx || !have_rx) return false;
+
+    return eth_map_ptp_event_to_utc_ns(&tx_ptp, out_t1_ns, NULL, NULL) &&
+           eth_map_ptp_event_to_utc_ns(&rx_ptp, out_t4_ns, NULL, NULL);
 #endif
 }
 

@@ -1866,14 +1866,16 @@ static esp_err_t send_status_json(httpd_req_t *request)
                          "\"successful_polls\":%" PRIu32 ",\"failed_polls\":%" PRIu32 ",\"rejected_responses\":%" PRIu32 ","
                          "\"duplicate_responses\":%" PRIu32 ",\"consecutive_failures\":%" PRIu32 ",\"kod_responses\":%" PRIu32 ","
                          "\"dns_failures\":%" PRIu32 ",\"timeout_failures\":%" PRIu32 ",\"samples\":%" PRIu32 ","
-                         "\"rolling_samples\":%" PRIu32 ",\"last_success_age_seconds\":%" PRIu32 "}",
+                         "\"rolling_samples\":%" PRIu32 ",\"last_success_age_seconds\":%" PRIu32 ","
+                         "\"hw_timestamped_samples\":%" PRIu32 "}",
                          i ? "," : "", (unsigned)i, peer->configured ? "true" : "false", peer->server, peer->resolved_address,
                          ntp_peer_monitor_health_name(peer->health), peer->reachability, peer->stratum, peer->leap, peer->reference_id,
                          peer->offset_ns, peer->delay_ns, peer->jitter_ns, peer->min_offset_ns, peer->max_offset_ns,
                          peer->mean_offset_ns, peer->rms_offset_ns, peer->min_delay_ns, peer->mean_delay_ns,
                          peer->successful_polls, peer->failed_polls, peer->rejected_responses, peer->duplicate_responses,
                          peer->consecutive_failures, peer->kod_responses, peer->dns_failures, peer->timeout_failures,
-                         peer->samples, peer->rolling_samples, peer->last_success_age_seconds);
+                         peer->samples, peer->rolling_samples, peer->last_success_age_seconds,
+                         peer->hw_timestamped_samples);
             if (n < 0 || (size_t)n >= response_size - (size_t)length) { length = (int)response_size; break; }
             length += n;
         }
