@@ -248,6 +248,13 @@ esp_err_t acme_client_store_tls_activation_intent(const acme_tls_activation_inte
  * existing production storage path, but does NOT activate it for management TLS.
  * No scheduler or HTTP endpoint calls this function in 5B.10e.1.
  */
+/* Exclusive claim on production ACME work (issuance, renewal) shared by the
+ * renewal scheduler and the manual console endpoints. begin() returns false
+ * if another operation holds it; end() releases it. The transaction below
+ * claims it itself. */
+bool acme_client_production_operation_begin(void);
+void acme_client_production_operation_end(void);
+
 esp_err_t acme_client_run_production_certificate_transaction(
     const char *hostname,
     const acme_production_dns01_hooks_t *dns01_hooks,

@@ -70,6 +70,8 @@ static const char *TAG = "NTS_KE";
  * and how long accept() may block before the loop re-checks. */
 #define NTS_KE_CERT_RELOAD_CHECK_SECONDS     600U
 #define NTS_KE_ACCEPT_WAKE_SECONDS            30
+/* Retry period for a startup step (TLS credential load, TCP bind) that failed. */
+#define NTS_KE_STARTUP_RETRY_SECONDS          60U
 #define NTS_KE_CERT_DIGEST_LEN                32U
 
 #define NTS_KE_CRITICAL_BIT                0x8000U
@@ -1177,26 +1179,35 @@ static void nts_ke_task(void *arg)
     }
     ESP_LOGI(TAG, "AES-SIV self-test passed");
 
+    /* Every startup step below retries rather than ending the task: once it
+     * exits, NTS stays down until the next reboot. A storage fault, a
+     * certificate not yet issued or a bind that fails early in boot must
+     * recover by itself. */
     bool waiting_logged = false;
+    uint32_t keyring_failures = 0U;
     for (;;) {
         err = nts_storage_ensure_cookie_keyring();
         if (err == ESP_OK) break;
-        if (err != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "Cookie keyring unavailable: %s", esp_err_to_name(err));
-            goto exit;
-        }
-        if (!waiting_logged) {
-            ESP_LOGW(TAG, "NTS-KE waiting for GNSS/PPS authoritative time before cookie-key initialization");
-            waiting_logged = true;
+        if (err == ESP_ERR_INVALID_STATE) {
+            if (!waiting_logged) {
+                ESP_LOGW(TAG, "NTS-KE waiting for GNSS/PPS authoritative time before cookie-key initialization");
+                waiting_logged = true;
+            }
+        } else if ((keyring_failures++ % 60U) == 0U) {
+            ESP_LOGE(TAG, "Cookie keyring unavailable: %s; retrying", esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(1000U));
     }
     if (waiting_logged)
         ESP_LOGI(TAG, "GNSS/PPS authoritative time available; continuing NTS-KE startup");
 
-    err = tls_bundle_load(NULL, &tls);
-    if (err != ESP_OK) {
-        goto exit;
+    for (;;) {
+        err = tls_bundle_load(NULL, &tls);
+        if (err == ESP_OK) break;
+        /* tls_bundle_load logs the cause. */
+        ESP_LOGW(TAG, "NTS-KE TLS credential unavailable; retrying in %u s",
+                 (unsigned)NTS_KE_STARTUP_RETRY_SECONDS);
+        vTaskDelay(pdMS_TO_TICKS(NTS_KE_STARTUP_RETRY_SECONDS * 1000U));
     }
 
     portENTER_CRITICAL(&s_tls_lock);
@@ -1217,12 +1228,15 @@ static void nts_ke_task(void *arg)
         goto exit;
     }
 
-    int ret = mbedtls_net_bind(
-        &listener, NULL, NTS_KE_PORT, MBEDTLS_NET_PROTO_TCP);
-
-    if (ret != 0) {
-        ESP_LOGE(TAG, "TCP/%s bind failed: -0x%x", NTS_KE_PORT, -ret);
-        goto exit;
+    int ret;
+    for (;;) {
+        ret = mbedtls_net_bind(&listener, NULL, NTS_KE_PORT, MBEDTLS_NET_PROTO_TCP);
+        if (ret == 0) break;
+        ESP_LOGE(TAG, "TCP/%s bind failed: -0x%x; retrying in %u s", NTS_KE_PORT, -ret,
+                 (unsigned)NTS_KE_STARTUP_RETRY_SECONDS);
+        mbedtls_net_free(&listener);
+        mbedtls_net_init(&listener);
+        vTaskDelay(pdMS_TO_TICKS(NTS_KE_STARTUP_RETRY_SECONDS * 1000U));
     }
 
     s_running = true;

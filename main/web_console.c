@@ -36,6 +36,7 @@
 #include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -1609,7 +1610,12 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"uptime_seconds\":%" PRIu64 ","
         "\"boot_time_valid\":%s,"
         "\"boot_time_unix\":%" PRId64 ","
-        "\"reset_reason\":\"%s\""
+        "\"reset_reason\":\"%s\","
+        "\"heap_internal_free\":%u,"
+        "\"heap_internal_min_free\":%u,"
+        "\"heap_internal_largest_block\":%u,"
+        "\"heap_psram_free\":%u,"
+        "\"heap_psram_min_free\":%u"
         "},"
         "\"readiness\":{"
         "\"ntp_ready\":%s,"
@@ -1730,6 +1736,12 @@ static esp_err_t send_status_json(httpd_req_t *request)
         boot_time_valid ? "true" : "false",
         boot_time_unix,
         reset_reason,
+        /* Minimums are since boot: a steady fall over a soak means a leak. */
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
         ntp_ready ? "true" : "false",
         current_time_valid ? "true" : "false",
         unix_now,
@@ -3345,7 +3357,23 @@ static esp_err_t acme_staging_certificate_issue_handler(httpd_req_t *request)
 }
 
 
+static esp_err_t production_certificate_issue_for_hostname_locked(httpd_req_t *request, const char *hostname);
+
+/* Manual issuance and the automatic renewal scheduler both rewrite the
+ * production slot and the DNS-01 TXT record; only one may run at a time. */
 static esp_err_t production_certificate_issue_for_hostname(httpd_req_t *request, const char *hostname)
+{
+    if (!acme_client_production_operation_begin()) {
+        httpd_resp_set_status(request, "409 Conflict");
+        return httpd_resp_send(request, "Another ACME production operation is in progress",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+    const esp_err_t err = production_certificate_issue_for_hostname_locked(request, hostname);
+    acme_client_production_operation_end();
+    return err;
+}
+
+static esp_err_t production_certificate_issue_for_hostname_locked(httpd_req_t *request, const char *hostname)
 {
     device_config_snapshot_t config;
     esp_err_t err = device_config_get_snapshot(&config);

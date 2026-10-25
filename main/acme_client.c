@@ -2506,7 +2506,38 @@ esp_err_t acme_client_finalize_production_order(const acme_order_discovery_t *or
 
 
 
+static uint32_t s_production_operation_busy;
+
+bool acme_client_production_operation_begin(void)
+{
+    return __atomic_exchange_n(&s_production_operation_busy, 1U, __ATOMIC_ACQ_REL) == 0U;
+}
+
+void acme_client_production_operation_end(void)
+{
+    __atomic_store_n(&s_production_operation_busy, 0U, __ATOMIC_RELEASE);
+}
+
+static esp_err_t run_production_certificate_transaction_locked(
+    const char *hostname,
+    const acme_production_dns01_hooks_t *dns01_hooks,
+    acme_production_transaction_status_t *out_status);
+
 esp_err_t acme_client_run_production_certificate_transaction(
+    const char *hostname,
+    const acme_production_dns01_hooks_t *dns01_hooks,
+    acme_production_transaction_status_t *out_status)
+{
+    if (!acme_client_production_operation_begin()) {
+        ESP_LOGW(TAG, "Production certificate transaction skipped: another ACME operation is in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t err = run_production_certificate_transaction_locked(hostname, dns01_hooks, out_status);
+    acme_client_production_operation_end();
+    return err;
+}
+
+static esp_err_t run_production_certificate_transaction_locked(
     const char *hostname,
     const acme_production_dns01_hooks_t *dns01_hooks,
     acme_production_transaction_status_t *out_status)
