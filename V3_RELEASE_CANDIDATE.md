@@ -4,7 +4,7 @@ Version: 3.0.0-rc1
 
 ## V3 scope
 
-- Two-node active/active redundancy monitoring for deployments such as ts1.nicknewman.au and ts2.nicknewman.au.
+- Two-node active/active redundancy monitoring for deployments such as ts1.example.com and ts2.example.com.
 - Redundant peer is configured on Management as an FQDN or IPv4 address; firmware is identical on both nodes.
 - Peer monitoring is measurement-only and has zero timing authority. It cannot discipline, step, slew, qualify, or otherwise modify the local GNSS/PPS-derived clock.
 - Configurable warning and critical clock-difference thresholds (defaults 100 us and 1 ms).

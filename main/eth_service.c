@@ -1411,7 +1411,7 @@ esp_err_t eth_service_init(void)
     /* Advertise the persisted device host label in DHCP Option 12 instead of
      * ESP-IDF's default "espressif" hostname. The configured hostname is a
      * single DNS label (for example "ts2"); the local DHCP/DNS server may
-     * append its domain suffix (for example nicknewman.au). This affects only
+     * append its domain suffix (for example example.com). This affects only
      * management/network identity and has no timing authority. */
     char dhcp_hostname[APP_DEVICE_HOSTNAME_MAX_LENGTH + 1U] = {0};
     ESP_RETURN_ON_ERROR(

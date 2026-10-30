@@ -37,3 +37,7 @@ serial_output.log
 /components/esp_eth/src/mac/backup/
 /components/esp_eth/**/*.diff
 /Phase9B_Backup_*/
+
+# Never commit archives of the working tree: they can capture keys that the
+# patterns above would otherwise exclude.
+*.zip

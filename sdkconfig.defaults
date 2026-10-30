@@ -62,3 +62,25 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 # This is a narrow management/NTS TLS reliability fix; hardware ECC/AES/SHA
 # remain independently configured.
 # CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY is not set
+
+# Production security baseline. These must live here, not only in a local
+# sdkconfig (which is git-ignored), or a fresh clone silently builds an image
+# with an unencrypted flash and NVS. Development mode keeps OTA and
+# encrypted-flash servicing available.
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+CONFIG_SECURE_FLASH_UART_BOOTLOADER_ALLOW_ENC=y
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y
+
+# Ethernet transmit is shared by the lwIP thread and the NTP timestamp path.
+CONFIG_ETH_TRANSMIT_MUTEX=y
+
+# LP core: independent PPS health supervisor.
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=4096
+
+# Let's Encrypt chain validation for ACME and Cloudflare HTTPS.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+CONFIG_MBEDTLS_X509_TRUSTED_CERT_CALLBACK=y
