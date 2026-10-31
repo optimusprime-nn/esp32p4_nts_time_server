@@ -50,7 +50,9 @@ static const char *TAG = "WEB";
 #define APP_WEB_CONSOLE_MAX_HANDLERS            64U
 #define APP_WEB_CONFIG_BODY_MAX                  2048U
 #define APP_WEB_CONSOLE_MAX_OPEN_SOCKETS        4U
-#define APP_ACME_RENEWAL_CHECK_INTERVAL_MS       (6U * 60U * 60U * 1000U)
+/* Kept in seconds: pdMS_TO_TICKS() multiplies in 32 bits and wraps above ~71
+ * minutes, which turned the previous 6 h interval into ~125 s. */
+#define APP_ACME_RENEWAL_CHECK_INTERVAL_SECONDS  (12U * 60U * 60U)
 #define APP_ACME_RENEWAL_INITIAL_DELAY_MS         30000U
 #define APP_ACME_RENEWAL_TASK_STACK_SIZE         12288U
 #define APP_ACME_RENEWAL_TASK_PRIORITY               4U
@@ -1237,6 +1239,9 @@ static void renewal_scheduler_evaluate(void)
              next.execution_preflight_ready);
 }
 
+_Static_assert((uint64_t)APP_ACME_RENEWAL_CHECK_INTERVAL_SECONDS * configTICK_RATE_HZ <= UINT32_MAX,
+               "renewal check interval does not fit in TickType_t");
+
 static void renewal_scheduler_task(void *arg)
 {
     (void)arg;
@@ -1248,7 +1253,7 @@ static void renewal_scheduler_task(void *arg)
         /* Converge an already-issued production credential after management
          * time becomes valid, and retry any persisted handoff intent. */
         tls_activation_converge_existing_production();
-        vTaskDelay(pdMS_TO_TICKS(APP_ACME_RENEWAL_CHECK_INTERVAL_MS));
+        vTaskDelay((TickType_t)APP_ACME_RENEWAL_CHECK_INTERVAL_SECONDS * configTICK_RATE_HZ);
     }
 }
 
@@ -1376,7 +1381,7 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
     }
 
     const int64_t next_check = status.last_evaluation_unix > 0
-                                 ? status.last_evaluation_unix + 21600LL : 0LL;
+                                 ? status.last_evaluation_unix + (int64_t)APP_ACME_RENEWAL_CHECK_INTERVAL_SECONDS : 0LL;
     char response[3072];
     const int length = snprintf(response, sizeof(response),
         "{\"enabled\":true,\"mode\":\"automatic_execution\","
@@ -1414,7 +1419,7 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         "\"tls_handoff_retry_not_before_unix\":%" PRId64 ",\"tls_handoff_target_leaf_sha256\":\"%s\","
         "\"tls_management_ca_unchanged\":true,"
         "\"task_started\":%s,\"evaluated\":%s,\"evaluation_count\":%" PRIu32 ","
-        "\"check_interval_seconds\":21600,\"last_evaluation_unix\":%" PRId64 ","
+        "\"check_interval_seconds\":%u,\"last_evaluation_unix\":%" PRId64 ","
         "\"next_check_unix\":%" PRId64 ",\"state\":\"%s\","
         "\"seconds_remaining\":%" PRId64 ",\"days_remaining\":%" PRId64 ","
         "\"renew_before_days\":30,\"urgent_before_days\":7}\n",
@@ -1462,7 +1467,8 @@ static esp_err_t acme_production_renewal_scheduler_handler(httpd_req_t *request)
         status.tls_handoff_attempt_count, status.tls_handoff_started_unix,
         status.tls_handoff_retry_not_before_unix, status.tls_handoff_target_leaf_sha256,
         status.task_started ? "true" : "false", status.evaluated ? "true" : "false",
-        status.evaluation_count, status.last_evaluation_unix, next_check,
+        status.evaluation_count, (unsigned)APP_ACME_RENEWAL_CHECK_INTERVAL_SECONDS,
+        status.last_evaluation_unix, next_check,
         renewal_scheduler_state_name(status.state), status.seconds_remaining, status.days_remaining);
     if (length < 0 || length >= (int)sizeof(response))
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
