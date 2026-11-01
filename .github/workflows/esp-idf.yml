@@ -1,0 +1,64 @@
+name: ESP-IDF Build
+on:
+  push:
+    branches: [main, 'feature/**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build firmware (ESP-IDF v6.1, esp32p4)
+        run: |
+          docker run --rm \
+            -e IDF_TARGET=esp32p4 \
+            -e IDF_GIT_SAFE_DIR=/project \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            espressif/idf:v6.1 \
+            bash -c "idf.py build size && idf.py merge-bin -o /project/build/merged-firmware.bin"
+      - name: Upload firmware and build configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: nts-time-server-esp32p4-idf-v6.1
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flasher_args.json
+            sdkconfig
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nts-time-server-esp32p4-idf-v6.1
+          path: fw
+      - name: Package firmware
+        run: |
+          name="nts-time-server-esp32p4-${GITHUB_REF_NAME}"
+          cp fw/build/merged-firmware.bin "${name}-merged.bin"
+          (cd fw && zip -r "../${name}.zip" .)
+          sha256sum "${name}.zip" "${name}-merged.bin" > SHA256SUMS.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" nts-time-server-esp32p4-* SHA256SUMS.txt --clobber
