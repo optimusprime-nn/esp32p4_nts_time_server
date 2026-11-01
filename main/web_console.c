@@ -3877,8 +3877,34 @@ static void delayed_reboot_task(void *arg)
     esp_restart();
 }
 
+/* True when a reboot now would cut off an OTA upload, a production certificate
+ * operation or a TLS hand-over; answers 409 and sets *out_result. A request
+ * that passes can still race work starting a moment later, which is why the
+ * ACME and TLS paths also recover from an interrupted run at boot. */
+static bool reboot_refused_busy(httpd_req_t *request, esp_err_t *out_result)
+{
+    const char *reason = NULL;
+    ota_manager_status_t ota;
+    if (ota_manager_get_status(&ota) == ESP_OK && ota.update_in_progress) {
+        reason = "An OTA update is in progress";
+    } else if (!acme_client_production_operation_begin()) {
+        reason = "A production certificate operation is in progress";
+    } else {
+        acme_client_production_operation_end();
+        if (s_tls_transition_pending) reason = "A TLS hand-over is in progress";
+    }
+    if (reason == NULL) return false;
+    httpd_resp_set_status(request, "409 Conflict");
+    set_security_headers(request);
+    *out_result = httpd_resp_send(request, reason, HTTPD_RESP_USE_STRLEN);
+    return true;
+}
+
 static esp_err_t system_reboot_handler(httpd_req_t *request)
 {
+    esp_err_t busy_result = ESP_OK;
+    if (reboot_refused_busy(request, &busy_result)) return busy_result;
+
     if (xTaskCreate(delayed_reboot_task, "web_reboot", 2048U,
                     NULL, 5U, NULL) != pdPASS) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -5453,6 +5479,8 @@ static esp_err_t ota_rollback_handler(httpd_req_t *request)
         httpd_resp_set_status(request, "412 Precondition Failed");
         return httpd_resp_send(request, "explicit ROLLBACK confirmation required", HTTPD_RESP_USE_STRLEN);
     }
+    esp_err_t busy_result = ESP_OK;
+    if (reboot_refused_busy(request, &busy_result)) return busy_result;
     char version[33];
     if (ota_manager_get_rollback_target(NULL, 0, version, sizeof(version)) != ESP_OK) {
         httpd_resp_set_status(request, "409 Conflict");
