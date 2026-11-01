@@ -6,14 +6,15 @@ MAC's hardware timestamps keep the served time accurate at the wire. It serves
 plain NTP and authenticated NTS, obtains its own Let's Encrypt certificate, and
 is managed over mutual-TLS HTTPS.
 
-**Current release: 3.1.8.** This is the final planned release of this line;
+**Current release: 3.1.10.** This is the final planned release of this line;
 further changes are bug fixes only.
 
 **To set up a board, follow [docs/PROVISIONING.md](docs/PROVISIONING.md).**
 
 ## Measured performance
 
-From a 91-hour soak of two boards on 3.1.8, with no reboots:
+From a 91-hour soak of two boards on 3.1.8, with no reboots. 3.1.9 and 3.1.10
+add a certificate-check fix and a reboot guard, and do not touch timing code:
 
 | Measure | Result |
 |---|---|
