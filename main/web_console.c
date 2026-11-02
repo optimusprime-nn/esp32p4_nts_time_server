@@ -888,6 +888,7 @@ static void tls_activation_converge_existing_production(void)
      * persist an activation intent and hand HTTPS over to the production
      * credential without requesting a new certificate. */
     if (s_tls_source != WEB_TLS_EMBEDDED || s_tls_transition_pending) return;
+    if (!management_ownership_is_provisioned()) return;  /* enrollment stays on the bootstrap certificate */
 
     acme_tls_activation_intent_record_t pending;
     if (acme_client_load_tls_activation_intent(&pending) == ESP_OK &&
@@ -5838,6 +5839,10 @@ static void tls_transition_task(void *arg)
 static esp_err_t web_console_start_https(void)
 {
     if (s_started) return ESP_OK;
+    /* Enrollment always uses this board's bootstrap certificate, whose
+     * fingerprint is on the serial console for the setup tool to pin, even if
+     * a production certificate survives from an earlier claim. */
+    if (!management_ownership_is_provisioned()) return start_https_server(WEB_TLS_EMBEDDED);
     if (management_ownership_is_provisioned() && s_management_client_ca == NULL) {
         esp_err_t ca_err = management_ownership_load_ca(&s_management_client_ca, &s_management_client_ca_length);
         if (ca_err != ESP_OK) {
