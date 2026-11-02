@@ -467,7 +467,9 @@ class Board:
             "gateway": gateway, "dns": dns})
 
     def set_cloudflare(self, api_token: str, zone_name: str, zone_id: str = "") -> None:
-        """The board checks the token and zone with Cloudflare before saving."""
+        """With no zone_id, the board looks the zone up itself, which checks the
+        token from the board's own network before saving. A supplied zone_id is
+        stored without that check, so the setup flow leaves it out."""
         self.json("PUT", "/api/v1/config/cloudflare",
                   {"api_token": api_token, "zone_name": zone_name, "zone_id": zone_id}, timeout=60)
 
@@ -484,6 +486,10 @@ class Board:
         log("Requesting the certificate. This usually takes 1 to 3 minutes...")
         try:
             self.json("POST", "/api/v1/acme/production/certificate/issue", {"hostname": fqdn}, timeout=600)
+        except SetupError as exc:
+            if "already exists" not in str(exc):
+                raise
+            log("The board already has a certificate; checking it...")
         except (OSError, ssl.SSLError, http.client.HTTPException):
             log("The connection closed during issuance; checking the result...")
 

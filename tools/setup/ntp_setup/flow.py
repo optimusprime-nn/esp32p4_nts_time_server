@@ -133,13 +133,28 @@ class Session:
         if create_dns:
             core.cloudflare_set_a_record(token, zone_id, rec.fqdn, board.host, self.log)
         self.log("Saving the token on the board (it checks it with Cloudflare first)...")
-        board.set_cloudflare(token, zone_name, zone_id)
+        # No zone_id: the board then resolves the zone itself, which proves the
+        # token works from the board's network, not just from this computer.
+        board.set_cloudflare(token, zone_name)
         self.log("Cloudflare is set up on the board.")
 
     # 8 ---------------------------------------------------------------------
     def certificate(self) -> dict:
         board = self._board()
         rec = self._rec()
+        try:
+            existing = board.certificate_status()
+        except SetupError:
+            existing = {}
+        if (existing.get("certificate_parse_valid") and existing.get("hostname_matches_certificate")
+                and existing.get("hostname") == rec.fqdn):
+            # Re-running setup on a finished board: keep its certificate.
+            self.log(f"The board already has a certificate for {rec.fqdn}; keeping it.")
+            info = core.wait_for_certificate(board, rec.fqdn, log=self.log)
+            self.board = Board(board.host, credentials=self._creds(), tls_name=rec.fqdn)
+            rec.certificate = True
+            rec.save(self._creds().folder)
+            return info
         try:
             board.sync_management_time()
             self.log("Board clock set for certificate checks.")

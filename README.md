@@ -6,10 +6,17 @@ MAC's hardware timestamps keep the served time accurate at the wire. It serves
 plain NTP and authenticated NTS, obtains its own Let's Encrypt certificate, and
 is managed over mutual-TLS HTTPS.
 
-**Current release: 3.1.10.** This is the final planned release of this line;
+**Current release: 3.1.11.** This is the final planned release of this line;
 further changes are bug fixes only.
 
-**To set up a board, follow [docs/PROVISIONING.md](docs/PROVISIONING.md).**
+**Documentation: <https://optimusprime-nn.github.io/esp32p4_nts_time_server/>**
+
+**To set up a board,** download the release zip from the
+[Releases page](https://github.com/optimusprime-nn/esp32p4_nts_time_server/releases)
+and run the setup tool in it: `setup.cmd` on Windows, `./setup.sh` on Linux. It
+flashes a new board, claims it, sets its name, address and DNS, and gets its
+Let's Encrypt certificate, in a window or as guided questions in a terminal
+(`--cli`). See [Quick setup](https://optimusprime-nn.github.io/esp32p4_nts_time_server/setup-tool/).
 
 ## Measured performance
 
@@ -110,19 +117,22 @@ server ts2.example.com iburst nts
 
 ## Building
 
-Requires ESP-IDF v6.1 (commit `fff9895c`) and OpenSSL on Windows PowerShell.
+Requires ESP-IDF v6.1 (commit `fff9895c`). No certificate files are needed:
+each board creates its own bootstrap certificate at first boot.
 
 ```powershell
-.\tools\generate-bootstrap-cert.ps1
 idf.py build
+python tools/release/make_release.py build dist
 ```
+
+The second command packages the release zip, the OTA image and checksums.
 
 `sdkconfig` is generated from `sdkconfig.defaults`, which is the complete
 production configuration. Do not build production firmware from a modified local
 `sdkconfig`. The app image for OTA is `build\esp32p4_nts_time_server.bin`.
 
 Flashing has different rules before and after a board is encrypted; see
-[docs/PROVISIONING.md](docs/PROVISIONING.md).
+[Building from source](https://optimusprime-nn.github.io/esp32p4_nts_time_server/building/).
 
 ## Repository layout
 
@@ -130,9 +140,11 @@ Flashing has different rules before and after a board is encrypted; see
 |---|---|
 | `main/` | Firmware |
 | `components/esp_eth/` | Project copy of the ESP-IDF Ethernet driver with hardware-timestamp and receive-hang changes. It overrides the ESP-IDF version, so recheck it on any ESP-IDF upgrade |
-| `tools/` | Provisioning, bootstrap certificate and OTA scripts |
+| `tools/setup/` | Setup tool: window and guided command line, Windows and Linux |
+| `tools/release/` | Release packaging |
+| `tools/` | Older PowerShell provisioning and OTA scripts |
 | `test/` | NTS AES-SIV test application |
-| `docs/PROVISIONING.md` | Step-by-step board setup and maintenance |
+| `docs/site/`, `mkdocs.yml` | Documentation site source |
 | `docs/ENGINEERING_HISTORY.md` | Original phase-by-phase design log (historical) |
 
 ## Security notes
@@ -141,8 +153,11 @@ Flashing has different rules before and after a board is encrypted; see
   with physical access to the serial port can still load firmware. Keep boards
   physically secure. Moving to release mode or enabling Secure Boot burns
   permanent eFuses and needs its own plan.
+- **Each board creates its own bootstrap key.** Published firmware holds no
+  private key. The setup tool checks the board's identity against the
+  fingerprint it prints on the serial console before sending anything.
 - **Secrets never belong in this repository.** That covers `management-credentials*/`,
-  `main/*.pem`, `sdkconfig`, configuration backups (which contain the Cloudflare
+  `sdkconfig`, configuration backups (which contain the Cloudflare
   token) and archives of the working tree.
 
 ## Known limitations
