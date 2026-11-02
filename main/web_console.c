@@ -182,6 +182,7 @@ static esp_err_t start_https_server_with_credentials(web_tls_source_t source,
                                                      acme_tls_credentials_t *credentials,
                                                      const char *known_leaf_sha256);
 static bool tls_transition_try_claim(void);
+static void format_dns_list(uint32_t a, uint32_t b, char *out, size_t out_size);
 static void tls_transition_release(void);
 static void tls_transition_task(void *arg);
 static bool hostname_in_zone(const char *hostname, const char *zone);
@@ -2255,12 +2256,16 @@ static esp_err_t send_config_json(httpd_req_t *request)
         const esp_ip4_addr_t net_addr = {.addr = config.static_ipv4_address};
         const esp_ip4_addr_t net_mask = {.addr = config.static_ipv4_netmask};
         const esp_ip4_addr_t net_gw = {.addr = config.static_ipv4_gateway};
-        const esp_ip4_addr_t net_dns = {.addr = config.static_ipv4_dns};
+        char net_dns[40], dns_in_use[40];
+        uint32_t use_main = 0U, use_backup = 0U;
+        format_dns_list(config.static_ipv4_dns, config.static_ipv4_dns2, net_dns, sizeof(net_dns));
+        eth_service_get_dns_in_use(&use_main, &use_backup);
+        format_dns_list(use_main, use_backup, dns_in_use, sizeof(dns_in_use));
         int n = snprintf(response + length, sizeof(response) - (size_t)length, "],\"redundant_server\":{\"enabled\":%s,\"server\":\"%s\",\"warning_ns\":%" PRIu32 ",\"critical_ns\":%" PRIu32 "}},"
-                         "\"network\":{\"static_ipv4_enabled\":%s,\"address\":\"" IPSTR "\",\"netmask\":\"" IPSTR "\",\"gateway\":\"" IPSTR "\",\"dns\":\"" IPSTR "\"}}\n",
+                         "\"network\":{\"static_ipv4_enabled\":%s,\"address\":\"" IPSTR "\",\"netmask\":\"" IPSTR "\",\"gateway\":\"" IPSTR "\",\"dns\":\"%s\",\"dns_in_use\":\"%s\"}}\n",
                          config.ntp_peers[APP_REDUNDANT_PEER_INDEX].enabled ? "true" : "false", config.ntp_peers[APP_REDUNDANT_PEER_INDEX].server, config.redundant_peer_warning_ns, config.redundant_peer_critical_ns,
                          config.static_ipv4_enabled ? "true" : "false",
-                         IP2STR(&net_addr), IP2STR(&net_mask), IP2STR(&net_gw), IP2STR(&net_dns));
+                         IP2STR(&net_addr), IP2STR(&net_mask), IP2STR(&net_gw), net_dns, dns_in_use);
         if (n < 0 || n >= (int)(sizeof(response) - (size_t)length)) length = (int)sizeof(response); else length += n;
     }
     if (length < 0 || length >= (int)sizeof(response)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "configuration serialization failed");
@@ -2498,6 +2503,42 @@ static bool parse_ipv4_text(const char *text, uint32_t *out_addr)
     return true;
 }
 
+/* One or two DNS servers, separated by commas, spaces or semicolons. Empty is
+ * allowed (no static DNS). Names are not accepted: the board needs a DNS
+ * server's address before it can look anything up. */
+static bool parse_dns_list(const char *text, uint32_t *out_main, uint32_t *out_backup)
+{
+    *out_main = 0U;
+    *out_backup = 0U;
+    uint32_t *slots[2] = {out_main, out_backup};
+    size_t count = 0U;
+    const char *p = text;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == ',' || *p == ';') ++p;
+        if (*p == '\0') break;
+        char item[16];
+        size_t n = 0U;
+        while (*p != '\0' && *p != ' ' && *p != ',' && *p != ';') {
+            if (n + 1U >= sizeof(item)) return false;
+            item[n++] = *p++;
+        }
+        item[n] = '\0';
+        if (count >= 2U || !parse_ipv4_text(item, slots[count]) || *slots[count] == 0U) return false;
+        ++count;
+    }
+    return true;
+}
+
+/* Format up to two DNS servers as "a, b" (empty when none). */
+static void format_dns_list(uint32_t a, uint32_t b, char *out, size_t out_size)
+{
+    const esp_ip4_addr_t ea = {.addr = a}, eb = {.addr = b};
+    if (a != 0U && b != 0U) snprintf(out, out_size, IPSTR ", " IPSTR, IP2STR(&ea), IP2STR(&eb));
+    else if (a != 0U) snprintf(out, out_size, IPSTR, IP2STR(&ea));
+    else if (b != 0U) snprintf(out, out_size, IPSTR, IP2STR(&eb));
+    else if (out_size > 0U) out[0] = '\0';
+}
+
 /* Static IPv4 takes effect at the next reboot, so a mistake can be undone
  * from the console before it applies; an invalid stored value boots DHCP. */
 static esp_err_t network_put_handler(httpd_req_t *request)
@@ -2513,8 +2554,8 @@ static esp_err_t network_put_handler(httpd_req_t *request)
     }
     body[received] = '\0';
     bool enabled = false;
-    char addr_text[16] = {0}, mask_text[16] = {0}, gw_text[16] = {0}, dns_text[16] = {0};
-    uint32_t addr = 0U, mask = 0U, gw = 0U, dns = 0U;
+    char addr_text[16] = {0}, mask_text[16] = {0}, gw_text[16] = {0}, dns_text[48] = {0};
+    uint32_t addr = 0U, mask = 0U, gw = 0U, dns = 0U, dns2 = 0U;
     if (!json_get_bool(body, "static_ipv4_enabled", &enabled))
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "static_ipv4_enabled is required");
     if (enabled) {
@@ -2523,12 +2564,15 @@ static esp_err_t network_put_handler(httpd_req_t *request)
             !json_get_string(body, "gateway", gw_text, sizeof(gw_text)) ||
             !json_get_string(body, "dns", dns_text, sizeof(dns_text)) ||
             !parse_ipv4_text(addr_text, &addr) || !parse_ipv4_text(mask_text, &mask) ||
-            !parse_ipv4_text(gw_text, &gw) || !parse_ipv4_text(dns_text, &dns))
-            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "address, netmask, gateway and dns must be IPv4 dotted quads");
+            !parse_ipv4_text(gw_text, &gw))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "address, netmask and gateway must be IPv4 dotted quads");
+        if (!parse_dns_list(dns_text, &dns, &dns2))
+            return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST,
+                                       "dns must be up to two IPv4 addresses separated by a comma (names cannot be used)");
         if (!device_config_static_ipv4_is_valid(addr, mask, gw, dns))
             return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "invalid static IPv4 configuration (address, mask or gateway)");
     }
-    const esp_err_t err = device_config_set_static_ipv4(enabled, addr, mask, gw, dns);
+    const esp_err_t err = device_config_set_static_ipv4(enabled, addr, mask, gw, dns, dns2);
     if (err != ESP_OK) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "network configuration commit failed");
     (void)operations_history_record(OPERATIONS_EVENT_CONFIG_CHANGE, 0, enabled ? "static_ipv4_set" : "dhcp_selected");
     return send_config_json(request);
@@ -3978,7 +4022,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "<main><div id=\"cards\"></div>\n"
         "<section class=\"card backupbar\" id=\"commission-panel\"><h2>Commissioning &amp; Certificate Setup</h2>\n"
         "<div class=\"backupgrid\"><div><label>Device hostname<input id=\"cmhost\" maxlength=\"63\"></label><label>Certificate FQDN<input id=\"cmfqdn\" maxlength=\"253\"></label><label>External NTP 1<input id=\"cmntp0\"></label><label>External NTP 2<input id=\"cmntp1\"></label></div><div><label>Cloudflare zone name<input id=\"cmzone\" maxlength=\"253\" placeholder=\"example.com\"></label><label>Cloudflare Zone ID<input id=\"cmzoneid\" maxlength=\"32\" placeholder=\"32-character Zone ID\"></label><label>Cloudflare API token<input id=\"cmtoken\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Enter only to configure/replace\"></label><p class=\"backupnote\">The token is stored in encrypted NVS and is never returned by the status API.</p><div id=\"cmtime\" class=\"backupstatus\">Management time: loading...</div></div></div>\n"
-        "<div class=\"backupgrid\"><div><label><input id=\"netstatic\" type=\"checkbox\"> Static IPv4 address (takes effect after reboot; DHCP when off)</label><label>Address<input id=\"netaddr\" maxlength=\"15\" placeholder=\"192.168.2.55\"></label><label>Netmask<input id=\"netmask\" maxlength=\"15\" placeholder=\"255.255.255.0\"></label></div><div><label>Gateway<input id=\"netgw\" maxlength=\"15\" placeholder=\"192.168.2.254\"></label><label>DNS server<input id=\"netdns\" maxlength=\"15\" placeholder=\"optional\"></label><button onclick=\"saveNetwork()\">Save Network</button><div id=\"netmsg\" class=\"backupstatus\"></div></div></div>\n"
+        "<div class=\"backupgrid\"><div><label><input id=\"netstatic\" type=\"checkbox\"> Static IPv4 address (takes effect after reboot; DHCP when off)</label><label>Address<input id=\"netaddr\" maxlength=\"15\" placeholder=\"192.168.2.55\"></label><label>Netmask<input id=\"netmask\" maxlength=\"15\" placeholder=\"255.255.255.0\"></label></div><div><label>Gateway<input id=\"netgw\" maxlength=\"15\" placeholder=\"192.168.2.254\"></label><label>DNS servers<input id=\"netdns\" maxlength=\"40\" placeholder=\"optional, up to two: 192.168.1.1, 1.1.1.1\"></label><div id=\"netdnsuse\" class=\"backupstatus\"></div><button onclick=\"saveNetwork()\">Save Network</button><div id=\"netmsg\" class=\"backupstatus\"></div></div></div>\n"
         "<div class=\"actions\"><button onclick=\"saveCommissioning()\">Save Identity &amp; External NTP</button><button onclick=\"syncManagementTime()\">Sync Management Time</button><button onclick=\"saveCloudflare()\">Save/Test Cloudflare</button><button onclick=\"requestCertificate()\">Request Certificate</button></div><div id=\"cmmsg\" class=\"backupstatus\"></div>\n"
         "<p class=\"backupnote\">GNSS/GPS is the master civil-time source. If it is unavailable, the dedicated Redundant Time Server is tried first, then External NTP 1 and External NTP 2, for management TLS/ACME wall time only. It never disciplines the Phase 8 clock and cannot make NTP/NTS timing ready or change stratum/LI.</p></section>\n"
         "<section class=\"card backupbar\" id=\"backup-panel\"><h2>Configuration Backup &amp; Restore</h2>\n"
@@ -4018,8 +4062,8 @@ static esp_err_t management_handler(httpd_req_t *request)
         "function renew(){if(confirm('Request production certificate renewal now? The existing 30-day renewal policy is still enforced.'))action('/api/v1/acme/production/certificate/renew','renewbtn');}\n"
         "function reboot(){if(confirm('Reboot the NTP server now? NTP and management HTTPS will be temporarily unavailable.'))action('/api/v1/system/reboot','rebootbtn');}\n"
         "let selectedBackupText='';\n"
-        "async function loadCommissioning(){try{const [c,d]=await Promise.all([getJson('/api/v1/commissioning'),getJson('/api/v1/config')]);document.getElementById('cmhost').value=d.hostname||'';document.getElementById('cmfqdn').value=c.certificate_fqdn||'';for(let i=0;i<2;i++)document.getElementById('cmntp'+i).value=c.ntp_servers[i]||'';document.getElementById('cmzone').value=d.cloudflare_zone_name||'';document.getElementById('cmzoneid').value=d.cloudflare_zone_id||'';if(d.network){const n=d.network,z=v=>v&&v!=='0.0.0.0'?v:'';document.getElementById('netstatic').checked=!!n.static_ipv4_enabled;document.getElementById('netaddr').value=z(n.address);document.getElementById('netmask').value=z(n.netmask);document.getElementById('netgw').value=z(n.gateway);document.getElementById('netdns').value=z(n.dns);}document.getElementById('cmtime').textContent='Management time: '+(c.management_time_valid?'VALID via '+c.management_time_source+' / '+c.management_time_server:'NOT VALID');}catch(e){document.getElementById('cmmsg').textContent='Commissioning status error: '+e.message;}}\n"
-        "async function saveNetwork(){const m=document.getElementById('netmsg'),en=document.getElementById('netstatic').checked;const body={static_ipv4_enabled:en,address:document.getElementById('netaddr').value.trim(),netmask:document.getElementById('netmask').value.trim(),gateway:document.getElementById('netgw').value.trim(),dns:document.getElementById('netdns').value.trim()};if(en&&!confirm('Save static IPv4 '+body.address+'? It applies at the next reboot; a wrong address makes the console unreachable until it is changed back over the network or serial.'))return;try{const r=await fetch('/api/v1/config/network',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const t=await r.text();if(!r.ok)throw new Error(t);m.textContent=en?'Static IPv4 saved; reboot to apply.':'DHCP selected; reboot to apply.';}catch(e){m.textContent='Save refused: '+e.message;}}\n"
+        "async function loadCommissioning(){try{const [c,d]=await Promise.all([getJson('/api/v1/commissioning'),getJson('/api/v1/config')]);document.getElementById('cmhost').value=d.hostname||'';document.getElementById('cmfqdn').value=c.certificate_fqdn||'';for(let i=0;i<2;i++)document.getElementById('cmntp'+i).value=c.ntp_servers[i]||'';document.getElementById('cmzone').value=d.cloudflare_zone_name||'';document.getElementById('cmzoneid').value=d.cloudflare_zone_id||'';if(d.network){const n=d.network,z=v=>v&&v!=='0.0.0.0'?v:'';document.getElementById('netstatic').checked=!!n.static_ipv4_enabled;document.getElementById('netaddr').value=z(n.address);document.getElementById('netmask').value=z(n.netmask);document.getElementById('netgw').value=z(n.gateway);document.getElementById('netdns').value=n.dns||'';document.getElementById('netdnsuse').textContent='In use now: '+(n.dns_in_use||'none')+(n.static_ipv4_enabled?'':' (from DHCP; these fields apply only with a static address)');}document.getElementById('cmtime').textContent='Management time: '+(c.management_time_valid?'VALID via '+c.management_time_source+' / '+c.management_time_server:'NOT VALID');}catch(e){document.getElementById('cmmsg').textContent='Commissioning status error: '+e.message;}}\n"
+        "async function saveNetwork(){const m=document.getElementById('netmsg'),en=document.getElementById('netstatic').checked;const body={static_ipv4_enabled:en,address:document.getElementById('netaddr').value.trim(),netmask:document.getElementById('netmask').value.trim(),gateway:document.getElementById('netgw').value.trim(),dns:document.getElementById('netdns').value.trim()};if(en&&!confirm('Save static IPv4 '+body.address+'? It applies at the next reboot; a wrong address makes the console unreachable until it is changed back over the network or serial.'))return;try{const r=await fetch('/api/v1/config/network',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const t=await r.text();if(!r.ok)throw new Error(t);m.textContent=en?'Static IPv4 saved; reboot to apply.':'DHCP selected; reboot to apply.';await loadCommissioning();}catch(e){m.textContent='Save refused: '+e.message;}}\n"
         "async function saveCommissioning(){const m=document.getElementById('cmmsg');try{const h=document.getElementById('cmhost').value.trim(),body={certificate_fqdn:document.getElementById('cmfqdn').value.trim(),ntp0:document.getElementById('cmntp0').value.trim(),ntp1:document.getElementById('cmntp1').value.trim()};let r=await fetch('/api/v1/config/hostname',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({hostname:h})});if(!r.ok)throw new Error('hostname: '+await r.text());r=await fetch('/api/v1/commissioning',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());m.textContent='Identity and External NTP fallback configuration saved.';await loadCommissioning();}catch(e){m.textContent='Save refused: '+e.message;}}\n"
         "async function syncManagementTime(){const m=document.getElementById('cmmsg');m.textContent='Synchronizing management wall time...';try{const r=await fetch('/api/v1/commissioning/time/sync',{method:'POST'});const t=await r.text();if(!r.ok)throw new Error(t);m.textContent='Management wall time synchronized. Timing authority remains GNSS/PPS only.';await loadCommissioning();}catch(e){m.textContent='Management time synchronization failed: '+e.message;}}\n"
         "async function saveCloudflare(){const m=document.getElementById('cmmsg'),token=document.getElementById('cmtoken').value,zone=document.getElementById('cmzone').value.trim(),zoneid=document.getElementById('cmzoneid').value.trim();if(!token){m.textContent='Enter a Cloudflare API token to configure or replace it.';return;}if(!zone){m.textContent='Enter the Cloudflare zone name (for example example.com).';return;}if(zoneid&&!/^[0-9a-fA-F]{32}$/.test(zoneid)){m.textContent='Cloudflare Zone ID must be exactly 32 hexadecimal characters.';return;}try{const r=await fetch('/api/v1/config/cloudflare',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token:token,zone_name:zone,zone_id:zoneid})});const t=await r.text();document.getElementById('cmtoken').value='';if(!r.ok)throw new Error(t);m.textContent='Cloudflare credentials verified and stored.';await loadCommissioning();}catch(e){m.textContent='Cloudflare setup failed: '+e.message;}}\n"
@@ -4393,11 +4437,12 @@ static esp_err_t config_backup_get_handler(httpd_req_t *request)
         const esp_ip4_addr_t b_mask = {.addr = sc->backup.config.static_ipv4_netmask};
         const esp_ip4_addr_t b_gw = {.addr = sc->backup.config.static_ipv4_gateway};
         const esp_ip4_addr_t b_dns = {.addr = sc->backup.config.static_ipv4_dns};
+        const esp_ip4_addr_t b_dns2 = {.addr = sc->backup.config.static_ipv4_dns2};
         const int n = snprintf(response + length, 8192U - (size_t)length,
             ",\"static_ipv4_enabled\":%s,\"static_ipv4_address\":\"" IPSTR "\",\"static_ipv4_netmask\":\"" IPSTR "\""
-            ",\"static_ipv4_gateway\":\"" IPSTR "\",\"static_ipv4_dns\":\"" IPSTR "\"",
+            ",\"static_ipv4_gateway\":\"" IPSTR "\",\"static_ipv4_dns\":\"" IPSTR "\",\"static_ipv4_dns2\":\"" IPSTR "\"",
             sc->backup.config.static_ipv4_enabled ? "true" : "false",
-            IP2STR(&b_addr), IP2STR(&b_mask), IP2STR(&b_gw), IP2STR(&b_dns));
+            IP2STR(&b_addr), IP2STR(&b_mask), IP2STR(&b_gw), IP2STR(&b_dns), IP2STR(&b_dns2));
         if (n < 0 || (size_t)n >= 8192U - (size_t)length) length = 8192; else length += n;
     }
     hardware_profile_status_t hw_status;
@@ -4515,6 +4560,10 @@ static esp_err_t config_backup_restore_handler(httpd_req_t *request)
                 parse_ipv4_text(ip_text[1], &backup.config.static_ipv4_netmask) &&
                 parse_ipv4_text(ip_text[2], &backup.config.static_ipv4_gateway) &&
                 parse_ipv4_text(ip_text[3], &backup.config.static_ipv4_dns);
+        char dns2_text[16] = {0};
+        /* Optional: backups from before 3.1.11 have no backup DNS server. */
+        if (valid && json_get_string(body, "static_ipv4_dns2", dns2_text, sizeof(dns2_text)))
+            valid = parse_ipv4_text(dns2_text, &backup.config.static_ipv4_dns2);
     }
     hardware_profile_config_t hw;
     memset(&hw, 0, sizeof(hw));

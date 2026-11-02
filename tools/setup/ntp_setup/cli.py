@@ -145,7 +145,7 @@ def run(firmware_dir: str | None = None) -> int:
             address = ask("Static address", ip, core.valid_ipv4, "Enter an address like 192.168.1.10.")
             netmask = ask("Netmask", mask, core.valid_ipv4, "Enter a mask like 255.255.255.0.")
             gateway = ask("Gateway", gw, core.valid_ipv4, "Enter an address like 192.168.1.1.")
-            dns = ask_optional("DNS server", gw)
+            dns = ask_optional("DNS servers, up to two separated by a comma (addresses, not names)", gw)
             say("If these are wrong, the board will be unreachable until it is reflashed or the")
             say("setting is changed from a computer that can still reach it.")
             if yes(f"Apply {address} / {netmask} via {gateway} and restart the board?", default=True):
@@ -184,8 +184,13 @@ def run(firmware_dir: str | None = None) -> int:
         say()
         for line in s.finish(do_import):
             say("  " + line)
-        if os.name != "nt":
-            say(f"  To use the console in a browser, import {s.credentials.p12} into its certificate settings.")
+        say()
+        say(f"{BOLD}Open the console in your browser{RESET}")
+        for title, steps in s.browser_steps(do_import):
+            say()
+            say(f"  {title}:")
+            for i, step in enumerate(steps, 1):
+                say(f"    {i}. {step}")
         say()
         say("Done. The board is serving time once its clock shows SYNCHRONIZED in the console.")
         return 0

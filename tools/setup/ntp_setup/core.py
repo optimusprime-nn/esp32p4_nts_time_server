@@ -595,6 +595,11 @@ def valid_ipv4(text: str) -> bool:
         return False
 
 
+def split_dns(text: str) -> list[str]:
+    """'192.168.1.1, 1.1.1.1' -> ['192.168.1.1', '1.1.1.1'] (commas, spaces or semicolons)."""
+    return [p for p in re.split(r"[\s,;]+", text.strip()) if p]
+
+
 def valid_hostname(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", text))
 

@@ -55,6 +55,7 @@ typedef struct {
     uint32_t static_ipv4_netmask;
     uint32_t static_ipv4_gateway;
     uint32_t static_ipv4_dns;
+    uint32_t static_ipv4_dns2;   /* backup DNS server; 0 = none */
 } device_config_snapshot_t;
 
 
@@ -92,12 +93,13 @@ bool device_config_static_ipv4_is_valid(uint32_t address,
                                         uint32_t netmask,
                                         uint32_t gateway,
                                         uint32_t dns);
-/* Takes effect at the next boot. */
+/* Takes effect at the next boot. dns2 is an optional backup server. */
 esp_err_t device_config_set_static_ipv4(bool enabled,
                                         uint32_t address,
                                         uint32_t netmask,
                                         uint32_t gateway,
-                                        uint32_t dns);
+                                        uint32_t dns,
+                                        uint32_t dns2);
 esp_err_t device_config_set_ntp_peer_monitor(bool enabled,
                                              uint32_t poll_interval_seconds,
                                              uint32_t response_timeout_ms,

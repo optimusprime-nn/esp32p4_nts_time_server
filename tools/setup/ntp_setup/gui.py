@@ -277,7 +277,7 @@ class App(tk.Tk):
         self.addr_var = self.field("Address", board.host)
         self.mask_var = self.field("Netmask", "")
         self.gw_var = self.field("Gateway", "")
-        self.dns_var = self.field("DNS server (optional)", "")
+        self.dns_var = self.field("DNS servers (optional, up to 2)", "")
         def fill(result):
             ip, mask, gw = result
             self.addr_var.set(ip); self.mask_var.set(mask); self.gw_var.set(gw); self.dns_var.set(gw)
@@ -361,13 +361,22 @@ class App(tk.Tk):
 
         def done(notes):
             self._clear()
-            self.title_var.set("Done")
+            self.title_var.set("Done: open the console in your browser")
+            box = tk.Text(self.body, wrap="word", height=18, font=("Segoe UI", 10), relief="flat",
+                          background=self.cget("background"))
+            sb = ttk.Scrollbar(self.body, command=box.yview)
+            box.configure(yscrollcommand=sb.set)
+            box.tag_configure("h", font=("Segoe UI", 10, "bold"), spacing1=8)
             for n in notes:
-                self.text(n)
-            if os.name != "nt":
-                self.text(f"To use the console in a browser, import {self.session.credentials.p12} "
-                          "into its certificate settings.")
-            self.text("The board serves time once the console shows the clock as SYNCHRONIZED.")
+                box.insert("end", n + "\n")
+            for title, steps in self.session.browser_steps(imp):
+                box.insert("end", title + "\n", "h")
+                for i, step in enumerate(steps, 1):
+                    box.insert("end", f"  {i}. {step}\n")
+            box.insert("end", "\nThe board serves time once the console shows the clock as SYNCHRONIZED.\n", "h")
+            box.configure(state="disabled")
+            box.pack(side="left", fill="both", expand=True, padx=10)
+            sb.pack(side="right", fill="y")
             self.next_btn.configure(text="Close", command=self.destroy)
         self.work(lambda: self.session.finish(imp), done)
 

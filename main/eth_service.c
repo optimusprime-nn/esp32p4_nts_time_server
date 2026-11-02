@@ -1452,6 +1452,12 @@ esp_err_t eth_service_init(void)
             dns.ip.u_addr.ip4.addr = net_cfg.static_ipv4_dns;
             ip_err = esp_netif_set_dns_info(s_eth_netif, ESP_NETIF_DNS_MAIN, &dns);
         }
+        if (ip_err == ESP_OK && net_cfg.static_ipv4_dns2 != 0U) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = net_cfg.static_ipv4_dns2;
+            ip_err = esp_netif_set_dns_info(s_eth_netif, ESP_NETIF_DNS_BACKUP, &dns);
+        }
 
         if (ip_err == ESP_OK) {
             static_ipv4_applied = true;
@@ -1864,6 +1870,19 @@ int32_t eth_service_get_nts_tx_bias_ns(void)
 #else
     return 0;
 #endif
+}
+
+void eth_service_get_dns_in_use(uint32_t *out_main, uint32_t *out_backup)
+{
+    *out_main = 0U;
+    *out_backup = 0U;
+    if (s_eth_netif == NULL) return;
+    esp_netif_dns_info_t dns = {0};
+    if (esp_netif_get_dns_info(s_eth_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4) *out_main = dns.ip.u_addr.ip4.addr;
+    memset(&dns, 0, sizeof(dns));
+    if (esp_netif_get_dns_info(s_eth_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4) *out_backup = dns.ip.u_addr.ip4.addr;
 }
 
 bool eth_service_get_status(eth_service_status_t *out_status)

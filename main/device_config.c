@@ -39,6 +39,7 @@ static const char *TAG = "DEVICE_CFG";
 #define KEY_IP_MASK         "ip_mask"
 #define KEY_IP_GW           "ip_gw"
 #define KEY_IP_DNS          "ip_dns"
+#define KEY_IP_DNS2         "ip_dns2"
 
 typedef struct {
     device_config_snapshot_t public_config;
@@ -229,6 +230,7 @@ static esp_err_t persist_config(const stored_config_t *config)
     if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_MASK, config->public_config.static_ipv4_netmask);
     if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_GW, config->public_config.static_ipv4_gateway);
     if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_DNS, config->public_config.static_ipv4_dns);
+    if (err == ESP_OK) err = nvs_set_u32(handle, KEY_IP_DNS2, config->public_config.static_ipv4_dns2);
 
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
@@ -365,12 +367,13 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
             }
         }
         uint8_t ip_static = 0U;
-        uint32_t ip_addr = 0U, ip_mask = 0U, ip_gw = 0U, ip_dns = 0U;
+        uint32_t ip_addr = 0U, ip_mask = 0U, ip_gw = 0U, ip_dns = 0U, ip_dns2 = 0U;
         (void)nvs_get_u8(handle, KEY_IP_STATIC, &ip_static);
         (void)nvs_get_u32(handle, KEY_IP_ADDR, &ip_addr);
         (void)nvs_get_u32(handle, KEY_IP_MASK, &ip_mask);
         (void)nvs_get_u32(handle, KEY_IP_GW, &ip_gw);
         (void)nvs_get_u32(handle, KEY_IP_DNS, &ip_dns);
+        (void)nvs_get_u32(handle, KEY_IP_DNS2, &ip_dns2);
         /* A stored but invalid static configuration falls back to DHCP so a
          * bad value can never leave the device unreachable. */
         if (ip_static != 0U &&
@@ -383,6 +386,7 @@ static esp_err_t load_config(stored_config_t *config, bool *out_needs_default)
         config->public_config.static_ipv4_netmask = ip_mask;
         config->public_config.static_ipv4_gateway = ip_gw;
         config->public_config.static_ipv4_dns = ip_dns;
+        config->public_config.static_ipv4_dns2 = ip_dns2;
         nvs_close(handle);
     }
     config->public_config.ntp_peer_monitor_enabled = peer_enabled != 0U;
@@ -608,7 +612,8 @@ esp_err_t device_config_set_static_ipv4(bool enabled,
                                         uint32_t address,
                                         uint32_t netmask,
                                         uint32_t gateway,
-                                        uint32_t dns)
+                                        uint32_t dns,
+                                        uint32_t dns2)
 {
     if (!s_initialized || s_lock == NULL) return ESP_ERR_INVALID_STATE;
     if (enabled && !device_config_static_ipv4_is_valid(address, netmask, gateway, dns))
@@ -622,6 +627,7 @@ esp_err_t device_config_set_static_ipv4(bool enabled,
         candidate.public_config.static_ipv4_netmask = netmask;
         candidate.public_config.static_ipv4_gateway = gateway;
         candidate.public_config.static_ipv4_dns = dns;
+        candidate.public_config.static_ipv4_dns2 = dns2;
     }
     candidate.public_config.generation = next_generation(candidate.public_config.generation);
     esp_err_t err = persist_config(&candidate);

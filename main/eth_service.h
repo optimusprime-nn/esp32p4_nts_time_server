@@ -83,6 +83,9 @@ esp_err_t eth_service_start(void);
 void eth_service_wait_for_ip(void);
 
 bool eth_service_get_status(eth_service_status_t *out_status);
+/* DNS servers the interface is using now (from DHCP or static), network
+ * byte order; 0 when none. */
+void eth_service_get_dns_in_use(uint32_t *out_main, uint32_t *out_backup);
 
 void eth_service_diag_log_phy_snapshot(void);
 void eth_service_diag_log_emac_snapshot(void);

@@ -233,5 +233,32 @@ class ProductionFingerprint(unittest.TestCase):
         self.assertTrue(info.complete())
         self.assertEqual(info.fingerprint, "EF" * 32)
 
+class DnsAndFinish(unittest.TestCase):
+    def test_split_dns(self):
+        self.assertEqual(core.split_dns("192.168.1.1, 1.1.1.1"), ["192.168.1.1", "1.1.1.1"])
+        self.assertEqual(core.split_dns(" 1.1.1.1;8.8.8.8 "), ["1.1.1.1", "8.8.8.8"])
+        self.assertEqual(core.split_dns(""), [])
+
+    def test_network_rejects_three_or_names(self):
+        from ntp_setup import flow
+        s = flow.Session(log=lambda m: None)
+        s.board = Board("192.0.2.10")
+        for bad in ("1.1.1.1, 8.8.8.8, 9.9.9.9", "dns.example.com"):
+            with self.assertRaisesRegex(SetupError, "up to two"):
+                s.network(True, "192.0.2.10", "255.255.255.0", "192.0.2.1", bad)
+
+    def test_browser_steps_cover_import(self):
+        from ntp_setup import flow
+        with tempfile.TemporaryDirectory() as d:
+            s = flow.Session(log=lambda m: None)
+            s.new_credentials(d, "correct horse")
+            s.record.fqdn = "ts1.example.com"
+            for imported in (True, False):
+                text = " ".join(" ".join(st) for _, st in s.browser_steps(imported))
+                self.assertIn("https://ts1.example.com/", text)
+                self.assertIn("ntp-admin", text)
+                self.assertIn("Firefox", " ".join(t for t, _ in s.browser_steps(imported)))
+
+
 if __name__ == "__main__":
     unittest.main()

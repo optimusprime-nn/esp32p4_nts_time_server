@@ -18,6 +18,7 @@ order, so the CLI and the window cannot drift apart.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -115,8 +116,11 @@ class Session:
             for name, value in (("address", address), ("netmask", netmask), ("gateway", gateway)):
                 if not core.valid_ipv4(value):
                     raise SetupError(f"The {name} must look like 192.168.1.10.")
-            if dns and not core.valid_ipv4(dns):
-                raise SetupError("The DNS server must look like 192.168.1.1, or be left blank.")
+            servers = core.split_dns(dns)
+            if len(servers) > 2 or not all(core.valid_ipv4(d) for d in servers):
+                raise SetupError("Enter up to two DNS server addresses separated by a comma, for example "
+                                 "192.168.1.1, 1.1.1.1 (names cannot be used), or leave it blank.")
+            dns = ", ".join(servers)
         board.set_network(static, address, netmask, gateway, dns)
         rec = self._rec()
         new_ip = address if static else None
@@ -202,6 +206,42 @@ class Session:
         ]
         rec.save(creds.folder)
         return notes
+
+    def browser_steps(self, imported: bool) -> list[tuple[str, list[str]]]:
+        """How to open the console in a browser with the administrator
+        certificate, as (heading, numbered steps). Shown at the end of setup."""
+        creds = self._creds()
+        url = f"https://{self._rec().fqdn or self._rec().ip}/"
+        open_steps = [
+            f"Open {url}",
+            "When the browser asks you to choose a certificate, pick ntp-admin "
+            "(issued by ESP32-P4 Management CA) and click OK.",
+            "If you get a connection error instead of that question, close every window of the "
+            "browser and open it again: browsers remember a 'no certificate' choice.",
+        ]
+        sections: list[tuple[str, list[str]]] = []
+        if os.name == "nt":
+            if imported:
+                sections.append(("Edge or Chrome (the certificate is already installed)", open_steps))
+            else:
+                sections.append(("Install the certificate for Edge and Chrome", [
+                    f"Double-click {creds.p12} to open the Certificate Import Wizard.",
+                    "Choose Current User, then Next, then Next again.",
+                    "Enter the password you chose in setup. Leave the other options as they are. Next.",
+                    "Choose 'Automatically select the certificate store', then Next and Finish.",
+                ] + open_steps))
+        else:
+            sections.append(("Chrome or Chromium", [
+                "Open Settings > Privacy and security > Security > Manage certificates.",
+                f"Under Your certificates, click Import and choose {creds.p12}.",
+                "Enter the password you chose in setup.",
+            ] + open_steps))
+        sections.append(("Firefox (keeps its own certificates on every system)", [
+            "Open Settings > Privacy & Security, scroll to Certificates and click View Certificates.",
+            f"On Your Certificates, click Import and choose {creds.p12}.",
+            "Enter the password you chose in setup.",
+        ] + open_steps))
+        return sections
 
     # helpers -----------------------------------------------------------------
     def _connect(self, ip: str) -> Board:
