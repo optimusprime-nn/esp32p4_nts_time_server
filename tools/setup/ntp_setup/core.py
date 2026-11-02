@@ -156,20 +156,66 @@ def read_boot(port: str, *, reset: bool = True, timeout: float = 240.0,
 
 FIRMWARE_FILES = ("bootloader.bin", "partition-table.bin", "ota_data_initial.bin",
                   "esp32p4_nts_time_server.bin")
+RE_CHIP_REVISION = re.compile(r"revision v(\d+)\.(\d+)")
 
 
-def find_firmware(directory: Optional[str] = None) -> Path:
-    """Locate the release firmware folder holding flash_args and the images."""
+@dataclass
+class FirmwareVariant:
+    """One firmware build. ESP32-P4 silicon below v3.0 and v3.x need different
+    images; variant.json in each folder records the revisions it supports."""
+    folder: Path
+    name: str = "firmware"
+    min_rev: int = 0
+    max_rev: int = 9999
+    cpu_mhz: int = 0
+
+    def supports(self, rev: int) -> bool:
+        return self.min_rev <= rev <= self.max_rev
+
+    def describe(self) -> str:
+        span = f"v{self.min_rev // 100}.{self.min_rev % 100} to v{self.max_rev // 100}.{self.max_rev % 100}"
+        return f"{self.name} (silicon {span}" + (f", {self.cpu_mhz} MHz)" if self.cpu_mhz else ")")
+
+
+def _is_image_folder(c: Path) -> bool:
+    return (c / "flash_args").is_file() and all((c / f).is_file() for f in FIRMWARE_FILES)
+
+
+def _variant(folder: Path) -> FirmwareVariant:
+    meta = folder / "variant.json"
+    if meta.is_file():
+        d = json.loads(meta.read_text())
+        return FirmwareVariant(folder, d.get("name", folder.name), int(d["min_rev"]),
+                               int(d["max_rev"]), int(d.get("cpu_mhz", 0)))
+    return FirmwareVariant(folder, folder.name)
+
+
+def find_firmware(directory: Optional[str] = None) -> list[FirmwareVariant]:
+    """Locate the release firmware: a folder of per-silicon variants (as
+    released), or a single folder of images (a local build)."""
     candidates = []
     if directory:
         candidates.append(Path(directory))
     here = Path(__file__).resolve().parent
     candidates += [here.parent / "firmware", here.parent.parent / "firmware", Path.cwd() / "firmware"]
     for c in candidates:
-        if (c / "flash_args").is_file() and all((c / f).is_file() for f in FIRMWARE_FILES):
-            return c
+        if _is_image_folder(c):
+            return [_variant(c)]
+        if c.is_dir():
+            found = [_variant(s) for s in sorted(c.iterdir()) if s.is_dir() and _is_image_folder(s)]
+            if found:
+                return found
     raise SetupError("Firmware not found. Point the tool at the release's 'firmware' folder, "
-                     "which contains flash_args and four .bin files.")
+                     "which holds a folder of images for each kind of ESP32-P4 silicon.")
+
+
+def select_firmware(variants: list[FirmwareVariant], revision: int) -> FirmwareVariant:
+    for v in variants:
+        if v.supports(revision):
+            return v
+    have = ", ".join(v.describe() for v in variants)
+    raise SetupError(f"No firmware in this release supports this chip (ESP32-P4 revision "
+                     f"v{revision // 100}.{revision % 100}). Available: {have}.")
 
 
 def _esptool(args: list[str], log: Log) -> str:
@@ -185,33 +231,46 @@ def _esptool(args: list[str], log: Log) -> str:
     return out
 
 
-def flash_encryption_enabled(port: str, log: Log = _quiet) -> bool:
-    out = _esptool(["-p", port, "get-security-info"], log)
+def parse_security_info(out: str) -> tuple[int, bool]:
+    """(chip revision as major*100+minor, flash encryption on) from esptool output."""
+    m = RE_CHIP_REVISION.search(out)
+    if not m:
+        raise SetupError("Could not read the chip's silicon revision, so it was not flashed.")
+    revision = int(m.group(1)) * 100 + int(m.group(2))
     if "Flash Encryption: Enabled" in out:
-        return True
+        return revision, True
     if "Flash Encryption: Disabled" in out:
-        return False
+        return revision, False
     raise SetupError("Could not read the board's flash-encryption state, so it was not flashed.")
 
 
-def flash_new_board(port: str, firmware: Path, log: Log = _quiet) -> None:
-    """Write the release images to a board that has never been encrypted.
+def inspect_chip(port: str, log: Log = _quiet) -> tuple[int, bool]:
+    return parse_security_info(_esptool(["-p", port, "get-security-info"], log))
 
-    The bootloader burns the flash-encryption key on the first boot afterwards.
-    That is permanent, which is why an already-encrypted board is refused:
-    its firmware is updated over the network instead.
+
+def flash_new_board(port: str, variants: list[FirmwareVariant], log: Log = _quiet) -> FirmwareVariant:
+    """Write the right release images to a board that has never been encrypted.
+
+    The chip's silicon revision picks the image (below v3.0 and v3.x need
+    different builds). The bootloader burns the flash-encryption key on the
+    first boot afterwards. That is permanent, which is why an already-encrypted
+    board is refused: its firmware is updated over the network instead.
     """
-    if flash_encryption_enabled(port, log):
+    revision, encrypted = inspect_chip(port, log)
+    variant = select_firmware(variants, revision)
+    log(f"Chip is ESP32-P4 revision v{revision // 100}.{revision % 100}; using {variant.describe()}.")
+    if encrypted:
         raise SetupError("This board is already encrypted, so it must not be flashed this way. "
                          "Update its firmware over the network from its Firmware page instead.")
-    tokens = (firmware / "flash_args").read_text().split()
+    tokens = (variant.folder / "flash_args").read_text().split()
     mapped = []
     for t in tokens:
         name = os.path.basename(t)
-        mapped.append(str(firmware / name) if name.endswith(".bin") else t)
+        mapped.append(str(variant.folder / name) if name.endswith(".bin") else t)
     log("Writing firmware (about a minute)...")
     _esptool(["-p", port, "-b", "460800", "--before", "default-reset", "--after", "hard-reset",
               "write-flash"] + mapped, log)
+    return variant
 
 
 # ---------------------------------------------------------------------------

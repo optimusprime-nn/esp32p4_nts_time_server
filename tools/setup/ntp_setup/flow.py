@@ -40,9 +40,9 @@ class Session:
 
     # 1 ---------------------------------------------------------------------
     def flash(self, firmware_dir: Optional[str]) -> None:
-        firmware = core.find_firmware(firmware_dir)
-        self.log(f"Using firmware in {firmware}")
-        core.flash_new_board(self.port, firmware, self.log)
+        variants = core.find_firmware(firmware_dir)
+        self.log("Firmware available: " + "; ".join(v.describe() for v in variants))
+        core.flash_new_board(self.port, variants, self.log)
         self.log("Firmware written. The board now encrypts its flash on first boot; "
                  "do not unplug it.")
 

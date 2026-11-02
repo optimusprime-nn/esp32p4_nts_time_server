@@ -211,18 +211,39 @@ class PinnedConnections(unittest.TestCase):
 
 
 class Firmware(unittest.TestCase):
-    def test_find_firmware(self):
+    @staticmethod
+    def _images(p, variant=None):
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "flash_args").write_text("--flash-mode dio\n0x2000 bootloader.bin\n")
+        for f in core.FIRMWARE_FILES:
+            (p / f).write_bytes(b"\0")
+        if variant:
+            (p / "variant.json").write_text(json.dumps(variant))
+
+    def test_single_folder(self):
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d)
             with self.assertRaises(SetupError):
                 core.find_firmware(d)
-            (p / "flash_args").write_text("--flash-mode dio\n0x2000 bootloader/bootloader.bin\n")
-            for f in core.FIRMWARE_FILES:
-                (p / f).write_bytes(b"\0")
-            self.assertEqual(core.find_firmware(d), p)
+            self._images(Path(d))
+            self.assertEqual([v.folder for v in core.find_firmware(d)], [Path(d)])
 
+    def test_variant_chosen_by_silicon(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._images(root / "silicon-v1", {"name": "silicon-v1", "min_rev": 100, "max_rev": 199, "cpu_mhz": 360})
+            self._images(root / "silicon-v3", {"name": "silicon-v3", "min_rev": 300, "max_rev": 399, "cpu_mhz": 400})
+            variants = core.find_firmware(d)
+            self.assertEqual(core.select_firmware(variants, 103).name, "silicon-v1")
+            self.assertEqual(core.select_firmware(variants, 301).cpu_mhz, 400)
+            with self.assertRaisesRegex(SetupError, "No firmware"):
+                core.select_firmware(variants, 250)
 
-
+    def test_security_info_parsing(self):
+        out = "Connected to ESP32-P4 on COM7:\nChip type:          ESP32-P4 (revision v3.1)\n...\nFlash Encryption: Disabled\n"
+        self.assertEqual(core.parse_security_info(out), (301, False))
+        self.assertEqual(core.parse_security_info(out.replace("Disabled", "Enabled")), (301, True))
+        with self.assertRaises(SetupError):
+            core.parse_security_info("Flash Encryption: Disabled")
 
 class ProductionFingerprint(unittest.TestCase):
     def test_server_certificate_line_is_pinned_upper_case(self):

@@ -31,7 +31,9 @@ static void defaults(hardware_profile_config_t *c)
     c->gnss_uart_num = APP_GNSS_UART_NUM;
     c->gnss_rx_gpio = APP_GNSS_UART_RX_GPIO;
     c->gnss_tx_gpio = APP_GNSS_UART_TX_GPIO;
-    c->requested_cpu_mhz = 360U;
+    /* The CPU frequency is fixed by the firmware variant (360 MHz for silicon
+     * below v3.0, 400 MHz for v3.x); this field only records it. */
+    c->requested_cpu_mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
 }
 
 static bool name_ok(const char *s, size_t max)
@@ -158,6 +160,9 @@ static void load_optional_profile_fields(nvs_handle_t h, hardware_profile_config
     }
 
     (void)nvs_get_u32(h, "cpu", &c->requested_cpu_mhz);
+    /* Informational: always the firmware variant's real frequency, whatever
+     * an older firmware or a restored backup recorded. */
+    c->requested_cpu_mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
 }
 
 esp_err_t hardware_profile_init(void)

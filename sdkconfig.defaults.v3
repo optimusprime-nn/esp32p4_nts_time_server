@@ -1,0 +1,6 @@
+# ESP32-P4 silicon v3.x (400 MHz). Applied on top of sdkconfig.defaults:
+#   idf.py -B build-v3 -D SDKCONFIG=build-v3/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.v3" build
+# Revisions below 3.0 and 3.0 and above need separate images (ESP-IDF treats them as mutually exclusive).
+# CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is not set
+CONFIG_ESP32P4_REV_MIN_300=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
