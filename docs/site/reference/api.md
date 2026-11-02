@@ -145,8 +145,8 @@ The `PUT` configuration calls answer with the same JSON as `GET /api/v1/config`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/v1/hardware/profile` | Board family and revision, GNSS pins, CPU profile, and the detected wafer, eFuse block and package revisions |
-| PUT | `/api/v1/hardware/profile` | Change the profile. Needs all of `board_family`, `board_revision`, `pps_gpio`, `gnss_uart`, `gnss_rx_gpio`, `gnss_tx_gpio`, `requested_cpu_mhz`. Applies after a reboot. `400` for invalid or conflicting pins |
+| GET | `/api/v1/hardware/profile` | Board family and revision, GNSS pins, CPU frequency (`requested_cpu_mhz` is always the firmware's frequency, and `configured_cpu_mhz`), and the detected wafer, eFuse block and package revisions |
+| PUT | `/api/v1/hardware/profile` | Change the profile. Needs all of `board_family`, `board_revision`, `pps_gpio`, `gnss_uart`, `gnss_rx_gpio`, `gnss_tx_gpio`. `requested_cpu_mhz` is not needed and is ignored if sent. Applies after a reboot. `400` for invalid or conflicting pins |
 
 ## Certificates (Let's Encrypt)
 

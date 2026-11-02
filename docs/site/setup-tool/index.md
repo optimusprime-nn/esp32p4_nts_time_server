@@ -19,7 +19,7 @@ the board on USB and Ethernet, the Cloudflare token, and the names you chose.
 | Step | What happens | Can be skipped? |
 |---|---|---|
 | 1. Connect | You choose the board's serial port | No |
-| 2. Firmware | Writes the firmware over USB, then resets the board and reads its serial console for the enrollment code, the bootstrap certificate fingerprint and the IP address | Writing is skipped for a board that already runs the firmware. Reading always happens |
+| 2. Firmware | Reads the chip's silicon revision and writes the matching firmware variant over USB (a chip no variant supports is refused), then resets the board and reads its serial console for the enrollment code, the bootstrap certificate fingerprint and the IP address | Writing is skipped for a board that already runs the firmware. Reading always happens. For v3.x silicon the tool first says that variant has not yet run on v3.x hardware and asks you to confirm; answering no writes nothing |
 | 3. Certificate | Creates your management certificate authority and administrator certificate in a folder on this computer, protected by a password you choose. For an already-claimed board, opens the folder from the earlier run instead | No |
 | 4. Claim | Sends the CA certificate to the board with the enrollment code. The board restarts and from then on accepts management only from your certificate | Skipped if the board is already claimed |
 | 5. Name | Sets the hostname, the full DNS name for the certificate and two fallback NTP servers | No |
@@ -131,7 +131,7 @@ finished board is safe.
 | Option | Effect |
 |---|---|
 | `--cli` | Use the questions in the terminal instead of the window |
-| `--firmware <folder>` | Use firmware from another folder. It must hold `flash_args` and the four `.bin` files |
+| `--firmware <folder>` | Use firmware from another folder. It must hold `flash_args` and the four `.bin` files, or one such folder per variant as in the release |
 
 On Linux the tool uses the terminal automatically when there is no desktop
 (`DISPLAY` and `WAYLAND_DISPLAY` unset), and when Tkinter is not installed.

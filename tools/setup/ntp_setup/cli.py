@@ -103,7 +103,11 @@ def run(firmware_dir: str | None = None) -> int:
             say("permanent: afterwards, updates go over the network, not USB.")
             if not yes("Write the firmware now?", default=True):
                 raise SetupError("Stopped before flashing; nothing was changed.")
-            s.flash(firmware_dir)
+            def confirm_preview(reason: str) -> bool:
+                say()
+                say(f"  {reason}")
+                return yes("Write this preview firmware anyway?", default=False)
+            s.flash(firmware_dir, confirm_preview)
         s.read_board(reset=True)
 
         # 3 -- credentials ----------------------------------------------------------

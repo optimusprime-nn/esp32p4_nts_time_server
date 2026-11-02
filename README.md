@@ -79,7 +79,7 @@ zero-change event that previously caused a 5-hour outage.
 
 | Item | Value |
 |---|---|
-| SoC | ESP32-P4, silicon revision below v3 |
+| SoC | ESP32-P4, silicon revision v1.x (360 MHz) or v3.x (400 MHz); one firmware variant for each |
 | Memory | 16 MB flash, 32 MB PSRAM |
 | GNSS | u-blox LEA-M8T with an outdoor or clear-sky antenna |
 | Ethernet | IP101 PHY over RMII |
@@ -120,16 +120,24 @@ server ts2.example.com iburst nts
 Requires ESP-IDF v6.1 (commit `fff9895c`). No certificate files are needed:
 each board creates its own bootstrap certificate at first boot.
 
+ESP-IDF cannot build one image for ESP32-P4 silicon below v3.0 and v3.0 or
+later, so there are two builds:
+
 ```powershell
 idf.py build
-python tools/release/make_release.py build dist
+idf.py -B build-v3 -D SDKCONFIG=build-v3/sdkconfig -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.v3" build
+python tools/release/make_release.py dist build build-v3
 ```
 
-The second command packages the release zip, the OTA image and checksums.
+The first builds `silicon-v1` (revisions v1.0–v1.99, 360 MHz) in `build`, the
+second `silicon-v3` (revisions v3.0–v3.99, 400 MHz) in `build-v3`. The third
+packages the release zip, one OTA image per variant and checksums.
 
 `sdkconfig` is generated from `sdkconfig.defaults`, which is the complete
-production configuration. Do not build production firmware from a modified local
-`sdkconfig`. The app image for OTA is `build\esp32p4_nts_time_server.bin`.
+production configuration; the v3 build adds the overlay
+`sdkconfig.defaults.v3`. Do not build production firmware from a modified local
+`sdkconfig`. The app image for OTA is `esp32p4_nts_time_server.bin` in the
+build folder for the board's silicon.
 
 Flashing has different rules before and after a board is encrypted; see
 [Building from source](https://optimusprime-nn.github.io/esp32p4_nts_time_server/building/).

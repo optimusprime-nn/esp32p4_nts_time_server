@@ -39,10 +39,11 @@ class Session:
     record: Optional[SetupRecord] = None
 
     # 1 ---------------------------------------------------------------------
-    def flash(self, firmware_dir: Optional[str]) -> None:
+    def flash(self, firmware_dir: Optional[str], confirm=None) -> None:
+        """confirm(reason) -> bool is asked before writing preview firmware."""
         variants = core.find_firmware(firmware_dir)
         self.log("Firmware available: " + "; ".join(v.describe() for v in variants))
-        core.flash_new_board(self.port, variants, self.log)
+        core.flash_new_board(self.port, variants, self.log, confirm)
         self.log("Firmware written. The board now encrypts its flash on first boot; "
                  "do not unplug it.")
 

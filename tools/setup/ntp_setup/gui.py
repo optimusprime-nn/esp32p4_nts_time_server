@@ -73,6 +73,19 @@ class App(tk.Tk):
         self.next_btn.pack(side="right")
         ttk.Button(nav, text="Quit", command=self.destroy).pack(side="left")
 
+    def _ask_from_worker(self, reason: str) -> bool:
+        """Ask yes/no on the window's thread from a worker thread, and wait."""
+        answer = {}
+        done = threading.Event()
+
+        def ask():
+            answer["yes"] = messagebox.askyesno(
+                "Preview firmware", reason + "\n\nWrite this preview firmware anyway?", default="no")
+            done.set()
+        self.after(0, ask)
+        done.wait()
+        return answer.get("yes", False)
+
     def _clear(self):
         for w in self.body.winfo_children():
             w.destroy()
@@ -195,7 +208,7 @@ class App(tk.Tk):
             return
         def job():
             if flash:
-                self.session.flash(self.firmware_dir)
+                self.session.flash(self.firmware_dir, self._ask_from_worker)
             return self.session.read_board(reset=True)
         self.work(job, self.advance)
 

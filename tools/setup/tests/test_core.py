@@ -238,6 +238,27 @@ class Firmware(unittest.TestCase):
             with self.assertRaisesRegex(SetupError, "No firmware"):
                 core.select_firmware(variants, 250)
 
+    def test_preview_variant_needs_confirmation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._images(root / "silicon-v3", {"name": "silicon-v3", "min_rev": 300, "max_rev": 399,
+                                               "cpu_mhz": 400, "preview": "not yet tested"})
+            variants = core.find_firmware(d)
+            self.assertEqual(variants[0].preview, "not yet tested")
+            calls = []
+            orig_inspect, orig_tool = core.inspect_chip, core._esptool
+            core.inspect_chip = lambda port, log=None: (301, False)
+            core._esptool = lambda args, log: calls.append(args) or ""
+            try:
+                for confirm in (None, lambda reason: False):
+                    with self.assertRaisesRegex(SetupError, "nothing was written"):
+                        core.flash_new_board("COM0", variants, confirm=confirm)
+                self.assertEqual(calls, [])
+                core.flash_new_board("COM0", variants, confirm=lambda reason: True)
+                self.assertTrue(any("write-flash" in a for a in calls))
+            finally:
+                core.inspect_chip, core._esptool = orig_inspect, orig_tool
+
     def test_security_info_parsing(self):
         out = "Connected to ESP32-P4 on COM7:\nChip type:          ESP32-P4 (revision v3.1)\n...\nFlash Encryption: Disabled\n"
         self.assertEqual(core.parse_security_info(out), (301, False))

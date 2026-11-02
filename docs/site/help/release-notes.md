@@ -20,6 +20,15 @@ The 3.1 line receives bug fixes only.
   connection, sets identity, DHCP or a static address, Cloudflare (optionally
   creating the DNS record) and the Let's Encrypt certificate, with optional GNSS
   pins and Windows certificate import.
+- Two firmware variants, one per ESP32-P4 silicon generation: `silicon-v1`
+  (revisions v1.x, 360 MHz) and `silicon-v3` (revisions v3.x, 400 MHz). ESP-IDF
+  cannot build one image for both. The release zip holds both and the setup
+  tool writes the one matching the chip. There is one OTA image per variant; a
+  wrong one is refused at upload. The v3.x variant is new and has not yet
+  completed a hardware soak.
+- The hardware profile's CPU frequency is now information only, set by the
+  firmware for the silicon. `PUT /api/v1/hardware/profile` no longer needs
+  `requested_cpu_mhz` and ignores it.
 
 ## 3.1.10
 

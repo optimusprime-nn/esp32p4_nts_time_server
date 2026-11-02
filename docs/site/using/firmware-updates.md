@@ -4,9 +4,21 @@ The board has two firmware slots. An update is written to the slot that is not
 running, checked, and only used after a reboot. The previous version stays in
 the other slot.
 
-Use the `esp32p4_nts_time_server-<version>.bin` file from the
-[release](../getting-started/download.md), or `build/esp32p4_nts_time_server.bin`
-if you build from source.
+Use the image for the board's silicon from the
+[release](../getting-started/download.md):
+
+| Board's chip revision | File |
+|---|---|
+| v1.x | `esp32p4_nts_time_server-<version>-silicon-v1.bin` |
+| v3.x | `esp32p4_nts_time_server-<version>-silicon-v3.bin` |
+
+If you build from source, use `esp32p4_nts_time_server.bin` from `build/` (v1.x)
+or `build-v3/` (v3.x).
+
+To find the revision, look at **Hardware Profile & GPIO** on the Management page
+(*Detected silicon: wafer vX.YY*). The serial console and `esptool` also show
+it. A wrong image is refused at upload, before anything is staged, so it cannot
+be installed by mistake.
 
 NTP and NTS stop for about a minute while the board reboots. With
 [two servers](redundancy.md), update one at a time.
@@ -56,7 +68,7 @@ Firmware older than 3.1.4 has no rollback button.
     ```powershell
     .\tools\ota-update.ps1 -HostName ts1.example.com `
         -CertificateThumbprint <thumbprint> `
-        -FirmwareBin .\esp32p4_nts_time_server-3.1.11.bin
+        -FirmwareBin .\esp32p4_nts_time_server-3.1.11-silicon-v1.bin
     ```
 
     It uploads and stages the image and prints the command that activates it.
@@ -69,7 +81,7 @@ Firmware older than 3.1.4 has no rollback button.
     C="--cert admin-client.crt.pem --key admin-client.key.pem --pass $KEYPASS"
 
     curl -sS $C -X POST -H 'Content-Type: application/octet-stream' \
-         --data-binary @esp32p4_nts_time_server-3.1.11.bin $B/api/v1/ota/image
+         --data-binary @esp32p4_nts_time_server-3.1.11-silicon-v1.bin $B/api/v1/ota/image
     curl -sS $C -X POST $B/api/v1/system/reboot
     curl -sS $C $B/api/v1/ota/status
     ```

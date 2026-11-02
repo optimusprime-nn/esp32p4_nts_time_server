@@ -168,6 +168,7 @@ class FirmwareVariant:
     min_rev: int = 0
     max_rev: int = 9999
     cpu_mhz: int = 0
+    preview: str = ""  # set when this variant has not yet been proven on its silicon
 
     def supports(self, rev: int) -> bool:
         return self.min_rev <= rev <= self.max_rev
@@ -186,7 +187,7 @@ def _variant(folder: Path) -> FirmwareVariant:
     if meta.is_file():
         d = json.loads(meta.read_text())
         return FirmwareVariant(folder, d.get("name", folder.name), int(d["min_rev"]),
-                               int(d["max_rev"]), int(d.get("cpu_mhz", 0)))
+                               int(d["max_rev"]), int(d.get("cpu_mhz", 0)), d.get("preview", ""))
     return FirmwareVariant(folder, folder.name)
 
 
@@ -248,13 +249,17 @@ def inspect_chip(port: str, log: Log = _quiet) -> tuple[int, bool]:
     return parse_security_info(_esptool(["-p", port, "get-security-info"], log))
 
 
-def flash_new_board(port: str, variants: list[FirmwareVariant], log: Log = _quiet) -> FirmwareVariant:
+def flash_new_board(port: str, variants: list[FirmwareVariant], log: Log = _quiet,
+                    confirm: Optional[Callable[[str], bool]] = None) -> FirmwareVariant:
     """Write the right release images to a board that has never been encrypted.
 
     The chip's silicon revision picks the image (below v3.0 and v3.x need
     different builds). The bootloader burns the flash-encryption key on the
     first boot afterwards. That is permanent, which is why an already-encrypted
     board is refused: its firmware is updated over the network instead.
+
+    A preview variant is only written after `confirm` (shown the reason)
+    returns True; without a confirm callback it is refused.
     """
     revision, encrypted = inspect_chip(port, log)
     variant = select_firmware(variants, revision)
@@ -262,6 +267,10 @@ def flash_new_board(port: str, variants: list[FirmwareVariant], log: Log = _quie
     if encrypted:
         raise SetupError("This board is already encrypted, so it must not be flashed this way. "
                          "Update its firmware over the network from its Firmware page instead.")
+    if variant.preview:
+        log("Preview firmware: " + variant.preview)
+        if confirm is None or not confirm(variant.preview):
+            raise SetupError("Stopped before flashing the preview firmware; nothing was written.")
     tokens = (variant.folder / "flash_args").read_text().split()
     mapped = []
     for t in tokens:

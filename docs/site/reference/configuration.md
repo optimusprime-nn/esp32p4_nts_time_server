@@ -56,7 +56,7 @@ or a failure applying it, makes the board fall back to DHCP.
 | GNSS RX GPIO (from the receiver's TXD) | 2 |
 | GNSS TX GPIO (to the receiver's RXD) | 3 |
 | Board family, board revision | Text labels |
-| CPU capability profile | 360 MHz. The 400 MHz option records capability only and does not change the clock speed |
+| CPU frequency | Not a setting. The firmware sets it for the silicon: 360 MHz below v3.0, 400 MHz for v3.x |
 
 Changes apply after a reboot. The board refuses conflicting pin choices.
 

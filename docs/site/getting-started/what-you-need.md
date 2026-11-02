@@ -7,7 +7,7 @@ build from source.
 
 | Item | Notes |
 |---|---|
-| ESP32-P4 board | Silicon revision below v3, 16 MB flash, 32 MB PSRAM, IP101 Ethernet PHY. See [Hardware and pins](../reference/hardware.md) |
+| ESP32-P4 board | Silicon revision v1.x or v3.x, 16 MB flash, 32 MB PSRAM, IP101 Ethernet PHY. See [Hardware and pins](../reference/hardware.md) |
 | u-blox LEA-M8T | Wired to the board as in [Hardware and pins](../reference/hardware.md) |
 | GNSS antenna | Outdoor, or with a clear view of the sky |
 | Ethernet connection | With DHCP and internet access |

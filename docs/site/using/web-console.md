@@ -66,7 +66,7 @@ The SD card is for logs only. Timing never depends on it.
 | Redundant Time Server | Set the other board's name and the warning and critical thresholds |
 | Commissioning & Certificate Setup | Hostname, certificate DNS name, two external NTP servers, Cloudflare zone, Zone ID and token, static IPv4. Buttons: **Save Identity & External NTP**, **Sync Management Time**, **Save/Test Cloudflare**, **Request Certificate**, **Save Network** |
 | Configuration Backup & Restore | **Download Backup**, and **Restore Configuration** from a backup file. See [Backup and restore](backup-restore.md) |
-| Hardware Profile & GPIO | Board family and revision, PPS GPIO, GNSS UART and its RX and TX GPIOs, CPU capability profile. Shows the detected silicon revision. **Save Hardware Profile** applies after a reboot |
+| Hardware Profile & GPIO | Board family and revision, PPS GPIO, GNSS UART and its RX and TX GPIOs. Shows the detected silicon revision and the CPU frequency. **Save Hardware Profile** applies after a reboot |
 
 Notes:
 
@@ -77,8 +77,8 @@ Notes:
   board is reflashed. An invalid stored address falls back to DHCP.
 - **Sync Management Time** sets the date used for TLS and certificates when GNSS
   has not locked. It never affects served time.
-- The 400 MHz CPU option records the silicon's capability only. It does not
-  raise the clock speed.
+- The CPU frequency is information only. The firmware sets it for the silicon:
+  360 MHz below v3.0, 400 MHz for v3.x.
 - Wrong GNSS pins stop GNSS working. Change them only for a carrier board wired
   differently from the [standard pins](../reference/hardware.md).
 

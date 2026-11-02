@@ -35,6 +35,10 @@ IMAGES = {  # flash_args entry -> file name in the variant folder
     "esp32p4_nts_time_server.bin": "esp32p4_nts_time_server.bin",
 }
 TOOL_FILES = ["requirements.txt", "setup.cmd", "setup.sh"]
+# Variants not yet proven on hardware. The setup tool shows this and asks
+# for confirmation before flashing one. Remove an entry once that silicon
+# has been tested.
+PREVIEW = {"silicon-v3": "This firmware is for ESP32-P4 silicon v3.x. It is built and checked, but it has not yet run on v3.x hardware, so treat this board as the first test."}
 
 
 def sha256(path: Path) -> str:
@@ -52,8 +56,11 @@ def variant_of(build: Path, version: str) -> dict:
     lo, hi = cfg["ESP32P4_REV_MIN_FULL"], cfg["ESP32P4_REV_MAX_FULL"]
     if not cfg.get("SECURE_FLASH_ENC_ENABLED") or not cfg.get("NVS_ENCRYPTION"):
         sys.exit(f"{build} is not built with flash and NVS encryption; refusing to package it.")
-    return {"name": f"silicon-v{hi // 100}", "min_rev": lo, "max_rev": hi,
-            "cpu_mhz": cfg["ESP_DEFAULT_CPU_FREQ_MHZ"]}
+    name = f"silicon-v{hi // 100}"
+    variant = {"name": name, "min_rev": lo, "max_rev": hi, "cpu_mhz": cfg["ESP_DEFAULT_CPU_FREQ_MHZ"]}
+    if name in PREVIEW:
+        variant["preview"] = PREVIEW[name]
+    return variant
 
 
 def main(out: Path, builds: list[Path]) -> None:
@@ -96,7 +103,8 @@ def main(out: Path, builds: list[Path]) -> None:
              "silicon on its Firmware page (the wrong one is refused):"]
     for ota, v in otas:
         lines.append(f"  {ota.name}  revisions v{v['min_rev'] // 100}.{v['min_rev'] % 100:02d}"
-                     f" to v{v['max_rev'] // 100}.{v['max_rev'] % 100:02d}, {v['cpu_mhz']} MHz")
+                     f" to v{v['max_rev'] // 100}.{v['max_rev'] % 100:02d}, {v['cpu_mhz']} MHz"
+                     + (" (preview: not yet tested on this silicon)" if v.get("preview") else ""))
     lines += ["", "Documentation: https://optimusprime-nn.github.io/esp32p4_nts_time_server/", ""]
     (stage / "README.txt").write_text("\n".join(lines))
 

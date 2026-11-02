@@ -20,24 +20,43 @@ From 3.1.11, no certificate files or OpenSSL are needed to build.
 
 ## Build
 
+ESP-IDF cannot build one image for ESP32-P4 silicon below v3.0 and v3.0 or
+later, so there are two builds. Build the one for your chip, or both for a
+release.
+
+| Variant | Chip revisions | CPU | Configuration |
+|---|---|---|---|
+| `silicon-v1` | v1.0–v1.99 | 360 MHz | `sdkconfig.defaults` |
+| `silicon-v3` | v3.0–v3.99 | 400 MHz | `sdkconfig.defaults` plus `sdkconfig.defaults.v3` |
+
 ```sh
 git clone https://github.com/optimusprime-nn/esp32p4_nts_time_server.git
 cd esp32p4_nts_time_server
-idf.py build
+idf.py build    # silicon-v1, in build/
+idf.py -B build-v3 -D SDKCONFIG=build-v3/sdkconfig -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.v3" build    # silicon-v3, in build-v3/
 ```
 
-`sdkconfig` is generated from `sdkconfig.defaults`, which is the complete
-production configuration, including flash encryption. Do not build production
+Package a release from both builds:
+
+```sh
+python tools/release/make_release.py dist build build-v3
+```
+
+`sdkconfig` is generated from `sdkconfig.defaults` (plus the v3 overlay for the
+v3 build), which is the complete production configuration, including flash
+encryption. Do not build production
 firmware from a modified local `sdkconfig`. If in doubt, delete `sdkconfig` and
 build again.
 
 Check that flash encryption is on before flashing a new board:
 
 ```sh
-grep '^CONFIG_SECURE_FLASH_ENC_ENABLED' sdkconfig     # must print =y
+grep '^CONFIG_SECURE_FLASH_ENC_ENABLED' sdkconfig            # must print =y
+grep '^CONFIG_SECURE_FLASH_ENC_ENABLED' build-v3/sdkconfig   # v3 build
 ```
 
-The app image for network updates is `build/esp32p4_nts_time_server.bin`.
+The app image for network updates is `esp32p4_nts_time_server.bin` in `build/`
+or `build-v3/`.
 
 !!! note "Ethernet driver"
     `components/esp_eth/` is a project copy of the ESP-IDF Ethernet driver with
@@ -54,6 +73,10 @@ The app image for network updates is `build/esp32p4_nts_time_server.bin`.
 ```sh
 idf.py -p COM7 flash monitor
 ```
+
+For a v3.x chip, add the `-B build-v3 -D SDKCONFIG=... -D SDKCONFIG_DEFAULTS=...`
+options from the build command. A mismatched image fails before anything is
+written ("requires chip revision in range"), so nothing is burned.
 
 Use plain `flash` **only** on a board that has never been encrypted. Then claim
 and commission it as in [Manual setup](getting-started/manual-setup.md), or run
