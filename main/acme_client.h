@@ -135,6 +135,13 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
 esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials);
 void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
 
+/* This board's own bootstrap TLS identity (see acme_client.c), created on the
+ * board at first boot and kept in encrypted storage. Used for HTTPS until a
+ * production certificate exists. Free with acme_client_free_tls_credentials(). */
+esp_err_t acme_client_load_bootstrap_tls_credentials(acme_tls_credentials_t *out_credentials);
+/* Upper-case hex SHA-256 of the bootstrap certificate (DER): 64 chars + NUL. */
+esp_err_t acme_client_bootstrap_certificate_sha256(char out_hex[65]);
+
 /* Persisted boot TLS selection. Only production may be selected persistently. */
 esp_err_t acme_client_get_production_boot_selected(bool *out_selected);
 esp_err_t acme_client_set_production_boot_selected(bool selected);
@@ -248,6 +255,13 @@ esp_err_t acme_client_store_tls_activation_intent(const acme_tls_activation_inte
  * existing production storage path, but does NOT activate it for management TLS.
  * No scheduler or HTTP endpoint calls this function in 5B.10e.1.
  */
+/* Exclusive claim on production ACME work (issuance, renewal) shared by the
+ * renewal scheduler and the manual console endpoints. begin() returns false
+ * if another operation holds it; end() releases it. The transaction below
+ * claims it itself. */
+bool acme_client_production_operation_begin(void);
+void acme_client_production_operation_end(void);
+
 esp_err_t acme_client_run_production_certificate_transaction(
     const char *hostname,
     const acme_production_dns01_hooks_t *dns01_hooks,

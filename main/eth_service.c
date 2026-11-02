@@ -7,9 +7,11 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "clock_discipline.h"
+#include "device_config.h"
 
 #include "esp_check.h"
 #include "esp_eth.h"
+#include "esp_eth_rx_diag.h"
 #include "esp_eth_mac_esp.h"
 #include "esp_eth_phy_ip101.h"
 #include "esp_event.h"
@@ -36,7 +38,30 @@ static const char *TAG = "ETH";
 #define ETH_NTP_RX_QUEUE_SIZE                        16U
 #define ETH_PTP_CORRELATION_MAX_AGE_US          30000000LL
 #define ETH_PTP_LOCAL_MAP_MAX_BRACKET_NS          250000ULL
-#define ETH_NTP_TX_COMPENSATION_NS                    98941ULL
+/* Initial L2-to-wire transmit latency added to the late-stamped XMT (the
+ * 6C.7A steady-state median). The running value then tracks measured
+ * hardware TX timestamps, bounded to the range below. */
+#define ETH_NTP_TX_COMPENSATION_NS                    98941LL
+#define ETH_NTP_TX_COMPENSATION_MIN_NS                20000LL
+#define ETH_NTP_TX_COMPENSATION_MAX_NS               500000LL
+/* Filter gain 1/16; samples mapped through a wide UTC/PTP bracket are too
+ * uncertain to learn from. */
+#define ETH_NTP_TX_COMPENSATION_GAIN_SHIFT                4
+#define ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS     20000ULL
+/* Best-of-N UTC/PTP pairing (see eth_sample_utc_ptp_pair). */
+#define ETH_PTP_PAIR_ATTEMPTS                            3U
+/* NTS T3 bias: integral gain 1/8, bounded to [0, 20 ms]. */
+#define ETH_NTS_TX_BIAS_GAIN_SHIFT                       3
+#define ETH_NTS_TX_BIAS_MAX_NS                    20000000LL
+#define ETH_NTS_TX_BIAS_INITIAL_NS                 1000000
+#define NTP_PACKET_LEN                                  48U
+#define ETH_PTP_PAIR_GOOD_BRACKET_NS                 10000ULL
+/* A queued RX timestamp older than this cannot belong to the request now
+ * being served: legitimate queueing is sub-millisecond, while the shortest
+ * client poll interval is seconds. Older entries are left behind by frames
+ * lwIP dropped after the MAC stamped them. */
+#define ETH_NTP_RX_MAX_AGE_NS                     100000000ULL
+#define ETH_HOT_PATH_LOG_INTERVAL_US               10000000LL
 
 static esp_eth_handle_t s_eth_handle;
 static esp_eth_mac_t *s_eth_mac;
@@ -58,6 +83,27 @@ static eth_ntp_rx_queue_entry_t s_ntp_rx_queue[ETH_NTP_RX_QUEUE_SIZE];
 static uint32_t s_ntp_rx_queue_next;
 static uint32_t s_ntp_rx_queue_sequence;
 
+/* Hardware stamps for the peer monitor's own NTP client exchanges: the
+ * request leaving (to port 123 from an ephemeral port) and the reply
+ * arriving (from port 123 to that port). Software T1/T4 taken around
+ * sendto()/recvfrom() are skewed by the lwIP and task-wakeup latency of
+ * each direction, which biased peer offsets by about -90 us. Keyed by
+ * (peer address, local port); entries are consumed once and purged by age. */
+#define ETH_PEER_TS_SLOTS                                4U
+#define ETH_PEER_TS_MAX_AGE_NS                  5000000000ULL
+
+typedef struct {
+    bool valid;
+    uint32_t peer_ipv4;
+    uint16_t local_port;
+    eth_mac_time_t ptp_time;
+} eth_peer_ts_entry_t;
+
+static eth_peer_ts_entry_t s_peer_tx_ts[ETH_PEER_TS_SLOTS];
+static eth_peer_ts_entry_t s_peer_rx_ts[ETH_PEER_TS_SLOTS];
+static uint32_t s_peer_tx_ts_next;
+static uint32_t s_peer_rx_ts_next;
+
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
 typedef struct {
     uint32_t matched;
@@ -70,6 +116,16 @@ typedef struct {
 } eth_ntp_tx_probe_status_t;
 
 static eth_ntp_tx_probe_status_t s_ntp_tx_probe;
+
+/* Current XMT transmit-latency compensation. Only the lwIP thread (the
+ * NTP TX hook) reads or writes it; s_status carries a copy for display. */
+static int64_t s_ntp_tx_compensation_ns = ETH_NTP_TX_COMPENSATION_NS;
+
+/* Learned T3-to-wire delay for NTS responses; written by the lwIP thread,
+ * read by the NTP task through eth_service_get_nts_tx_bias_ns(). Starts at
+ * the value measured on ESP32-P4 hardware so NTS is close from the first
+ * response; clients poll too rarely to learn it quickly from zero. */
+static int32_t s_nts_tx_bias_ns = ETH_NTS_TX_BIAS_INITIAL_NS;
 
 static TaskHandle_t s_ptp_correlation_task;
 static bool s_ptp_correlation_baseline_valid;
@@ -92,6 +148,21 @@ static uint32_t read_be32(const uint8_t *p)
 }
 
 static bool eth_frame_is_ipv4_udp_ntp_response(const uint8_t *buffer, size_t length);
+
+/* Per-packet paths must never block on the console UART. Failures there are
+ * counted in s_status; this gates the occasional human-readable warning. */
+static bool eth_hot_path_log_allowed(int64_t *last_log_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    if (*last_log_us != 0 &&
+        (now_us - *last_log_us) < ETH_HOT_PATH_LOG_INTERVAL_US) {
+        return false;
+    }
+
+    *last_log_us = now_us;
+    return true;
+}
 
 static void write_be16(uint8_t *p, uint16_t value)
 {
@@ -336,7 +407,8 @@ static uint64_t ptp_timestamp_to_ns(const eth_mac_time_t *timestamp);
 static bool eth_frame_get_ntp_response_xmt(const uint8_t *buffer,
                                            size_t length,
                                            uint32_t *out_seconds,
-                                           uint32_t *out_fraction)
+                                           uint32_t *out_fraction,
+                                           size_t *out_ntp_length)
 {
     if (buffer == NULL || out_seconds == NULL || out_fraction == NULL ||
         !eth_frame_is_ipv4_udp_ntp_response(buffer, length)) {
@@ -362,10 +434,63 @@ static bool eth_frame_get_ntp_response_xmt(const uint8_t *buffer,
 
     *out_seconds = read_be32(buffer + ntp_offset + 40U);
     *out_fraction = read_be32(buffer + ntp_offset + 44U);
+    if (out_ntp_length != NULL) {
+        const uint16_t udp_length = read_be16(buffer + ntp_offset - 8U + 4U);
+        *out_ntp_length = udp_length >= 8U ? (size_t)udp_length - 8U : 0U;
+    }
     return true;
 }
 
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+/*
+ * Pairs "now" on the disciplined UTC clock with "now" on the EMAC PTP clock
+ * by reading UTC, PTP, UTC and taking the midpoint. The pair is only as good
+ * as the UTC bracket: preemption between the reads widens it, and half the
+ * bracket is the worst-case mapping error. Take the tightest of a few
+ * attempts, stopping early once one is good enough.
+ */
+static bool eth_sample_utc_ptp_pair(uint64_t *out_utc_mid_ns,
+                                    uint64_t *out_ptp_now_ns,
+                                    uint64_t *out_bracket_ns)
+{
+    bool have_sample = false;
+    uint64_t best_bracket_ns = UINT64_MAX;
+
+    for (unsigned attempt = 0U; attempt < ETH_PTP_PAIR_ATTEMPTS; attempt++) {
+        clock_ntp_timestamp_t utc_before = {0};
+        clock_ntp_timestamp_t utc_after = {0};
+        eth_mac_time_t ptp_now = {0};
+
+        if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
+            esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
+            !clock_discipline_get_ntp_timestamp(&utc_after)) {
+            return false;
+        }
+
+        const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
+        const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
+
+        if (utc_after_ns < utc_before_ns) {
+            continue;
+        }
+
+        const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
+        if (bracket_ns < best_bracket_ns) {
+            best_bracket_ns = bracket_ns;
+            *out_utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
+            *out_ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+            *out_bracket_ns = bracket_ns;
+            have_sample = true;
+        }
+
+        if (best_bracket_ns <= ETH_PTP_PAIR_GOOD_BRACKET_NS) {
+            break;
+        }
+    }
+
+    return have_sample;
+}
+
 static bool eth_map_ptp_event_to_utc_ns(const eth_mac_time_t *event_ptp,
                                         uint64_t *out_utc_ns,
                                         uint32_t *out_bracket_ns,
@@ -375,27 +500,20 @@ static bool eth_map_ptp_event_to_utc_ns(const eth_mac_time_t *event_ptp,
         return false;
     }
 
-    clock_ntp_timestamp_t utc_before = {0};
-    clock_ntp_timestamp_t utc_after = {0};
-    eth_mac_time_t ptp_now = {0};
+    uint64_t utc_mid_ns = 0U;
+    uint64_t ptp_now_ns = 0U;
+    uint64_t bracket_ns = 0U;
 
-    if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
-        esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
-        !clock_discipline_get_ntp_timestamp(&utc_after)) {
+    if (!eth_sample_utc_ptp_pair(&utc_mid_ns, &ptp_now_ns, &bracket_ns)) {
         return false;
     }
 
-    const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
-    const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
-    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
     const uint64_t event_ptp_ns = ptp_timestamp_to_ns(event_ptp);
 
-    if (utc_after_ns < utc_before_ns || ptp_now_ns < event_ptp_ns) {
+    if (ptp_now_ns < event_ptp_ns) {
         return false;
     }
 
-    const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
-    const uint64_t utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
     const uint64_t ptp_age_ns = ptp_now_ns - event_ptp_ns;
 
     int64_t rate_ppb = 0;
@@ -474,14 +592,108 @@ static esp_err_t eth_tx_probe_set_mac_filter(void *h,
                          (void *)eth_mac);
 }
 
+/* Read-only classification; never changes or retains the frame buffer. */
+static void eth_diag_classify_rx(const uint8_t *buffer, uint32_t length,
+                                 bool *arp, bool *dhcp)
+{
+    *arp = false;
+    *dhcp = false;
+    if (buffer == NULL || length < 14U) return;
+    uint32_t l3 = 14U;
+    uint16_t type = read_be16(buffer + 12U);
+    for (unsigned i = 0; i < 2U &&
+         (type == ETHERTYPE_VLAN || type == ETHERTYPE_QINQ); ++i) {
+        if (length < l3 + 4U) return;
+        type = read_be16(buffer + l3 + 2U);
+        l3 += 4U;
+    }
+    if (type == 0x0806U) { *arp = true; return; }
+    if (type != ETHERTYPE_IPV4 || length < l3 + 20U) return;
+    const uint32_t ihl = (buffer[l3] & 0x0FU) * 4U;
+    if (ihl < 20U || length < l3 + ihl + 8U || buffer[l3 + 9U] != IP_PROTOCOL_UDP) return;
+    const uint16_t fragment = read_be16(buffer + l3 + 6U);
+    if ((fragment & 0x3FFFU) != 0U) return;
+    const uint32_t udp = l3 + ihl;
+    const uint16_t src = read_be16(buffer + udp);
+    const uint16_t dst = read_be16(buffer + udp + 2U);
+    *dhcp = (src == 67U && dst == 68U) || (src == 68U && dst == 67U);
+}
+
+/* IPv4/UDP addressing of a first-fragment frame. Addresses are copied as
+ * stored (the sockaddr_in.sin_addr.s_addr representation); ports are host
+ * byte order. */
+static bool eth_frame_get_udp_tuple(const uint8_t *buffer, size_t length,
+                                    uint32_t *src_ipv4, uint32_t *dst_ipv4,
+                                    uint16_t *src_port, uint16_t *dst_port)
+{
+    if (buffer == NULL || length < 14U) return false;
+    size_t l3 = 14U;
+    uint16_t type = read_be16(buffer + 12U);
+    for (unsigned i = 0; i < 2U &&
+         (type == ETHERTYPE_VLAN || type == ETHERTYPE_QINQ); ++i) {
+        if (length < l3 + 4U) return false;
+        type = read_be16(buffer + l3 + 2U);
+        l3 += 4U;
+    }
+    if (type != ETHERTYPE_IPV4 || length < l3 + 20U || (buffer[l3] >> 4) != 4U) return false;
+    const size_t ihl = (size_t)(buffer[l3] & 0x0FU) * 4U;
+    if (ihl < 20U || length < l3 + ihl + 8U || buffer[l3 + 9U] != IP_PROTOCOL_UDP) return false;
+    if ((read_be16(buffer + l3 + 6U) & 0x1FFFU) != 0U) return false;
+    memcpy(src_ipv4, buffer + l3 + 12U, sizeof(*src_ipv4));
+    memcpy(dst_ipv4, buffer + l3 + 16U, sizeof(*dst_ipv4));
+    *src_port = read_be16(buffer + l3 + ihl);
+    *dst_port = read_be16(buffer + l3 + ihl + 2U);
+    return true;
+}
+
+/* Caller holds s_eth_lock. */
+static void eth_peer_ts_store(eth_peer_ts_entry_t *table, uint32_t *next,
+                              uint32_t peer_ipv4, uint16_t local_port,
+                              const eth_mac_time_t *ptp_time)
+{
+    eth_peer_ts_entry_t *entry = &table[*next];
+    entry->valid = true;
+    entry->peer_ipv4 = peer_ipv4;
+    entry->local_port = local_port;
+    entry->ptp_time = *ptp_time;
+    *next = (*next + 1U) % ETH_PEER_TS_SLOTS;
+}
+
 static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
 {
     esp_eth_handle_t eth_handle = (esp_eth_handle_t)h;
 
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+    /* Peer-monitor request: transmit with a hardware TX stamp (T1). */
+    uint32_t tx_src_ipv4 = 0U, tx_dst_ipv4 = 0U;
+    uint16_t tx_src_port = 0U, tx_dst_port = 0U;
+    if (eth_frame_get_udp_tuple((const uint8_t *)buffer, length, &tx_src_ipv4, &tx_dst_ipv4,
+                                &tx_src_port, &tx_dst_port) &&
+        tx_dst_port == NTP_UDP_PORT && tx_src_port != NTP_UDP_PORT) {
+        eth_mac_time_t tx_timestamp = {0};
+        const esp_err_t err = esp_eth_transmit_ctrl_vargs(eth_handle, &tx_timestamp, 2U,
+                                                          (uint8_t *)buffer, (uint32_t)length);
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_tx_other_attempt++;
+        if (err != ESP_OK) {
+            s_status.diag_tx_other_fail++;
+        } else if (tx_timestamp.seconds != 0U || tx_timestamp.nanoseconds != 0U) {
+            eth_peer_ts_store(s_peer_tx_ts, &s_peer_tx_ts_next, tx_dst_ipv4, tx_src_port, &tx_timestamp);
+        }
+        portEXIT_CRITICAL(&s_eth_lock);
+        return err;
+    }
+#endif
+
     /* Fail open to the stock path unless this is positively identified as an
      * IPv4 UDP NTP server response. */
     if (!eth_frame_is_ipv4_udp_ntp_response((const uint8_t *)buffer, length)) {
-        return esp_eth_transmit(eth_handle, buffer, length);
+        const esp_err_t err = esp_eth_transmit(eth_handle, buffer, length);
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_tx_other_attempt++;
+        if (err != ESP_OK) s_status.diag_tx_other_fail++;
+        portEXIT_CRITICAL(&s_eth_lock);
+        return err;
     }
 
 #ifndef SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -509,7 +721,7 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
     clock_ntp_timestamp_t predicted_tx_timestamp = late_sw_timestamp;
     if (late_sw_valid) {
         const uint64_t fraction_delta =
-            ((ETH_NTP_TX_COMPENSATION_NS << 32) + 500000000ULL) /
+            (((uint64_t)s_ntp_tx_compensation_ns << 32) + 500000000ULL) /
             1000000000ULL;
         const uint64_t fraction_sum =
             (uint64_t)predicted_tx_timestamp.fraction + fraction_delta;
@@ -525,11 +737,13 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
 
     uint32_t xmt_seconds = 0U;
     uint32_t xmt_fraction = 0U;
+    size_t ntp_length = 0U;
     const bool xmt_valid =
         eth_frame_get_ntp_response_xmt((const uint8_t *)buffer,
                                        length,
                                        &xmt_seconds,
-                                       &xmt_fraction);
+                                       &xmt_fraction,
+                                       &ntp_length);
 
     eth_mac_time_t tx_timestamp = {0};
 
@@ -563,13 +777,20 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
     }
     portEXIT_CRITICAL(&s_eth_lock);
 
+    /* This runs in the lwIP thread for every NTP response. Diagnostics are
+     * DEBUG level (compiled out at the default INFO maximum); failures are
+     * counted above and only warned about at a bounded rate. */
+    static int64_t s_tx_warn_log_us;
+
     if (tx_err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "HW TX NTP transmit failed: n=%" PRIu32 " err=%s",
-                 sample,
-                 esp_err_to_name(tx_err));
+        if (eth_hot_path_log_allowed(&s_tx_warn_log_us)) {
+            ESP_LOGW(TAG,
+                     "HW TX NTP transmit failed: n=%" PRIu32 " err=%s",
+                     sample,
+                     esp_err_to_name(tx_err));
+        }
     } else if (timestamp_valid) {
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "HW TX NTP timestamp: n=%" PRIu32
                  " ptp=%" PRIu32 ".%09" PRIu32,
                  sample,
@@ -592,7 +813,7 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
             const int64_t delta_ns =
                 (int64_t)software_xmt_ns - (int64_t)hw_tx_utc_ns;
 
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare: n=%" PRIu32
                      " xmt-hw=%" PRId64
                      " ns map_bracket=%" PRIu32 " ns age=%" PRIu32 " us",
@@ -601,36 +822,88 @@ static esp_err_t eth_ntp_tx_probe_transmit(void *h, void *buffer, size_t length)
                      mapping_bracket_ns,
                      mapping_age_us);
 
+            /* NTS responses cannot be late-stamped (the XMT is inside the
+             * authenticated data), so their T3 is sampled before the final
+             * seal and the send path. Learn that residual (hw - xmt) from
+             * the hardware TX stamp and feed it back as a bias the NTP task
+             * adds to NTS T3: an integral controller, so the bias already
+             * applied is accounted for. Only extension-bearing responses
+             * with a real XMT (not KoD/NAK) and a tight mapping count. */
+            const int64_t nts_residual_ns = -delta_ns;
+            if (!late_stamp_ready &&
+                ntp_length > NTP_PACKET_LEN &&
+                xmt_seconds != 0U &&
+                mapping_bracket_ns <= ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS &&
+                nts_residual_ns >= -ETH_NTS_TX_BIAS_MAX_NS &&
+                nts_residual_ns <= ETH_NTS_TX_BIAS_MAX_NS) {
+                int32_t bias_ns = __atomic_load_n(&s_nts_tx_bias_ns, __ATOMIC_RELAXED);
+                int64_t updated_ns =
+                    (int64_t)bias_ns +
+                    nts_residual_ns / (1LL << ETH_NTS_TX_BIAS_GAIN_SHIFT);
+                if (updated_ns < 0) {
+                    updated_ns = 0;
+                } else if (updated_ns > ETH_NTS_TX_BIAS_MAX_NS) {
+                    updated_ns = ETH_NTS_TX_BIAS_MAX_NS;
+                }
+                bias_ns = (int32_t)updated_ns;
+                __atomic_store_n(&s_nts_tx_bias_ns, bias_ns, __ATOMIC_RELAXED);
+
+                portENTER_CRITICAL(&s_eth_lock);
+                s_status.nts_tx_bias_ns = bias_ns;
+                s_status.nts_tx_bias_samples++;
+                s_status.nts_tx_last_residual_ns = nts_residual_ns;
+                portEXIT_CRITICAL(&s_eth_lock);
+            }
+
             if (late_sw_valid) {
                 const uint64_t late_sw_ns =
                     ntp_timestamp_to_ns(&late_sw_timestamp);
                 const int64_t late_delta_ns =
                     (int64_t)late_sw_ns - (int64_t)hw_tx_utc_ns;
 
-                ESP_LOGI(TAG,
+                ESP_LOGD(TAG,
                          "HW TX late compare: n=%" PRIu32
                          " late-hw=%" PRId64 " ns stamped=%u",
                          sample,
                          late_delta_ns,
                          late_stamp_applied ? 1U : 0U);
+
+                /* Learn the real L2-to-wire latency (hw - late_sw) from
+                 * well-mapped samples so XMT tracks load and build changes
+                 * instead of a frozen constant. Bounded, slow (1/16) filter;
+                 * implausible samples are ignored rather than clamped. */
+                const int64_t measured_latency_ns = -late_delta_ns;
+                if (late_stamp_applied &&
+                    mapping_bracket_ns <= ETH_NTP_TX_COMPENSATION_MAX_BRACKET_NS &&
+                    measured_latency_ns >= ETH_NTP_TX_COMPENSATION_MIN_NS &&
+                    measured_latency_ns <= ETH_NTP_TX_COMPENSATION_MAX_NS) {
+                    s_ntp_tx_compensation_ns +=
+                        (measured_latency_ns - s_ntp_tx_compensation_ns) /
+                        (1LL << ETH_NTP_TX_COMPENSATION_GAIN_SHIFT);
+
+                    portENTER_CRITICAL(&s_eth_lock);
+                    s_status.tx_compensation_ns = s_ntp_tx_compensation_ns;
+                    s_status.tx_compensation_samples++;
+                    portEXIT_CRITICAL(&s_eth_lock);
+                }
             } else {
-                ESP_LOGW(TAG,
+                ESP_LOGD(TAG,
                          "HW TX late compare unavailable: n=%" PRIu32
                          " disciplined UTC unavailable",
                          sample);
             }
         } else if (!xmt_valid) {
-            ESP_LOGW(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare unavailable: n=%" PRIu32
                      " serialized XMT unavailable",
                      sample);
         } else {
-            ESP_LOGW(TAG,
+            ESP_LOGD(TAG,
                      "HW TX NTP compare unavailable: n=%" PRIu32
                      " PTP/UTC mapping unavailable",
                      sample);
         }
-    } else {
+    } else if (eth_hot_path_log_allowed(&s_tx_warn_log_us)) {
         ESP_LOGW(TAG,
                  "HW TX NTP timestamp invalid: n=%" PRIu32,
                  sample);
@@ -672,6 +945,15 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
 {
     (void)eth_handle;
 
+    bool diag_arp = false;
+    bool diag_dhcp = false;
+    eth_diag_classify_rx(buffer, length, &diag_arp, &diag_dhcp);
+    portENTER_CRITICAL(&s_eth_lock);
+    s_status.diag_rx_frames++;
+    if (diag_arp) s_status.diag_rx_arp++;
+    if (diag_dhcp) s_status.diag_rx_dhcp++;
+    portEXIT_CRITICAL(&s_eth_lock);
+
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     const eth_mac_time_t *timestamp = (const eth_mac_time_t *)info;
     const bool timestamp_valid =
@@ -683,9 +965,20 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
     const bool client_valid = is_ntp &&
         eth_frame_get_ntp_client(buffer, length, &client_ipv4, &client_port);
 
+    /* Reply to the peer monitor's own request (T4). */
+    uint32_t rx_src_ipv4 = 0U, rx_dst_ipv4 = 0U;
+    uint16_t rx_src_port = 0U, rx_dst_port = 0U;
+    const bool peer_reply = !is_ntp && timestamp_valid &&
+        eth_frame_get_udp_tuple(buffer, length, &rx_src_ipv4, &rx_dst_ipv4,
+                                &rx_src_port, &rx_dst_port) &&
+        rx_src_port == NTP_UDP_PORT && rx_dst_port != NTP_UDP_PORT;
+
     uint32_t ntp_sample = 0U;
 
     portENTER_CRITICAL(&s_eth_lock);
+    if (peer_reply) {
+        eth_peer_ts_store(s_peer_rx_ts, &s_peer_rx_ts_next, rx_src_ipv4, rx_dst_port, timestamp);
+    }
     s_status.rx_hw_frames++;
     if (timestamp_valid) {
         s_status.rx_hw_timestamp_valid++;
@@ -720,14 +1013,17 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
     }
     portEXIT_CRITICAL(&s_eth_lock);
 
+    /* EMAC RX task context: never block every NTP frame on the console. */
     if (is_ntp) {
+        static int64_t s_rx_warn_log_us;
+
         if (timestamp_valid) {
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "HW RX NTP timestamp: n=%" PRIu32 " ptp=%" PRIu32 ".%09" PRIu32,
                      ntp_sample,
                      timestamp->seconds,
                      timestamp->nanoseconds);
-        } else {
+        } else if (eth_hot_path_log_allowed(&s_rx_warn_log_us)) {
             ESP_LOGW(TAG,
                      "HW RX NTP timestamp invalid: n=%" PRIu32,
                      ntp_sample);
@@ -739,7 +1035,13 @@ static esp_err_t eth_input_to_netif_with_timestamp(esp_eth_handle_t eth_handle,
 
     /* Preserve the stock Ethernet glue behavior: it forwards the received
      * Ethernet buffer to esp-netif and does not pass MAC-specific info on. */
-    return esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+    const esp_err_t forward_err = esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+    if (forward_err != ESP_OK) {
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.diag_rx_forward_fail++;
+        portEXIT_CRITICAL(&s_eth_lock);
+    }
+    return forward_err;
 }
 
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
@@ -956,6 +1258,7 @@ static void eth_event_handler(void *arg,
     if (event_id == ETHERNET_EVENT_CONNECTED) {
         portENTER_CRITICAL(&s_eth_lock);
         s_status.link_up = true;
+        s_status.diag_link_up_events++;
         portEXIT_CRITICAL(&s_eth_lock);
 
         ESP_LOGI(TAG, "Ethernet link up");
@@ -967,6 +1270,7 @@ static void eth_event_handler(void *arg,
 
         s_status.link_up = false;
         s_status.ipv4_ready = false;
+        s_status.diag_link_down_events++;
         s_status.ipv4_address = 0U;
         s_status.ipv4_netmask = 0U;
         s_status.ipv4_gateway = 0U;
@@ -1024,6 +1328,7 @@ static void got_ip_event_handler(void *arg,
     portENTER_CRITICAL(&s_eth_lock);
 
     s_status.ipv4_ready = true;
+    s_status.diag_got_ip_events++;
     s_status.ipv4_address = got_ip->ip_info.ip.addr;
     s_status.ipv4_netmask = got_ip->ip_info.netmask.addr;
     s_status.ipv4_gateway = got_ip->ip_info.gw.addr;
@@ -1037,7 +1342,8 @@ static void got_ip_event_handler(void *arg,
     }
 
     ESP_LOGI(TAG,
-             "DHCP IPv4 acquired: " IPSTR,
+             "%s IPv4 acquired: " IPSTR,
+             s_status.ipv4_static ? "Static" : "DHCP",
              IP2STR(&got_ip->ip_info.ip));
 }
 
@@ -1100,6 +1406,68 @@ esp_err_t eth_service_init(void)
 
     if (s_eth_netif == NULL) {
         return ESP_ERR_NO_MEM;
+    }
+
+    /* Advertise the persisted device host label in DHCP Option 12 instead of
+     * ESP-IDF's default "espressif" hostname. The configured hostname is a
+     * single DNS label (for example "ts2"); the local DHCP/DNS server may
+     * append its domain suffix (for example example.com). This affects only
+     * management/network identity and has no timing authority. */
+    char dhcp_hostname[APP_DEVICE_HOSTNAME_MAX_LENGTH + 1U] = {0};
+    ESP_RETURN_ON_ERROR(
+        device_config_get_hostname(dhcp_hostname, sizeof(dhcp_hostname)),
+        TAG,
+        "read configured DHCP hostname");
+
+    ESP_RETURN_ON_ERROR(
+        esp_netif_set_hostname(s_eth_netif, dhcp_hostname),
+        TAG,
+        "set Ethernet DHCP hostname");
+
+    ESP_LOGI(TAG, "DHCP hostname configured: %s", dhcp_hostname);
+
+    /* Static IPv4: stop the DHCP client before the netif comes up and fix
+     * the address. esp-netif then raises IP_EVENT_ETH_GOT_IP on link-up as
+     * it does for a DHCP lease, so the rest of the boot is unchanged. Any
+     * failure here falls back to DHCP rather than leaving no address. */
+    bool static_ipv4_applied = false;
+    device_config_snapshot_t net_cfg;
+    if (device_config_get_snapshot(&net_cfg) == ESP_OK &&
+        net_cfg.static_ipv4_enabled) {
+        esp_netif_ip_info_t ip_info = {
+            .ip.addr = net_cfg.static_ipv4_address,
+            .netmask.addr = net_cfg.static_ipv4_netmask,
+            .gw.addr = net_cfg.static_ipv4_gateway,
+        };
+        esp_err_t ip_err = esp_netif_dhcpc_stop(s_eth_netif);
+        if (ip_err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+            ip_err = ESP_OK;
+        }
+        if (ip_err == ESP_OK) {
+            ip_err = esp_netif_set_ip_info(s_eth_netif, &ip_info);
+        }
+        if (ip_err == ESP_OK && net_cfg.static_ipv4_dns != 0U) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = net_cfg.static_ipv4_dns;
+            ip_err = esp_netif_set_dns_info(s_eth_netif, ESP_NETIF_DNS_MAIN, &dns);
+        }
+        if (ip_err == ESP_OK && net_cfg.static_ipv4_dns2 != 0U) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = net_cfg.static_ipv4_dns2;
+            ip_err = esp_netif_set_dns_info(s_eth_netif, ESP_NETIF_DNS_BACKUP, &dns);
+        }
+
+        if (ip_err == ESP_OK) {
+            static_ipv4_applied = true;
+            ESP_LOGI(TAG, "Static IPv4 configured: " IPSTR " mask " IPSTR " gw " IPSTR,
+                     IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
+        } else {
+            ESP_LOGE(TAG, "Static IPv4 setup failed (%s); falling back to DHCP",
+                     esp_err_to_name(ip_err));
+            (void)esp_netif_dhcpc_start(s_eth_netif);
+        }
     }
 
     const esp_eth_netif_glue_handle_t glue =
@@ -1172,9 +1540,12 @@ esp_err_t eth_service_init(void)
     s_ntp_rx_queue_sequence = 0U;
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     memset(&s_ntp_tx_probe, 0, sizeof(s_ntp_tx_probe));
+    s_status.tx_compensation_ns = s_ntp_tx_compensation_ns;
+    s_status.nts_tx_bias_ns = s_nts_tx_bias_ns;
 #endif
 
     s_status.initialized = true;
+    s_status.ipv4_static = static_ipv4_applied;
 #ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
     s_status.ptp_supported = true;
 #endif
@@ -1292,14 +1663,41 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
     eth_mac_time_t rx_ptp = {0};
     bool found = false;
 
+    /* Reference instant for discarding stale queue entries. A frame stamped
+     * after this read has a later PTP time and is never considered stale. */
+    eth_mac_time_t scan_ptp_now = {0};
+    if (esp_eth_mac_get_ptp_time(s_eth_mac, &scan_ptp_now) != ESP_OK) {
+        portENTER_CRITICAL(&s_eth_lock);
+        s_status.rx_hw_map_failures++;
+        portEXIT_CRITICAL(&s_eth_lock);
+        return false;
+    }
+    const uint64_t scan_ptp_now_ns = ptp_timestamp_to_ns(&scan_ptp_now);
+
     portENTER_CRITICAL(&s_eth_lock);
-    /* Oldest matching entry wins. With a 16-entry queue this bounded scan is
-     * short and prevents two clients from stealing one another's timestamps. */
+    /* Purge every entry older than ETH_NTP_RX_MAX_AGE_NS, whatever its
+     * client: those frames were dropped above the MAC (e.g. lwIP mailbox
+     * full) and would otherwise hand a seconds-old T2 to a later request
+     * reusing the same address/port (ntpd's fixed source port 123, NAT).
+     * Among the remaining entries the oldest match wins, so back-to-back
+     * requests from one client are consumed in arrival order. */
     uint32_t best_index = 0U;
     uint32_t best_sequence = UINT32_MAX;
     for (uint32_t index = 0U; index < ETH_NTP_RX_QUEUE_SIZE; index++) {
-        const eth_ntp_rx_queue_entry_t *entry = &s_ntp_rx_queue[index];
-        if (entry->valid && entry->client_ipv4 == client_ipv4 &&
+        eth_ntp_rx_queue_entry_t *entry = &s_ntp_rx_queue[index];
+        if (!entry->valid) {
+            continue;
+        }
+
+        const uint64_t entry_ns = ptp_timestamp_to_ns(&entry->ptp_time);
+        if (entry_ns < scan_ptp_now_ns &&
+            (scan_ptp_now_ns - entry_ns) > ETH_NTP_RX_MAX_AGE_NS) {
+            entry->valid = false;
+            s_status.rx_hw_queue_stale_purges++;
+            continue;
+        }
+
+        if (entry->client_ipv4 == client_ipv4 &&
             entry->client_port == client_port && entry->sequence < best_sequence) {
             best_index = index;
             best_sequence = entry->sequence;
@@ -1320,33 +1718,19 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
         return false;
     }
 
-    clock_ntp_timestamp_t utc_before = {0};
-    clock_ntp_timestamp_t utc_after = {0};
-    eth_mac_time_t ptp_now = {0};
-
-    if (!clock_discipline_get_ntp_timestamp(&utc_before) ||
-        esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK ||
-        !clock_discipline_get_ntp_timestamp(&utc_after)) {
-        portENTER_CRITICAL(&s_eth_lock);
-        s_status.rx_hw_map_failures++;
-        portEXIT_CRITICAL(&s_eth_lock);
-        return false;
-    }
-
-    const uint64_t utc_before_ns = ntp_timestamp_to_ns(&utc_before);
-    const uint64_t utc_after_ns = ntp_timestamp_to_ns(&utc_after);
-    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+    uint64_t utc_mid_ns = 0U;
+    uint64_t ptp_now_ns = 0U;
+    uint64_t bracket_ns = 0U;
     const uint64_t rx_ptp_ns = ptp_timestamp_to_ns(&rx_ptp);
 
-    if (utc_after_ns < utc_before_ns || ptp_now_ns < rx_ptp_ns) {
+    if (!eth_sample_utc_ptp_pair(&utc_mid_ns, &ptp_now_ns, &bracket_ns) ||
+        ptp_now_ns < rx_ptp_ns) {
         portENTER_CRITICAL(&s_eth_lock);
         s_status.rx_hw_map_failures++;
         portEXIT_CRITICAL(&s_eth_lock);
         return false;
     }
 
-    const uint64_t bracket_ns = utc_after_ns - utc_before_ns;
-    const uint64_t utc_mid_ns = utc_before_ns + bracket_ns / 2ULL;
     const uint64_t ptp_age_ns = ptp_now_ns - rx_ptp_ns;
 
     int64_t rate_ppb = 0;
@@ -1422,6 +1806,85 @@ bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
 #endif
 }
 
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+/* Caller holds s_eth_lock. Takes the newest matching entry no older than
+ * ETH_PEER_TS_MAX_AGE_NS and invalidates every match and every stale entry. */
+static bool eth_peer_ts_take(eth_peer_ts_entry_t *table, uint32_t peer_ipv4,
+                             uint16_t local_port, uint64_t ptp_now_ns,
+                             eth_mac_time_t *out)
+{
+    bool found = false;
+    uint64_t best_ns = 0U;
+    for (uint32_t i = 0U; i < ETH_PEER_TS_SLOTS; i++) {
+        eth_peer_ts_entry_t *entry = &table[i];
+        if (!entry->valid) continue;
+        const uint64_t entry_ns = ptp_timestamp_to_ns(&entry->ptp_time);
+        if (entry_ns < ptp_now_ns && ptp_now_ns - entry_ns > ETH_PEER_TS_MAX_AGE_NS) {
+            entry->valid = false;
+            continue;
+        }
+        if (entry->peer_ipv4 != peer_ipv4 || entry->local_port != local_port) continue;
+        if (!found || entry_ns > best_ns) {
+            *out = entry->ptp_time;
+            best_ns = entry_ns;
+            found = true;
+        }
+        entry->valid = false;
+    }
+    return found;
+}
+#endif
+
+bool eth_service_take_peer_timestamps(uint32_t peer_ipv4, uint16_t local_port,
+                                      uint64_t *out_t1_ns, uint64_t *out_t4_ns)
+{
+#ifndef SOC_EMAC_IEEE1588V2_SUPPORTED
+    (void)peer_ipv4;
+    (void)local_port;
+    (void)out_t1_ns;
+    (void)out_t4_ns;
+    return false;
+#else
+    if (out_t1_ns == NULL || out_t4_ns == NULL || s_eth_mac == NULL) return false;
+    eth_mac_time_t ptp_now = {0};
+    if (esp_eth_mac_get_ptp_time(s_eth_mac, &ptp_now) != ESP_OK) return false;
+    const uint64_t ptp_now_ns = ptp_timestamp_to_ns(&ptp_now);
+
+    eth_mac_time_t tx_ptp = {0};
+    eth_mac_time_t rx_ptp = {0};
+    portENTER_CRITICAL(&s_eth_lock);
+    const bool have_tx = eth_peer_ts_take(s_peer_tx_ts, peer_ipv4, local_port, ptp_now_ns, &tx_ptp);
+    const bool have_rx = eth_peer_ts_take(s_peer_rx_ts, peer_ipv4, local_port, ptp_now_ns, &rx_ptp);
+    portEXIT_CRITICAL(&s_eth_lock);
+    if (!have_tx || !have_rx) return false;
+
+    return eth_map_ptp_event_to_utc_ns(&tx_ptp, out_t1_ns, NULL, NULL) &&
+           eth_map_ptp_event_to_utc_ns(&rx_ptp, out_t4_ns, NULL, NULL);
+#endif
+}
+
+int32_t eth_service_get_nts_tx_bias_ns(void)
+{
+#ifdef SOC_EMAC_IEEE1588V2_SUPPORTED
+    return __atomic_load_n(&s_nts_tx_bias_ns, __ATOMIC_RELAXED);
+#else
+    return 0;
+#endif
+}
+
+void eth_service_get_dns_in_use(uint32_t *out_main, uint32_t *out_backup)
+{
+    *out_main = 0U;
+    *out_backup = 0U;
+    if (s_eth_netif == NULL) return;
+    esp_netif_dns_info_t dns = {0};
+    if (esp_netif_get_dns_info(s_eth_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4) *out_main = dns.ip.u_addr.ip4.addr;
+    memset(&dns, 0, sizeof(dns));
+    if (esp_netif_get_dns_info(s_eth_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK &&
+        dns.ip.type == ESP_IPADDR_TYPE_V4) *out_backup = dns.ip.u_addr.ip4.addr;
+}
+
 bool eth_service_get_status(eth_service_status_t *out_status)
 {
     if (out_status == NULL) {
@@ -1433,4 +1896,127 @@ bool eth_service_get_status(eth_service_status_t *out_status)
     portEXIT_CRITICAL(&s_eth_lock);
 
     return true;
+}
+
+
+/* Software-only EMAC snapshot; safe to call after RX has stalled. */
+void eth_service_diag_log_emac_snapshot(void)
+{
+    if (s_eth_mac == NULL) {
+        ESP_LOGW(TAG, "eth-emac-snapshot: MAC unavailable");
+        return;
+    }
+    esp_eth_rx_diag_t d = {0};
+    if (!esp_eth_rx_diag_snapshot(s_eth_mac, &d)) {
+        ESP_LOGW(TAG, "eth-emac-snapshot: unavailable");
+        return;
+    }
+    ESP_LOGW(TAG, "B6C: rx_poll_timeout=%" PRIu32, d.rx_poll_timeout);
+    ESP_LOGW(TAG, "eth-emac-snapshot: irq=%" PRIu32 " wake=%" PRIu32
+             " frame=%" PRIu32 " callback=%" PRIu32 " alloc_fail=%" PRIu32
+             " copy_fail=%" PRIu32 " truncated=%" PRIu32
+             " remain=%" PRIu32 " free_desc=%" PRIu32,
+             d.rx_irq, d.rx_wakeup, d.rx_frame, d.rx_callback_attempt,
+             d.rx_alloc_fail, d.rx_copy_fail, d.rx_truncated,
+             d.rx_frames_remain, d.rx_desc_free);
+    esp_eth_rx_hw_diag_t hw = {0};
+    if (esp_eth_rx_hw_diag_snapshot(s_eth_mac, &hw)) {
+        ESP_LOGW(TAG, "B6D: emacdebug=0x%08" PRIx32
+                 " tx_fc=%" PRIu32 " rx_fifo=%" PRIu32,
+                 hw.mac_debug, hw.tx_frame_ctrl_state, hw.rx_fifo_read_state);
+        /* B6E: read-only bitfield correlation. These are raw slices,
+         * not decoded DMA process-state names; verify LL register mapping
+         * before interpreting. No read-to-clear register access added. */
+        ESP_LOGW(TAG, "B6E: dma_status=0x%08" PRIx32
+                 " status_bits_17_19=%" PRIu32
+                 " status_bits_20_22=%" PRIu32
+                 " dma_rx_enabled_bit1=%" PRIu32,
+                 hw.dma_status,
+                 (hw.dma_status >> 17) & 7U,
+                 (hw.dma_status >> 20) & 7U,
+                 (hw.dma_operation_mode >> 1) & 1U);
+        ESP_LOGW(TAG, "eth-emac-hw: mac_cfg=0x%08" PRIx32
+                 " dma_status=0x%08" PRIx32 " dma_op=0x%08" PRIx32
+                 " dma_irq_en=0x%08" PRIx32,
+                 hw.mac_config, hw.dma_status, hw.dma_operation_mode,
+                 hw.dma_interrupt_enable);
+        ESP_LOGW(TAG, "eth-emac-hw: rx_list=0x%08" PRIx32
+                 " rx_current_desc=0x%08" PRIx32 " rx_current_buf=0x%08" PRIx32,
+                 hw.rx_descriptor_list, hw.rx_current_descriptor,
+                 hw.rx_current_buffer);
+    }
+
+}
+
+/* Observe-only Clause 22 PHY snapshot. Call from diagnostics task only.
+ * Read BMSR twice because the first read may report latched link loss. */
+void eth_service_diag_log_phy_snapshot(void)
+{
+    if (s_eth_handle == NULL) {
+        ESP_LOGW(TAG, "eth-phy-snapshot: driver unavailable");
+        return;
+    }
+    uint32_t phy_addr = 0U;
+    esp_err_t err = esp_eth_ioctl(s_eth_handle, ETH_CMD_G_PHY_ADDR, &phy_addr);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "eth-phy-snapshot: addr error=%s", esp_err_to_name(err));
+        return;
+    }
+    static const uint32_t regs[] = {0U, 1U, 1U, 2U, 3U, 4U, 5U, 6U};
+    static const char *names[] = {
+        "BMCR", "BMSR_first", "BMSR_second", "PHYID1",
+        "PHYID2", "ANAR", "ANLPAR", "ANER"
+    };
+    ESP_LOGW(TAG, "eth-phy-snapshot: addr=%" PRIu32, phy_addr);
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+        uint32_t value = 0U;
+        esp_eth_phy_reg_rw_data_t rw = {
+            .reg_addr = regs[i], .reg_value_p = &value
+        };
+        err = esp_eth_ioctl(s_eth_handle, ETH_CMD_READ_PHY_REG, &rw);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "eth-phy-snapshot: %s[%" PRIu32 "]=0x%04" PRIx32,
+                     names[i], regs[i], value & 0xffffU);
+        } else {
+            ESP_LOGW(TAG, "eth-phy-snapshot: %s error=%s",
+                     names[i], esp_err_to_name(err));
+        }
+    }
+}
+
+/* Stage B5: manually invoked, one-shot diagnostic restart. Never call from
+ * an ISR, Ethernet event handler, or timing-critical NTP/PPS task. */
+esp_err_t eth_service_diag_restart_driver(void)
+{
+    static volatile uint32_t busy = 0;
+    if (!__atomic_compare_exchange_n(&busy, &(uint32_t){0}, 1U, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_eth_handle == NULL || !s_status.initialized || !s_status.started) {
+        ESP_LOGE(TAG, "B5: Ethernet is not initialized and started");
+        goto done;
+    }
+    ESP_LOGW(TAG, "B5: pre-stop EMAC snapshot");
+    eth_service_diag_log_emac_snapshot();
+    eth_service_diag_log_phy_snapshot();
+    ESP_LOGW(TAG, "B5: stopping Ethernet (all network services will drop)");
+    err = esp_eth_stop(s_eth_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "B5: stop failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGW(TAG, "B5: starting existing Ethernet driver");
+    err = esp_eth_start(s_eth_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "B5: start failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+    ESP_LOGW(TAG, "B5: start returned OK; verify link/IP, RX counters and PTP externally");
+    eth_service_diag_log_emac_snapshot();
+done:
+    __atomic_store_n(&busy, 0U, __ATOMIC_RELEASE);
+    return err;
 }

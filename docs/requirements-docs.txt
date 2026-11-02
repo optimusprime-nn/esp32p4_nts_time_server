@@ -1,0 +1,6 @@
+# Documentation site build (MkDocs Material). Used by .github/workflows/docs.yml.
+#   pip install -r docs/requirements-docs.txt
+#   mkdocs serve          (preview at http://127.0.0.1:8000/)
+#   mkdocs build --strict
+mkdocs==1.6.*
+mkdocs-material==9.6.*

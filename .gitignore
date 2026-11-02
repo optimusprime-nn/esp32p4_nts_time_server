@@ -21,3 +21,23 @@ serial_output1.log
 .gitignore
 serial_output2.log
 serial_output.log
+
+# Phase 9A local provisioning outputs (board-specific directories are recommended).
+/management-credentials/
+/management-credentials-*/
+
+# Local firmware archive (OTA images and ELFs, kept per version).
+/artifacts/
+
+# Local backup copies made while working on a file.
+*.pre_*
+*.b6d-original
+* - Copy.c
+* - Copy (*).c
+/components/esp_eth/src/mac/backup/
+/components/esp_eth/**/*.diff
+/Phase9B_Backup_*/
+
+# Never commit archives of the working tree: they can capture keys that the
+# patterns above would otherwise exclude.
+*.zip

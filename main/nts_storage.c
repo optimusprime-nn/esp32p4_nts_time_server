@@ -21,8 +21,18 @@ static const char *TAG = "NTS_STORE";
 #define NTS_STORAGE_KEY_PERIOD_SECONDS \
     (30ULL * 24ULL * 3600ULL)
 
+/* Minimum spacing between NVS write retries after a failed rotation save. */
+#define NTS_STORAGE_PERSIST_RETRY_SECONDS 60ULL
+
 static SemaphoreHandle_t s_lock;
 static bool s_initialized;
+
+/* Authoritative in-RAM copy of the cookie keyring, guarded by s_lock. NVS is
+ * read once to fill it and written only when the ring rotates. */
+static nts_storage_cookie_keyring_t s_cached_keyring;
+static bool s_cache_valid;
+static bool s_persist_pending;
+static uint64_t s_last_persist_attempt_ntp;
 
 static esp_err_t ensure_lock(void)
 {
@@ -136,7 +146,7 @@ static esp_err_t validate_cookie_keyring(
         const nts_storage_cookie_key_t *slot =
             &keyring->slots[i];
 
-        ESP_LOGI(
+        ESP_LOGD(
             TAG,
             "Cookie ring %s: valid=%u id=%lu not_before=%llu not_after=%llu",
             slot_names[i],
@@ -278,25 +288,14 @@ void nts_storage_zeroize(void *buffer,
     }
 }
 
-esp_err_t nts_storage_load_cookie_keyring(
+static esp_err_t nvs_load_cookie_keyring_locked(
     nts_storage_cookie_keyring_t *keyring)
 {
-    if (keyring == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = nts_storage_init();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-
     nvs_handle_t handle;
-    err = nvs_open_from_partition(NTS_STORAGE_NVS_PARTITION,
-                                  NTS_STORAGE_NVS_NAMESPACE,
-                                  NVS_READONLY,
-                                  &handle);
+    esp_err_t err = nvs_open_from_partition(NTS_STORAGE_NVS_PARTITION,
+                                            NTS_STORAGE_NVS_NAMESPACE,
+                                            NVS_READONLY,
+                                            &handle);
     if (err == ESP_OK) {
         size_t length = sizeof(*keyring);
         err = nvs_get_blob(handle,
@@ -317,6 +316,88 @@ esp_err_t nts_storage_load_cookie_keyring(
         nvs_close(handle);
     }
 
+    return err;
+}
+
+static esp_err_t nvs_save_cookie_keyring_locked(
+    const nts_storage_cookie_keyring_t *keyring)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open_from_partition(NTS_STORAGE_NVS_PARTITION,
+                                            NTS_STORAGE_NVS_NAMESPACE,
+                                            NVS_READWRITE,
+                                            &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(handle,
+                           NTS_STORAGE_COOKIE_RING_KEY,
+                           keyring,
+                           sizeof(*keyring));
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+
+        nvs_close(handle);
+    }
+
+    return err;
+}
+
+static void cache_store_locked(
+    const nts_storage_cookie_keyring_t *keyring)
+{
+    s_cached_keyring = *keyring;
+    s_cache_valid = true;
+}
+
+/* Fills the RAM cache from NVS on first use. Every cookie create/unpack
+ * runs on the NTP request path, so steady-state access must not touch
+ * flash or the console. */
+static esp_err_t ensure_cache_locked(void)
+{
+    if (s_cache_valid) {
+        return ESP_OK;
+    }
+
+    nts_storage_cookie_keyring_t keyring;
+
+    esp_err_t err = nvs_load_cookie_keyring_locked(&keyring);
+
+    if (err == ESP_OK) {
+        err = validate_cookie_keyring(&keyring);
+    }
+
+    if (err == ESP_OK) {
+        cache_store_locked(&keyring);
+        ESP_LOGI(TAG,
+                 "Cookie keyring cached: previous=%lu active=%lu next=%lu",
+                 (unsigned long)keyring.slots[NTS_STORAGE_SLOT_PREVIOUS].key_id,
+                 (unsigned long)keyring.slots[NTS_STORAGE_SLOT_ACTIVE].key_id,
+                 (unsigned long)keyring.slots[NTS_STORAGE_SLOT_NEXT].key_id);
+    }
+
+    nts_storage_zeroize(&keyring, sizeof(keyring));
+    return err;
+}
+
+esp_err_t nts_storage_load_cookie_keyring(
+    nts_storage_cookie_keyring_t *keyring)
+{
+    if (keyring == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = nts_storage_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    err = ensure_cache_locked();
+    if (err == ESP_OK) {
+        *keyring = s_cached_keyring;
+    }
+
     xSemaphoreGive(s_lock);
     return err;
 }
@@ -335,21 +416,10 @@ esp_err_t nts_storage_save_cookie_keyring(
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
-    nvs_handle_t handle;
-    err = nvs_open_from_partition(NTS_STORAGE_NVS_PARTITION,
-                                  NTS_STORAGE_NVS_NAMESPACE,
-                                  NVS_READWRITE,
-                                  &handle);
+    err = nvs_save_cookie_keyring_locked(keyring);
     if (err == ESP_OK) {
-        err = nvs_set_blob(handle,
-                           NTS_STORAGE_COOKIE_RING_KEY,
-                           keyring,
-                           sizeof(*keyring));
-        if (err == ESP_OK) {
-            err = nvs_commit(handle);
-        }
-
-        nvs_close(handle);
+        cache_store_locked(keyring);
+        s_persist_pending = false;
     }
 
     xSemaphoreGive(s_lock);
@@ -405,36 +475,42 @@ esp_err_t nts_storage_ensure_cookie_keyring(void)
 
 esp_err_t nts_storage_maintain_cookie_keyring(void)
 {
-    nts_storage_cookie_keyring_t keyring;
-
-    esp_err_t err =
-        nts_storage_load_cookie_keyring(&keyring);
-
+    esp_err_t err = nts_storage_init();
     if (err != ESP_OK) {
-        return err;
-    }
-
-    err = validate_cookie_keyring(&keyring);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Cookie keyring validation failed");
-        nts_storage_zeroize(
-            &keyring,
-            sizeof(keyring));
         return err;
     }
 
     clock_ntp_timestamp_t now;
 
     if (!clock_discipline_get_ntp_timestamp(&now)) {
-        nts_storage_zeroize(
-            &keyring,
-            sizeof(keyring));
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_TIMEOUT; /* clock unavailable: transient, never NAK-eligible */
     }
 
     const uint64_t now_ntp =
         (uint64_t)now.seconds;
+
+    /* Hold the lock across the whole check/rotate/persist cycle so two
+     * callers (NTS-KE and the NTP task) cannot rotate concurrently. */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    err = ensure_cache_locked();
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        ESP_LOGE(TAG,
+                 "Cookie keyring unavailable: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    /* Steady-state fast path: no rotation due and nothing to re-persist. */
+    if (now_ntp < s_cached_keyring.slots[
+                      NTS_STORAGE_SLOT_ACTIVE].not_after_ntp &&
+        !s_persist_pending) {
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
+    nts_storage_cookie_keyring_t keyring = s_cached_keyring;
 
     bool changed = false;
 
@@ -475,17 +551,36 @@ esp_err_t nts_storage_maintain_cookie_keyring(void)
     }
 
     if (changed) {
-        err =
-            nts_storage_save_cookie_keyring(
-                &keyring);
+        /* The rotated ring takes effect immediately even if persistence
+         * fails; cookies issued under an unpersisted key simply stop
+         * verifying after a reboot and clients re-run NTS-KE. */
+        cache_store_locked(&keyring);
+        s_persist_pending = true;
+    }
 
-        if (err != ESP_OK) {
+    err = ESP_OK;
+
+    if (s_persist_pending &&
+        (changed ||
+         now_ntp >= s_last_persist_attempt_ntp +
+                        NTS_STORAGE_PERSIST_RETRY_SECONDS)) {
+        s_last_persist_attempt_ntp = now_ntp;
+
+        err = nvs_save_cookie_keyring_locked(&s_cached_keyring);
+
+        if (err == ESP_OK) {
+            s_persist_pending = false;
+        } else {
             ESP_LOGE(
                 TAG,
                 "Cookie keyring rotation persistence failed: %s",
                 esp_err_to_name(err));
+            /* Serving continues from the RAM ring; retry later. */
+            err = ESP_OK;
         }
     }
+
+    xSemaphoreGive(s_lock);
 
     nts_storage_zeroize(
         &keyring,

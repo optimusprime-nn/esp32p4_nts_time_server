@@ -68,6 +68,9 @@ typedef struct {
     /* Phase 6C.4C authoritative hardware receive timestamping. */
     uint32_t hw_rx_authoritative_responses;
     uint32_t hw_rx_authority_drops;
+    /* Requests over the per-client rate limit that got no reply (NTS
+     * requests, or plain ones inside the KoD interval). */
+    uint32_t rate_limited_drops;
 
     uint8_t advertised_stratum;
     uint8_t advertised_leap_indicator;

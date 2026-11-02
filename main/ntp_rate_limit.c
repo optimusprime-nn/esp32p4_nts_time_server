@@ -6,10 +6,15 @@
 
 #include "esp_timer.h"
 
-#define APP_NTP_MAX_CLIENTS                     32U
+/* Distinct client addresses tracked; least-recently-seen is evicted. */
+#define APP_NTP_MAX_CLIENTS                     128U
 #define APP_NTP_RATE_BURST                      8U
 #define APP_NTP_RATE_PER_MINUTE                 30U
 #define APP_NTP_CLIENT_IDLE_US                  900000000LL
+/* A rate-limited client gets at most one RATE KoD per interval; further
+ * excess requests are dropped silently so KoD replies cannot themselves be
+ * used to generate a steady reply stream. */
+#define APP_NTP_KOD_INTERVAL_US                 5000000LL
 
 typedef struct {
     bool in_use;
@@ -18,6 +23,7 @@ typedef struct {
     uint32_t tokens;
     int64_t last_refill_us;
     int64_t last_seen_us;
+    int64_t last_kod_us;
 } ntp_rate_client_t;
 
 static ntp_rate_client_t s_clients[APP_NTP_MAX_CLIENTS];
@@ -80,6 +86,7 @@ static ntp_rate_client_t *find_or_allocate_client(uint32_t client_ipv4,
             candidate->tokens = APP_NTP_RATE_BURST;
             candidate->last_refill_us = now_us;
             candidate->last_seen_us = now_us;
+            candidate->last_kod_us = 0;
             return candidate;
         }
 
@@ -93,6 +100,7 @@ static ntp_rate_client_t *find_or_allocate_client(uint32_t client_ipv4,
     oldest->tokens = APP_NTP_RATE_BURST;
     oldest->last_refill_us = now_us;
     oldest->last_seen_us = now_us;
+    oldest->last_kod_us = 0;
 
     return oldest;
 }
@@ -123,7 +131,10 @@ bool ntp_rate_limit_allow(uint32_t client_ipv4,
         return true;
     }
 
-    if (out_send_kod != NULL) {
+    if (out_send_kod != NULL &&
+        (client->last_kod_us == 0 ||
+         now_us - client->last_kod_us >= APP_NTP_KOD_INTERVAL_US)) {
+        client->last_kod_us = now_us;
         *out_send_kod = true;
     }
 

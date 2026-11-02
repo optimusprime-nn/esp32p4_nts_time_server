@@ -121,6 +121,24 @@ static esp_err_t append_extension(
     return ESP_OK;
 }
 
+/* Errors that mean "this cookie or Authenticator is not acceptable", as
+ * opposed to an internal failure (storage, clock, memory). Only the former
+ * warrants an NTS NAK; the client must not discard good cookies because the
+ * server had a transient fault. */
+static bool nak_error(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_NOT_FOUND:        /* unknown cookie master key */
+    case ESP_ERR_INVALID_CRC:      /* AES-SIV tag mismatch */
+    case ESP_ERR_INVALID_RESPONSE: /* cookie payload malformed */
+    case ESP_ERR_INVALID_SIZE:     /* cookie length wrong */
+    case ESP_ERR_INVALID_STATE:    /* cookie expired */
+        return true;
+    default:
+        return false;
+    }
+}
+
 static esp_err_t verify_request_impl(
     const uint8_t *packet,
     size_t packet_len,
@@ -164,44 +182,48 @@ static esp_err_t verify_request_impl(
         const uint8_t *body = &packet[offset + 4U];
         const size_t body_len = (size_t)field_len - 4U;
 
-        if (!auth_seen) {
-            switch (type) {
-            case NTS_EF_UNIQUE_IDENTIFIER:
-                if (uid != NULL ||
-                    body_len < 32U ||
-                    body_len > NTS_NTP_MAX_UID_LEN) {
-                    return ESP_ERR_INVALID_RESPONSE;
-                }
-                uid = body;
-                uid_len = body_len;
-                break;
+        /* Bytes after the Authenticator are not covered by it, so a client
+         * cannot legitimately send any (RFC 8915 section 5.6). */
+        if (auth_seen) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
 
-            case NTS_EF_COOKIE:
-                if (cookie != NULL ||
-                    body_len == 0U ||
-                    body_len > NTS_COOKIE_MAX_LEN) {
-                    return ESP_ERR_INVALID_RESPONSE;
-                }
-                cookie = body;
-                cookie_len = body_len;
-                break;
-
-            case NTS_EF_COOKIE_PLACEHOLDER:
-                if (placeholder_count < NTS_NTP_MAX_PLACEHOLDERS) {
-                    placeholder_lengths[placeholder_count++] = body_len;
-                }
-                break;
-
-            case NTS_EF_AUTHENTICATOR:
-                auth_seen = true;
-                auth_offset = offset;
-                auth_body = body;
-                auth_body_len = body_len;
-                break;
-
-            default:
-                break;
+        switch (type) {
+        case NTS_EF_UNIQUE_IDENTIFIER:
+            if (uid != NULL ||
+                body_len < 32U ||
+                body_len > NTS_NTP_MAX_UID_LEN) {
+                return ESP_ERR_INVALID_RESPONSE;
             }
+            uid = body;
+            uid_len = body_len;
+            break;
+
+        case NTS_EF_COOKIE:
+            if (cookie != NULL ||
+                body_len == 0U ||
+                body_len > NTS_COOKIE_MAX_LEN) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            cookie = body;
+            cookie_len = body_len;
+            break;
+
+        case NTS_EF_COOKIE_PLACEHOLDER:
+            if (placeholder_count < NTS_NTP_MAX_PLACEHOLDERS) {
+                placeholder_lengths[placeholder_count++] = body_len;
+            }
+            break;
+
+        case NTS_EF_AUTHENTICATOR:
+            auth_seen = true;
+            auth_offset = offset;
+            auth_body = body;
+            auth_body_len = body_len;
+            break;
+
+        default:
+            break;
         }
 
         offset += field_len;
@@ -233,9 +255,16 @@ static esp_err_t verify_request_impl(
     const uint8_t *nonce = &auth_body[4U];
     const uint8_t *ciphertext = &auth_body[4U + padded_nonce_len];
 
+    /* From here on the request is well formed. A failure to open the cookie
+     * or verify the Authenticator is answered with an NTS NAK, which echoes
+     * the Unique Identifier so the client can match it and re-run NTS-KE. */
     esp_err_t err = nts_cookie_unpack(cookie, cookie_len, &context->keys);
     if (err != ESP_OK) {
         nts_ntp_auth_clear_context(context);
+        memcpy(context->unique_id, uid, uid_len);
+        context->unique_id_len = uid_len;
+        context->request_length = packet_len;
+        context->nak_eligible = nak_error(err);
         return err;
     }
 
@@ -255,6 +284,10 @@ static esp_err_t verify_request_impl(
 
     if (err != ESP_OK) {
         nts_ntp_auth_clear_context(context);
+        memcpy(context->unique_id, uid, uid_len);
+        context->unique_id_len = uid_len;
+        context->request_length = packet_len;
+        context->nak_eligible = nak_error(err);
         return err;
     }
 
@@ -284,33 +317,14 @@ static esp_err_t verify_request_impl(
     return ESP_OK;
 }
 
-static esp_err_t protect_response_impl(
-    const nts_ntp_auth_context_t *context,
-    uint8_t *packet,
-    size_t base_packet_len,
-    size_t packet_capacity,
-    size_t *packet_len)
+static esp_err_t prepare_response_impl(nts_ntp_auth_context_t *context)
 {
-    if (context == NULL || packet == NULL || packet_len == NULL ||
-        !context->authenticated ||
-        base_packet_len != NTP_HEADER_LEN ||
-        packet_capacity < base_packet_len ||
-        packet_capacity > NTS_NTP_MAX_PACKET_SIZE) {
+    if (context == NULL || !context->authenticated) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t offset = base_packet_len;
-
-    esp_err_t err = append_extension(
-        packet,
-        packet_capacity,
-        &offset,
-        NTS_EF_UNIQUE_IDENTIFIER,
-        context->unique_id,
-        context->unique_id_len);
-    if (err != ESP_OK) {
-        return err;
-    }
+    context->response_prepared = false;
+    context->prepared_plaintext_len = 0U;
 
     uint16_t cookie_count = (uint16_t)(1U + context->valid_placeholders);
     if (cookie_count > (1U + NTS_NTP_MAX_PLACEHOLDERS)) {
@@ -324,7 +338,7 @@ static esp_err_t protect_response_impl(
         uint8_t cookie[NTS_COOKIE_MAX_LEN];
         size_t cookie_len = sizeof(cookie);
 
-        err = nts_cookie_create(&context->keys, cookie, &cookie_len);
+        esp_err_t err = nts_cookie_create(&context->keys, cookie, &cookie_len);
         if (err != ESP_OK) {
             memset(cookie, 0, sizeof(cookie));
             memset(s_plaintext, 0, sizeof(s_plaintext));
@@ -346,6 +360,44 @@ static esp_err_t protect_response_impl(
             return err;
         }
     }
+
+    context->prepared_plaintext_len = plaintext_len;
+    context->response_prepared = true;
+    return ESP_OK;
+}
+
+static esp_err_t protect_response_impl(
+    const nts_ntp_auth_context_t *context,
+    uint8_t *packet,
+    size_t base_packet_len,
+    size_t packet_capacity,
+    size_t *packet_len)
+{
+    if (context == NULL || packet == NULL || packet_len == NULL ||
+        !context->authenticated ||
+        !context->response_prepared ||
+        context->prepared_plaintext_len > sizeof(s_plaintext) ||
+        base_packet_len != NTP_HEADER_LEN ||
+        packet_capacity < base_packet_len ||
+        packet_capacity > NTS_NTP_MAX_PACKET_SIZE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t offset = base_packet_len;
+
+    esp_err_t err = append_extension(
+        packet,
+        packet_capacity,
+        &offset,
+        NTS_EF_UNIQUE_IDENTIFIER,
+        context->unique_id,
+        context->unique_id_len);
+    if (err != ESP_OK) {
+        memset(s_plaintext, 0, sizeof(s_plaintext));
+        return err;
+    }
+
+    const size_t plaintext_len = context->prepared_plaintext_len;
 
     uint8_t nonce[NTS_AES_SIV_NONCE_LEN];
     esp_fill_random(nonce, sizeof(nonce));
@@ -427,6 +479,56 @@ esp_err_t nts_ntp_auth_verify_request(
     return err;
 }
 
+esp_err_t nts_ntp_auth_build_nak(
+    const nts_ntp_auth_context_t *context,
+    uint8_t *packet,
+    size_t base_packet_len,
+    size_t packet_capacity,
+    size_t *packet_len)
+{
+    if (context == NULL || packet == NULL || packet_len == NULL ||
+        !context->nak_eligible ||
+        context->unique_id_len == 0U ||
+        base_packet_len != NTP_HEADER_LEN ||
+        packet_capacity < base_packet_len ||
+        packet_capacity > NTS_NTP_MAX_PACKET_SIZE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* RFC 8915 section 5.7: the NAK carries the Unique Identifier and nothing
+     * else; no cookies and no Authenticator. */
+    size_t offset = base_packet_len;
+    esp_err_t err = append_extension(
+        packet,
+        packet_capacity,
+        &offset,
+        NTS_EF_UNIQUE_IDENTIFIER,
+        context->unique_id,
+        context->unique_id_len);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Anti-amplification: the NAK is always smaller than the request, which
+     * also carried a cookie and an Authenticator; check anyway. */
+    if (offset > context->request_length) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    stats_increment(&s_stats.naks_sent);
+    *packet_len = offset;
+    return ESP_OK;
+}
+
+esp_err_t nts_ntp_auth_prepare_response(nts_ntp_auth_context_t *context)
+{
+    const esp_err_t err = prepare_response_impl(context);
+    if (err != ESP_OK) {
+        stats_increment(&s_stats.protection_failures);
+    }
+    return err;
+}
+
 esp_err_t nts_ntp_auth_protect_response(
     const nts_ntp_auth_context_t *context,
     uint8_t *packet,
@@ -447,6 +549,15 @@ esp_err_t nts_ntp_auth_protect_response(
 void nts_ntp_auth_clear_context(nts_ntp_auth_context_t *context)
 {
     if (context != NULL) {
+        if (context->response_prepared) {
+            /* Staged fresh cookies for a response that may not have been
+             * sealed (early-exit paths in the NTP loop). */
+            volatile uint8_t *staged = s_plaintext;
+            for (size_t i = 0U; i < sizeof(s_plaintext); ++i) {
+                staged[i] = 0U;
+            }
+        }
+
         volatile uint8_t *p = (volatile uint8_t *)context;
         for (size_t i = 0U; i < sizeof(*context); ++i) {
             p[i] = 0U;

@@ -22,6 +22,13 @@ typedef struct {
     size_t request_length;
     nts_cookie_keys_t keys;
     bool authenticated;
+    /* Set by nts_ntp_auth_prepare_response(): the fresh-cookie plaintext is
+     * staged in the module's static buffer (single NTP task owner). */
+    bool response_prepared;
+    size_t prepared_plaintext_len;
+    /* Set when verification failed on cookie or Authenticator validation of
+     * an otherwise well-formed request; unique_id holds the client UID. */
+    bool nak_eligible;
 } nts_ntp_auth_context_t;
 
 typedef struct {
@@ -30,6 +37,7 @@ typedef struct {
     uint32_t verification_failures;
     uint32_t protected_responses;
     uint32_t protection_failures;
+    uint32_t naks_sent;
 } nts_ntp_auth_stats_t;
 
 bool nts_ntp_auth_request_present(const uint8_t *packet, size_t packet_len);
@@ -39,6 +47,23 @@ esp_err_t nts_ntp_auth_verify_request(
     size_t packet_len,
     nts_ntp_auth_context_t *context);
 
+/* Appends the Unique Identifier to a caller-built NTS NAK header (KoD,
+ * stratum 0, refid "NTSN"). Valid only when verification left the context
+ * nak_eligible. */
+esp_err_t nts_ntp_auth_build_nak(
+    const nts_ntp_auth_context_t *context,
+    uint8_t *packet,
+    size_t base_packet_len,
+    size_t packet_capacity,
+    size_t *packet_len);
+
+/* Generates the 1+k fresh cookies for an authenticated request. Call before
+ * the response transmit timestamp is sampled: this is the costly part of
+ * response protection and does not depend on the NTP header. */
+esp_err_t nts_ntp_auth_prepare_response(nts_ntp_auth_context_t *context);
+
+/* Appends the UID and Authenticator over the already-built NTP header. The
+ * context must have been prepared with nts_ntp_auth_prepare_response(). */
 esp_err_t nts_ntp_auth_protect_response(
     const nts_ntp_auth_context_t *context,
     uint8_t *packet,

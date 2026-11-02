@@ -22,6 +22,10 @@
 
 esp_err_t nts_aes_siv_init(void);
 
+/* Known-answer test (RFC 5297 A.1 plus NTS-shaped vectors), including
+ * decrypt round trip and tag-tamper rejection. ESP_OK only if all pass. */
+esp_err_t nts_aes_siv_self_test(void);
+
 esp_err_t nts_aes_siv_encrypt(
     const uint8_t key[NTS_AES_SIV_KEY_LEN],
     const uint8_t *associated_data,

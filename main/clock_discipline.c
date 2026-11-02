@@ -30,19 +30,34 @@ static const char *TAG = "CLOCK";
 #define CLOCK_TIM_TP_POLL_DELAY_MS              10U
 #define CLOCK_TIM_TP_MAX_AGE_US                 1500000LL
 #define CLOCK_LOG_INTERVAL_US                   5000000LL
+/* Samples arrive once per second, and a TIM-TP record arriving late can
+ * push the gap just past one second. Only treat the reference as lost (and
+ * advertise holdover) after a few whole seconds without a sample, so a
+ * single late record does not flap the advertised stratum. Dispersion
+ * still grows from the last sample throughout. */
+#define CLOCK_HOLDOVER_ENTRY_SECONDS            3U
 
 typedef struct {
     bool initialized;
     bool solution_valid;
 
-    uint64_t anchor_capture_us;
+    /* PPS capture instants on the GPTimer timebase, in ns. */
+    uint64_t anchor_capture_ns;
     int64_t anchor_utc_seconds;
 
-    uint64_t last_sample_capture_us;
+    uint64_t last_sample_capture_ns;
     int64_t last_sample_utc_seconds;
 
+    /* The same instants in GPS seconds (UTC + leap seconds), which never
+     * repeat or skip. Continuity, frequency and phase are computed on this
+     * scale so a leap second is a clean step of the served UTC rather than
+     * an apparent 1 s timing error. */
+    int64_t anchor_gps_seconds;
+    int64_t last_sample_gps_seconds;
+    int8_t last_sample_leap_seconds;
+
     bool reference_timestamp_valid;
-    uint64_t reference_capture_us;
+    uint64_t reference_capture_ns;
     int64_t reference_utc_seconds;
 
     int64_t last_phase_error_ns;
@@ -60,6 +75,7 @@ typedef struct {
     uint16_t week;
     uint32_t tow_ms;
     int64_t utc_seconds;
+    int8_t leap_seconds;
     int32_t quantization_error_ns;
     app_leap_indicator_t leap_indicator;
 } clock_gnss_sample_t;
@@ -103,15 +119,28 @@ static void rate_limited_log(esp_log_level_t level, const char *text)
     }
 }
 
-static uint32_t calculate_holdover_seconds_locked(uint64_t now_capture_us)
+static uint32_t calculate_holdover_seconds_locked(uint64_t now_capture_ns)
 {
     if (!s_clock.solution_valid ||
-        now_capture_us < s_clock.last_sample_capture_us) {
+        now_capture_ns < s_clock.last_sample_capture_ns) {
         return 0U;
     }
 
     return (uint32_t)(
-        (now_capture_us - s_clock.last_sample_capture_us) / 1000000ULL);
+        (now_capture_ns - s_clock.last_sample_capture_ns) / 1000000000ULL);
+}
+
+/*
+ * Elapsed local time scaled to UTC: elapsed * (1 + f), in integer ns. Only
+ * the small frequency correction is floating point, so the result keeps
+ * full GPTimer resolution (a double holding absolute UTC seconds only
+ * resolves ~0.24 us).
+ */
+static int64_t corrected_elapsed_ns(uint64_t elapsed_ns, double frequency_ppm)
+{
+    const double correction_ns =
+        (double)elapsed_ns * (frequency_ppm / 1000000.0);
+    return (int64_t)elapsed_ns + (int64_t)llround(correction_ns);
 }
 
 static uint32_t calculate_dispersion_16_16_locked(uint32_t holdover_seconds)
@@ -141,12 +170,12 @@ static uint32_t calculate_dispersion_16_16_locked(uint32_t holdover_seconds)
 
 static void publish_state_locked(void)
 {
-    uint64_t now_capture_us = s_clock.last_sample_capture_us;
+    uint64_t now_capture_ns = s_clock.last_sample_capture_ns;
 
-    (void)pps_service_get_monotonic_us(&now_capture_us);
+    (void)pps_service_get_monotonic_ns(&now_capture_ns);
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     app_state_set_clock_solution(
         s_clock.state,
@@ -218,18 +247,38 @@ static bool tim_tp_to_utc(const gnss_service_status_t *status,
         return false;
     }
 
-    const int64_t gps_seconds =
+    /* Whole-second pulses only; anything else would mis-label the edge. */
+    if ((status->timing_tow_ms % 1000U) != 0U) {
+        return false;
+    }
+
+    const int64_t week_seconds =
         GPS_EPOCH_UNIX_SECONDS +
         ((int64_t)status->timing_week * GPS_WEEK_SECONDS) +
         ((int64_t)status->timing_tow_ms / 1000LL);
 
+    /* TIM-TP flags bit 0 is the time base. With a UTC base the week/TOW
+     * are already UTC. With a GNSS base they must be GPS time (refInfo low
+     * nibble 0; 15 means "not reported" and is treated as GPS, as before):
+     * GLONASS, BeiDou or Galileo time would be offset by many seconds. */
+    if ((status->timing_pulse_flags & 0x01U) != 0U) {
+        *out_utc_seconds = week_seconds;
+        return true;
+    }
+
+    const uint8_t time_ref_gnss = status->timing_pulse_ref_info & 0x0FU;
+    if (time_ref_gnss != 0U && time_ref_gnss != 0x0FU) {
+        return false;
+    }
+
     *out_utc_seconds =
-        gps_seconds - (int64_t)status->current_leap_seconds;
+        week_seconds - (int64_t)status->current_leap_seconds;
 
     return true;
 }
 
-static bool wait_for_gnss_sample(clock_gnss_sample_t *out_sample)
+static bool wait_for_gnss_sample(clock_gnss_sample_t *out_sample,
+                                 uint64_t pps_capture_ns)
 {
     if (out_sample == NULL) {
         return false;
@@ -256,8 +305,61 @@ static bool wait_for_gnss_sample(clock_gnss_sample_t *out_sample)
             status.timing_pulse_age_us < 0 ||
             status.timing_pulse_age_us > CLOCK_TIM_TP_MAX_AGE_US ||
             !tim_tp_is_new(&status)) {
+            /* Diagnostic only: log gate states without changing behavior. */
+            static int64_t last_gate_diag_us = 0;
+            const int64_t gate_now_us = esp_timer_get_time();
+            if (gate_now_us - last_gate_diag_us >= 5000000LL) {
+                last_gate_diag_us = gate_now_us;
+                ESP_LOGW("CLOCK",
+                         "SYNC_DIAG gate utc=%d pvt=%d fix=%d resolved=%d "
+                         "leap_valid=%d leap_state=%d offset=%d tp_valid=%d "
+                         "tp_age_us=%lld tp_new=%d week=%u tow_ms=%lu",
+                         (int)status.utc_valid,
+                         (int)status.utc_from_ubx_pvt,
+                         (int)status.gnss_fix_valid,
+                         (int)status.gnss_time_fully_resolved,
+                         (int)status.leap_information_valid,
+                         (int)status.leap_indicator,
+                         (int)status.current_leap_seconds,
+                         (int)status.timing_pulse_valid,
+                         (long long)status.timing_pulse_age_us,
+                         (int)tim_tp_is_new(&status),
+                         (unsigned)status.timing_week,
+                         (unsigned long)status.timing_tow_ms);
+            }
             vTaskDelay(pdMS_TO_TICKS(CLOCK_TIM_TP_POLL_DELAY_MS));
             continue;
+        }
+
+        /* UBX-TIM-TP describes the NEXT pulse and arrives several hundred
+         * ms before it. A record received after this edge belongs to the
+         * following pulse: using it would label this edge one second late
+         * (the record for this edge was lost or corrupted). Skip the edge. */
+        /* Fail-safe: u-blox documents TIM-TP as describing the next pulse.
+         * If this receiver ever delivers it after its edge instead, every
+         * edge would be skipped and the clock would never lock; after 10
+         * consecutive skips, stop applying this check for the boot. The
+         * continuity check in clock_discipline_submit_sample still rejects
+         * any mis-labelled second. */
+        static uint32_t s_pairing_skips;
+        static bool s_pairing_check_disabled;
+        uint64_t now_pps_ns = 0U;
+        if (!s_pairing_check_disabled &&
+            pps_service_get_monotonic_ns(&now_pps_ns) &&
+            now_pps_ns >= pps_capture_ns) {
+            const int64_t since_edge_ns = (int64_t)(now_pps_ns - pps_capture_ns);
+            const int64_t tim_tp_age_ns = status.timing_pulse_age_us * 1000LL;
+            if (tim_tp_age_ns <= since_edge_ns) {
+                if (++s_pairing_skips >= 10U) {
+                    s_pairing_check_disabled = true;
+                    ESP_LOGE(TAG, "TIM-TP consistently arrives after its PPS edge; "
+                                  "pairing check disabled, relying on continuity check");
+                }
+                rate_limited_log(ESP_LOG_WARN,
+                                 "TIM-TP for this PPS edge missing (next pulse's record arrived); edge skipped");
+                return false;
+            }
+            s_pairing_skips = 0U;
         }
 
         int64_t utc_seconds = 0;
@@ -285,6 +387,7 @@ static bool wait_for_gnss_sample(clock_gnss_sample_t *out_sample)
         out_sample->week = status.timing_week;
         out_sample->tow_ms = status.timing_tow_ms;
         out_sample->utc_seconds = utc_seconds;
+        out_sample->leap_seconds = status.current_leap_seconds;
         out_sample->quantization_error_ns = qerr_ns;
         out_sample->leap_indicator = status.leap_indicator;
 
@@ -292,7 +395,7 @@ static bool wait_for_gnss_sample(clock_gnss_sample_t *out_sample)
     }
 
     rate_limited_log(ESP_LOG_WARN,
-                     "new UBX-TIM-TP record did not arrive");
+                     "GNSS sample not eligible (check leap validity, UTC, PPS, TIM-TP freshness)");
 
     return false;
 }
@@ -341,15 +444,15 @@ static void enforce_holdover_policy(void)
         return;
     }
 
-    uint64_t now_capture_us = 0;
+    uint64_t now_capture_ns = 0;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us)) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns)) {
         unlock_clock();
         return;
     }
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     if (holdover_seconds > APP_HOLDOVER_MAX_SECONDS) {
         s_clock.solution_valid = false;
@@ -357,7 +460,7 @@ static void enforce_holdover_policy(void)
 
         ESP_LOGW(TAG,
                  "holdover limit exceeded; clock is fail-closed");
-    } else if (holdover_seconds > 0U &&
+    } else if (holdover_seconds >= CLOCK_HOLDOVER_ENTRY_SECONDS &&
                s_clock.state == APP_CLOCK_SYNCHRONIZED) {
         s_clock.state = APP_CLOCK_HOLDOVER;
     }
@@ -401,11 +504,12 @@ static void clock_monitor_task(void *arg)
                 pps_status_usable(&pps_status)) {
                 clock_gnss_sample_t gnss_sample;
 
-                if (wait_for_gnss_sample(&gnss_sample)) {
+                if (wait_for_gnss_sample(&gnss_sample, pps_event.capture_ns)) {
                     const esp_err_t err =
                         clock_discipline_submit_sample(
-                            pps_event.capture_us,
+                            pps_event.capture_ns,
                             gnss_sample.utc_seconds,
+                            gnss_sample.leap_seconds,
                             gnss_sample.quantization_error_ns,
                             gnss_sample.leap_indicator);
 
@@ -478,16 +582,20 @@ esp_err_t clock_discipline_init(void)
     return ESP_OK;
 }
 
-esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
+esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_ns,
                                          int64_t utc_seconds,
+                                         int8_t leap_seconds,
                                          int32_t timing_quantization_error_ns,
                                          app_leap_indicator_t leap_indicator)
 {
     if (!s_clock.initialized ||
-        pps_capture_us == 0U ||
-        utc_seconds <= 0) {
+        pps_capture_ns == 0U ||
+        utc_seconds <= 0 ||
+        leap_seconds < 0 || leap_seconds > 64) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    const int64_t gps_seconds = utc_seconds + (int64_t)leap_seconds;
 
     if (llabs((int64_t)timing_quantization_error_ns) >
         APP_CLOCK_MAX_TIMING_QERR_NS) {
@@ -504,14 +612,17 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
     }
 
     if (!s_clock.solution_valid) {
-        s_clock.anchor_capture_us = pps_capture_us;
+        s_clock.anchor_capture_ns = pps_capture_ns;
         s_clock.anchor_utc_seconds = utc_seconds;
+        s_clock.anchor_gps_seconds = gps_seconds;
 
-        s_clock.last_sample_capture_us = pps_capture_us;
+        s_clock.last_sample_capture_ns = pps_capture_ns;
         s_clock.last_sample_utc_seconds = utc_seconds;
+        s_clock.last_sample_gps_seconds = gps_seconds;
+        s_clock.last_sample_leap_seconds = leap_seconds;
 
         s_clock.reference_timestamp_valid = true;
-        s_clock.reference_capture_us = pps_capture_us;
+        s_clock.reference_capture_ns = pps_capture_ns;
         s_clock.reference_utc_seconds = utc_seconds;
 
         s_clock.last_phase_error_ns = timing_quantization_error_ns;
@@ -535,92 +646,107 @@ esp_err_t clock_discipline_submit_sample(uint64_t pps_capture_us,
         return ESP_OK;
     }
 
-    if (pps_capture_us <= s_clock.last_sample_capture_us ||
-        utc_seconds <= s_clock.last_sample_utc_seconds) {
+    /*
+     * Every check below rejects without touching the anchor, frequency or
+     * state, so one bad sample can never become the served time. Three
+     * consecutive rejects drop the clock to ACQUIRING (reject_sample_locked),
+     * which stops service and re-anchors from scratch on the next sample.
+     */
+    if (pps_capture_ns <= s_clock.last_sample_capture_ns ||
+        gps_seconds <= s_clock.last_sample_gps_seconds) {
         reject_sample_locked();
         unlock_clock();
         return ESP_ERR_INVALID_STATE;
     }
 
-    const uint64_t local_elapsed_us =
-        pps_capture_us - s_clock.last_sample_capture_us;
+    const uint64_t local_elapsed_ns =
+        pps_capture_ns - s_clock.last_sample_capture_ns;
 
-    const int64_t utc_elapsed_seconds =
-        utc_seconds - s_clock.last_sample_utc_seconds;
+    const int64_t gps_elapsed_seconds =
+        gps_seconds - s_clock.last_sample_gps_seconds;
 
-    if (utc_elapsed_seconds <= 0) {
+    /* Continuity: the labelled seconds must advance by exactly the number
+     * of whole seconds the local timer measured between the two edges. A
+     * mis-paired TIM-TP shows up here as a 1 s mismatch. */
+    const int64_t measured_whole_seconds =
+        (int64_t)((local_elapsed_ns + 500000000ULL) / 1000000000ULL);
+
+    if (gps_elapsed_seconds != measured_whole_seconds) {
+        rate_limited_log(ESP_LOG_WARN,
+                         "GNSS second label does not match elapsed PPS time; sample rejected");
         reject_sample_locked();
         unlock_clock();
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
-    const double expected_elapsed_us =
-        (double)utc_elapsed_seconds * 1000000.0;
+    const double expected_elapsed_ns =
+        (double)gps_elapsed_seconds * 1000000000.0;
 
     const double measured_period_error_ppm =
-        (((double)local_elapsed_us - expected_elapsed_us) /
-         expected_elapsed_us) * 1000000.0;
+        (((double)local_elapsed_ns - expected_elapsed_ns) /
+         expected_elapsed_ns) * 1000000.0;
 
     /*
      * The local counter runs fast when its measured interval exceeds one
-     * UTC second. The software timebase must therefore apply the opposite
+     * second. The software timebase must therefore apply the opposite
      * frequency correction.
      */
     const double target_frequency_ppm =
         -measured_period_error_ppm;
 
-    s_clock.frequency_ppm =
-        ((1.0 - APP_CLOCK_FREQUENCY_FILTER_GAIN) *
-         s_clock.frequency_ppm) +
-        (APP_CLOCK_FREQUENCY_FILTER_GAIN *
-         target_frequency_ppm);
+    /* Candidate frequency: seeded from the first measured interval (the
+     * filter would otherwise lock only ~60% converged), then filtered. */
+    double candidate_frequency_ppm =
+        (s_clock.accepted_samples <= 1U)
+            ? target_frequency_ppm
+            : ((1.0 - APP_CLOCK_FREQUENCY_FILTER_GAIN) * s_clock.frequency_ppm) +
+                  (APP_CLOCK_FREQUENCY_FILTER_GAIN * target_frequency_ppm);
 
-    if (s_clock.frequency_ppm > APP_CLOCK_MAX_FREQUENCY_PPM) {
-        s_clock.frequency_ppm = APP_CLOCK_MAX_FREQUENCY_PPM;
-    } else if (s_clock.frequency_ppm < -APP_CLOCK_MAX_FREQUENCY_PPM) {
-        s_clock.frequency_ppm = -APP_CLOCK_MAX_FREQUENCY_PPM;
+    if (candidate_frequency_ppm > APP_CLOCK_MAX_FREQUENCY_PPM) {
+        candidate_frequency_ppm = APP_CLOCK_MAX_FREQUENCY_PPM;
+    } else if (candidate_frequency_ppm < -APP_CLOCK_MAX_FREQUENCY_PPM) {
+        candidate_frequency_ppm = -APP_CLOCK_MAX_FREQUENCY_PPM;
     }
 
-    const uint64_t anchor_elapsed_us =
-        pps_capture_us - s_clock.anchor_capture_us;
-
-    const double predicted_utc_seconds =
-        (double)s_clock.anchor_utc_seconds +
-        ((double)anchor_elapsed_us / 1000000.0) *
-            (1.0 + (s_clock.frequency_ppm / 1000000.0));
+    /* Phase error = actual elapsed - predicted (corrected local) elapsed,
+     * in integer ns on the GPS scale. */
+    const uint64_t anchor_elapsed_ns =
+        pps_capture_ns - s_clock.anchor_capture_ns;
 
     const int64_t phase_error_ns =
-        (int64_t)llround(
-            ((double)utc_seconds - predicted_utc_seconds) *
-            1000000000.0) +
+        ((gps_seconds - s_clock.anchor_gps_seconds) * 1000000000LL) -
+        corrected_elapsed_ns(anchor_elapsed_ns, candidate_frequency_ppm) +
         (int64_t)timing_quantization_error_ns;
 
     if (llabs(phase_error_ns) >
         APP_CLOCK_MAX_ACCEPTABLE_ERROR_NS) {
-        s_clock.anchor_capture_us = pps_capture_us;
-        s_clock.anchor_utc_seconds = utc_seconds;
-
-        s_clock.last_sample_capture_us = pps_capture_us;
-        s_clock.last_sample_utc_seconds = utc_seconds;
-
         s_clock.last_phase_error_ns = phase_error_ns;
-        s_clock.frequency_ppm = 0.0;
-        s_clock.accepted_samples = 1U;
-
         reject_sample_locked();
         unlock_clock();
 
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    s_clock.anchor_capture_us = pps_capture_us;
-    s_clock.anchor_utc_seconds = utc_seconds;
+    if (leap_seconds != s_clock.last_sample_leap_seconds) {
+        ESP_LOGW(TAG,
+                 "leap second applied: UTC offset %d -> %d s at utc=%" PRId64,
+                 (int)s_clock.last_sample_leap_seconds, (int)leap_seconds,
+                 utc_seconds);
+    }
 
-    s_clock.last_sample_capture_us = pps_capture_us;
+    s_clock.frequency_ppm = candidate_frequency_ppm;
+
+    s_clock.anchor_capture_ns = pps_capture_ns;
+    s_clock.anchor_utc_seconds = utc_seconds;
+    s_clock.anchor_gps_seconds = gps_seconds;
+
+    s_clock.last_sample_capture_ns = pps_capture_ns;
     s_clock.last_sample_utc_seconds = utc_seconds;
+    s_clock.last_sample_gps_seconds = gps_seconds;
+    s_clock.last_sample_leap_seconds = leap_seconds;
 
     s_clock.reference_timestamp_valid = true;
-    s_clock.reference_capture_us = pps_capture_us;
+    s_clock.reference_capture_ns = pps_capture_ns;
     s_clock.reference_utc_seconds = utc_seconds;
 
     s_clock.last_phase_error_ns = phase_error_ns;
@@ -658,36 +784,34 @@ bool clock_discipline_get_ntp_timestamp(clock_ntp_timestamp_t *out_timestamp)
         return false;
     }
 
-    uint64_t now_capture_us = 0;
+    uint64_t now_capture_ns = 0;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us) ||
-        now_capture_us < s_clock.anchor_capture_us) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns) ||
+        now_capture_ns < s_clock.anchor_capture_ns) {
         unlock_clock();
         return false;
     }
 
-    const uint64_t elapsed_us =
-        now_capture_us - s_clock.anchor_capture_us;
+    const int64_t since_anchor_ns = corrected_elapsed_ns(
+        now_capture_ns - s_clock.anchor_capture_ns, s_clock.frequency_ppm);
 
-    const double utc_seconds =
-        (double)s_clock.anchor_utc_seconds +
-        ((double)elapsed_us / 1000000.0) *
-            (1.0 + (s_clock.frequency_ppm / 1000000.0));
-
-    if (utc_seconds < 0.0) {
+    if (s_clock.anchor_utc_seconds < 0 || since_anchor_ns < 0) {
         unlock_clock();
         return false;
     }
 
-    const uint64_t integer_seconds = (uint64_t)utc_seconds;
-    const double fractional_seconds =
-        utc_seconds - (double)integer_seconds;
+    const uint64_t integer_seconds =
+        (uint64_t)s_clock.anchor_utc_seconds +
+        (uint64_t)since_anchor_ns / 1000000000ULL;
+    const uint64_t remainder_ns =
+        (uint64_t)since_anchor_ns % 1000000000ULL;
 
     out_timestamp->seconds =
         (uint32_t)(integer_seconds + APP_NTP_EPOCH_DELTA);
 
+    /* remainder_ns < 1e9, so remainder_ns << 32 fits in 64 bits. */
     out_timestamp->fraction =
-        (uint32_t)(fractional_seconds * 4294967296.0);
+        (uint32_t)((remainder_ns << 32) / 1000000000ULL);
 
     unlock_clock();
 
@@ -715,10 +839,10 @@ bool clock_discipline_get_reference_timestamp(
         return false;
     }
 
-    uint64_t now_capture_us = s_clock.reference_capture_us;
+    uint64_t now_capture_ns = s_clock.reference_capture_ns;
 
-    if (!pps_service_get_monotonic_us(&now_capture_us) ||
-        now_capture_us < s_clock.reference_capture_us) {
+    if (!pps_service_get_monotonic_ns(&now_capture_ns) ||
+        now_capture_ns < s_clock.reference_capture_ns) {
         unlock_clock();
         return false;
     }
@@ -730,7 +854,7 @@ bool clock_discipline_get_reference_timestamp(
 
     if (out_age_seconds != NULL) {
         const uint64_t age_seconds =
-            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+            (now_capture_ns - s_clock.reference_capture_ns) / 1000000000ULL;
 
         *out_age_seconds = age_seconds > UINT32_MAX
                                ? UINT32_MAX
@@ -751,12 +875,12 @@ bool clock_discipline_get_status(clock_discipline_status_t *out_status)
         return false;
     }
 
-    uint64_t now_capture_us = s_clock.last_sample_capture_us;
+    uint64_t now_capture_ns = s_clock.last_sample_capture_ns;
 
-    (void)pps_service_get_monotonic_us(&now_capture_us);
+    (void)pps_service_get_monotonic_ns(&now_capture_ns);
 
     const uint32_t holdover_seconds =
-        calculate_holdover_seconds_locked(now_capture_us);
+        calculate_holdover_seconds_locked(now_capture_ns);
 
     out_status->initialized = s_clock.initialized;
     out_status->solution_valid = s_clock.solution_valid;
@@ -776,9 +900,9 @@ bool clock_discipline_get_status(clock_discipline_status_t *out_status)
     out_status->reference_utc_seconds = s_clock.reference_utc_seconds;
 
     if (out_status->reference_timestamp_valid &&
-        now_capture_us >= s_clock.reference_capture_us) {
+        now_capture_ns >= s_clock.reference_capture_ns) {
         const uint64_t reference_age_seconds =
-            (now_capture_us - s_clock.reference_capture_us) / 1000000ULL;
+            (now_capture_ns - s_clock.reference_capture_ns) / 1000000000ULL;
 
         out_status->reference_age_seconds =
             reference_age_seconds > UINT32_MAX

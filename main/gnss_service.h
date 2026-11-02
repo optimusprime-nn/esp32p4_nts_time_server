@@ -43,6 +43,9 @@ typedef struct {
     int32_t timing_tow_sub_ms;
     int32_t timing_quantization_error_ns;
     uint8_t timing_pulse_flags;
+    /* TIM-TP refInfo: low nibble is the GNSS time reference (0 = GPS) when
+     * flags bit 0 (time base) is 0. */
+    uint8_t timing_pulse_ref_info;
     int64_t timing_pulse_age_us;
 
     bool ubx_configuration_attempted;

@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "test_app_main.c"
+        "../../test_nts_aes_siv.c"
+        "../../../main/nts_aes_siv.c"
+    INCLUDE_DIRS
+        "../../../main"
+    REQUIRES
+        unity
+        mbedtls
+    WHOLE_ARCHIVE
+)

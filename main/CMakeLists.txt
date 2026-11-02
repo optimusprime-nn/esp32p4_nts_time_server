@@ -3,6 +3,12 @@ idf_component_register(
         "app_main.c"
         "app_state.c"
         "device_config.c"
+        "hardware_profile.c"
+        "commissioning.c"
+        "operations_history.c"
+        "ota_manager.c"
+        "sd_storage.c"
+        "management_ownership.c"
         "cloudflare_client.c"
         "acme_client.c"
         "acme_storage.c"
@@ -37,16 +43,16 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_gptimer
         esp_driver_uart
+        fatfs
+        sdmmc
         esp_hw_support
         nvs_flash
         bootloader_support
+        app_update
+        efuse
         freertos
         lwip
         log
         espressif__ip101
 
-    EMBED_TXTFILES
-        "servercert.pem"
-        "serverkey.pem"
-        "management_ca.pem"
 )

@@ -99,14 +99,6 @@ config APP_NTS_MAX_PACKET_SIZE
     range 128 2048
     default 512
 
-config APP_ENABLE_NTS
-    bool "Enable Network Time Security"
-    default n
-    help
-        Keep disabled until PSA Crypto AES-SIV, NTS cookies,
-        authenticated NTP extension handling, TLS 1.3 NTS-KE,
-        ALPN ntske/1, and interoperability testing are complete.
-
 config APP_ENABLE_INTERLEAVED
     bool "Enable NTP interleaved mode"
     default n
@@ -130,16 +122,33 @@ config APP_ENABLE_MANAGEMENT_API
     bool "Enable management API"
     default n
 
-config APP_ENABLE_NTS_UART_PROVISIONING
-    bool "Enable temporary UART NTS provisioning"
-    default n
+config APP_SD_STORAGE_ENABLE
+    bool "Enable onboard SD-card operational storage (SDMMC 4-bit)"
+    default y
     help
-        Enables local UART commands for TLS certificate and private-key
-        provisioning. Disable after provisioning is complete.
+        Enables the JC-ESP32P4-M3 onboard SD socket using native 4-bit SDMMC:
+        D0 GPIO39, D1 GPIO40, D2 GPIO41, D3 GPIO42, CLK GPIO43, CMD GPIO44.
+        ESP_LDO_VO4 / on-chip LDO channel 4 supplies the SD domain.
+        This is operations-plane storage only and is never a timing source,
+        timing authority, or dependency of NTP/NTS/GNSS/PPS operation.
 
-config APP_NTS_PROVISION_UART
-    int "UART used for temporary NTS provisioning"
-    range 0 9
-    default 0
+if APP_SD_STORAGE_ENABLE
+
+config APP_SD_MAX_ARCHIVE_FILES
+    int "Maximum retained boot archive files"
+    range 8 512
+    default 128
+    help
+        Oldest boot archive files are deleted first when this limit is exceeded.
+
+config APP_SD_MIN_FREE_MIB
+    int "Minimum free-space reserve (MiB)"
+    range 8 4096
+    default 64
+    help
+        When free space falls below this reserve, the oldest archive is removed.
+        Timing services are never blocked by retention work or storage failure.
+
+endif
 
 endmenu

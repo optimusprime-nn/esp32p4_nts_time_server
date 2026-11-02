@@ -1,4 +1,5 @@
 #include "pps_service.h"
+#include "hardware_profile.h"
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -32,9 +33,19 @@ static portMUX_TYPE s_pps_lock = portMUX_INITIALIZER_UNLOCKED;
 static pps_service_status_t s_status;
 static uint64_t s_previous_capture_us;
 
+_Static_assert((1000000000ULL % APP_PPS_TIMER_RESOLUTION_HZ) == 0ULL,
+               "PPS timer resolution must divide 1 GHz for exact ns conversion");
+
+#define PPS_NS_PER_TICK (1000000000ULL / APP_PPS_TIMER_RESOLUTION_HZ)
+
+static uint64_t ticks_to_ns(uint64_t ticks)
+{
+    return ticks * PPS_NS_PER_TICK;
+}
+
 static uint64_t ticks_to_us(uint64_t ticks)
 {
-    return (ticks * 1000000ULL) / APP_PPS_TIMER_RESOLUTION_HZ;
+    return ticks_to_ns(ticks) / 1000ULL;
 }
 
 static void IRAM_ATTR pps_gpio_isr(void *arg)
@@ -57,6 +68,7 @@ static void IRAM_ATTR pps_gpio_isr(void *arg)
 
     const pps_capture_event_t event = {
         .capture_ticks = captured_ticks,
+        .capture_ns = ticks_to_ns(captured_ticks),
         .capture_us = ticks_to_us(captured_ticks),
     };
 
@@ -114,7 +126,7 @@ static esp_err_t pps_configure_etm_capture(void)
                         "create GPIO ETM event");
 
     ESP_RETURN_ON_ERROR(gpio_etm_event_bind_gpio(s_gpio_etm_event,
-                                                 APP_PPS_GPIO),
+                                                 hardware_profile_pps_gpio()),
                         TAG,
                         "bind GPIO ETM event");
 
@@ -155,7 +167,7 @@ static esp_err_t pps_configure_gpio_interrupt(void)
      * gpio_config() function.
      */
     const gpio_config_t pps_gpio_config = {
-        .pin_bit_mask = (1ULL << APP_PPS_GPIO),
+        .pin_bit_mask = (1ULL << hardware_profile_pps_gpio()),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -176,7 +188,7 @@ static esp_err_t pps_configure_gpio_interrupt(void)
         return err;
     }
 
-    return gpio_isr_handler_add((gpio_num_t)APP_PPS_GPIO,
+    return gpio_isr_handler_add((gpio_num_t)hardware_profile_pps_gpio(),
                                 pps_gpio_isr,
                                 NULL);
 }
@@ -216,7 +228,7 @@ esp_err_t pps_service_init(void)
 
     ESP_LOGI(TAG,
              "PPS ETM capture active: GPIO=%d resolution=%u Hz",
-             APP_PPS_GPIO,
+             hardware_profile_pps_gpio(),
              APP_PPS_TIMER_RESOLUTION_HZ);
 
     return ESP_OK;
@@ -312,6 +324,22 @@ bool pps_service_get_monotonic_us(uint64_t *out_us)
     }
 
     *out_us = ticks_to_us(raw_ticks);
+    return true;
+}
+
+bool pps_service_get_monotonic_ns(uint64_t *out_ns)
+{
+    if (out_ns == NULL || s_gptimer == NULL) {
+        return false;
+    }
+
+    uint64_t raw_ticks = 0;
+
+    if (gptimer_get_raw_count(s_gptimer, &raw_ticks) != ESP_OK) {
+        return false;
+    }
+
+    *out_ns = ticks_to_ns(raw_ticks);
     return true;
 }
 

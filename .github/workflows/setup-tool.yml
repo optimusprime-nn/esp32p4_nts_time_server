@@ -1,0 +1,29 @@
+name: Setup tool tests
+
+on:
+  push:
+    branches: [main]
+    paths: ["tools/setup/**", ".github/workflows/setup-tool.yml"]
+  pull_request:
+    paths: ["tools/setup/**", ".github/workflows/setup-tool.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tools/setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v

@@ -14,6 +14,7 @@ typedef struct {
     bool started;
     bool link_up;
     bool ipv4_ready;
+    bool ipv4_static;
 
     bool ptp_supported;
     bool ptp_enabled;
@@ -29,6 +30,16 @@ typedef struct {
     uint32_t ptp_utc_bracket_ns;
 
     bool rx_hw_timestamp_all_enabled;
+    /* Observe-only Ethernet datapath counters (monotonic since init). */
+    uint32_t diag_rx_frames;
+    uint32_t diag_rx_arp;
+    uint32_t diag_rx_dhcp;
+    uint32_t diag_rx_forward_fail;
+    uint32_t diag_tx_other_attempt;
+    uint32_t diag_tx_other_fail;
+    uint32_t diag_link_up_events;
+    uint32_t diag_link_down_events;
+    uint32_t diag_got_ip_events;
     uint32_t rx_hw_frames;
     uint32_t rx_hw_timestamp_valid;
     uint32_t rx_hw_timestamp_invalid;
@@ -43,6 +54,12 @@ typedef struct {
     uint32_t rx_hw_queue_overruns;
     uint32_t rx_hw_queue_matches;
     uint32_t rx_hw_queue_misses;
+    uint32_t rx_hw_queue_stale_purges;
+    int64_t tx_compensation_ns;
+    uint32_t tx_compensation_samples;
+    int32_t nts_tx_bias_ns;
+    uint32_t nts_tx_bias_samples;
+    int64_t nts_tx_last_residual_ns;
     uint32_t rx_hw_map_successes;
     uint32_t rx_hw_map_failures;
     uint32_t rx_hw_last_map_bracket_ns;
@@ -66,6 +83,12 @@ esp_err_t eth_service_start(void);
 void eth_service_wait_for_ip(void);
 
 bool eth_service_get_status(eth_service_status_t *out_status);
+/* DNS servers the interface is using now (from DHCP or static), network
+ * byte order; 0 when none. */
+void eth_service_get_dns_in_use(uint32_t *out_main, uint32_t *out_backup);
+
+void eth_service_diag_log_phy_snapshot(void);
+void eth_service_diag_log_emac_snapshot(void);
 
 typedef struct {
     uint32_t seconds;
@@ -84,6 +107,23 @@ typedef struct {
 bool eth_service_take_ntp_rx_timestamp(uint32_t client_ipv4,
                                        uint16_t client_port,
                                        eth_service_ntp_rx_timestamp_t *out_timestamp);
+
+/* Learned delay from sampling an NTS response's T3 to its hardware transmit
+ * time, in ns (0 until learned). The NTP task adds it to NTS T3, which cannot
+ * be late-stamped because it is covered by the NTS Authenticator. */
+int32_t eth_service_get_nts_tx_bias_ns(void);
+
+/* Hardware wire times of the peer monitor's last request to peer_ipv4 sent
+ * from local_port (T1) and of its reply (T4), as disciplined time in NTP-era
+ * nanoseconds (seconds since 1900 * 1e9). Consumes both entries. Returns
+ * false, leaving the caller on software stamps, if either was not captured
+ * or the PTP/UTC mapping is not established and fresh. peer_ipv4 uses the
+ * sockaddr_in.sin_addr.s_addr representation; local_port is host order. */
+bool eth_service_take_peer_timestamps(uint32_t peer_ipv4, uint16_t local_port,
+                                      uint64_t *out_t1_ns, uint64_t *out_t4_ns);
+
+/* Stage B5: diagnostic only; call from a dedicated non-timing task. */
+esp_err_t eth_service_diag_restart_driver(void);
 
 #ifdef __cplusplus
 }

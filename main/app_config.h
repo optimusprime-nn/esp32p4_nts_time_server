@@ -102,7 +102,10 @@
 #define APP_HOLDOVER_MAX_SECONDS                CONFIG_APP_HOLDOVER_MAX_SECONDS
 #define APP_PPS_TIMEOUT_MS                      CONFIG_APP_PPS_TIMEOUT_MS
 
-#define APP_PPS_TIMER_RESOLUTION_HZ             1000000U
+/* 20 MHz = 50 ns per tick. Divides both the 40 MHz XTAL and the 80 MHz PLL
+ * GPTimer sources, and 1e9 / 20e6 is an integer so ticks convert to ns
+ * exactly. Was 1 MHz (1 us quantisation of every PPS edge). */
+#define APP_PPS_TIMER_RESOLUTION_HZ             20000000U
 #define APP_PPS_NOMINAL_INTERVAL_US             1000000ULL
 #define APP_PPS_MIN_INTERVAL_US                 800000ULL
 #define APP_PPS_MAX_INTERVAL_US                 1200000ULL

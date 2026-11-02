@@ -15,6 +15,8 @@ typedef enum {
     NTP_PEER_HEALTH_DISABLED = 0,
     NTP_PEER_HEALTH_UNKNOWN,
     NTP_PEER_HEALTH_HEALTHY,
+    NTP_PEER_HEALTH_WARNING,
+    NTP_PEER_HEALTH_CRITICAL,
     NTP_PEER_HEALTH_DEGRADED,
     NTP_PEER_HEALTH_UNREACHABLE,
     NTP_PEER_HEALTH_DIVERGENT,
@@ -25,6 +27,7 @@ typedef enum {
 typedef struct {
     bool configured;
     char server[APP_NTP_PEER_SERVER_MAX_LENGTH + 1U];
+    char resolved_address[16];
     ntp_peer_health_t health;
     uint8_t reachability;
     uint8_t stratum;
@@ -52,6 +55,8 @@ typedef struct {
     uint32_t samples;
     uint32_t rolling_samples;
     uint32_t last_success_age_seconds;
+    /* Samples whose T1/T4 came from EMAC hardware stamps, not software. */
+    uint32_t hw_timestamped_samples;
 } ntp_peer_status_t;
 
 typedef struct {
