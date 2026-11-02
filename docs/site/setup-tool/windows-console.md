@@ -55,7 +55,8 @@ not shown as you type.
     - Answer `n` to *Set a static address on the board?* to keep DHCP. Reserve
       the address on your router.
     - Answer `y` to enter a static address, netmask, gateway and DNS server.
-      Confirm, and the board restarts on the new address.
+      Up to two DNS servers can be given, separated by a comma. Confirm, and
+      the board restarts on the new address.
 10. **Step 7 of 9: DNS and Cloudflare.**
 
     ```text

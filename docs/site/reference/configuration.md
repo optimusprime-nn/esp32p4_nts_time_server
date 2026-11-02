@@ -30,7 +30,7 @@ the [API](api.md). All except the renewal switch are included in
 | Address | A usable host address in the subnet | |
 | Netmask | Contiguous, from /8 to /30 | |
 | Gateway | Inside the subnet | |
-| DNS server | Optional | |
+| DNS servers | Optional. Up to two IPv4 addresses separated by a comma, for example `192.168.1.1, 1.1.1.1`. Addresses only: the board needs a DNS server before it can look up a name | Applies only with a static address. The console shows the servers in use now, including those from DHCP |
 
 Changes apply at the next reboot. A stored value that turns out to be invalid,
 or a failure applying it, makes the board fall back to DHCP.

@@ -53,7 +53,8 @@
 12. **Done.** The window lists:
     - the administrator certificate thumbprint (for the update script);
     - the console address, for example `https://ts1.example.com/`;
-    - the credentials folder.
+    - the credentials folder;
+    - numbered steps for [opening the console in your browser](index.md#opening-the-console-in-a-browser).
 
     Click **Close**.
 

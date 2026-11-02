@@ -70,6 +70,49 @@ every board.
     Store the folder and its password somewhere safe, outside any code
     repository.
 
+## Opening the console in a browser
+
+The last screen of setup shows these steps for your system. The console only
+opens for a browser that has your administrator certificate.
+
+=== "Windows: Edge or Chrome"
+
+    If you left **Install the administrator certificate in Windows** ticked, skip
+    to step 5.
+
+    1. Double-click `admin-client.p12` in your credentials folder to open the
+       Certificate Import Wizard.
+    2. Choose **Current User**, then **Next**, then **Next** again.
+    3. Enter the password you chose in setup. Leave the other options as they
+       are, then **Next**.
+    4. Choose **Automatically select the certificate store**, then **Next** and
+       **Finish**.
+    5. Open `https://ts1.example.com/` (your board's name).
+    6. When asked to choose a certificate, pick **ntp-admin** (issued by ESP32-P4
+       Management CA) and click **OK**.
+
+=== "Linux: Chrome or Chromium"
+
+    1. Open **Settings > Privacy and security > Security > Manage certificates**.
+    2. Under **Your certificates**, click **Import** and choose
+       `admin-client.p12` from your credentials folder.
+    3. Enter the password you chose in setup.
+    4. Open `https://ts1.example.com/` and pick **ntp-admin** when asked.
+
+=== "Firefox (any system)"
+
+    Firefox keeps its own certificates, even on Windows.
+
+    1. Open **Settings > Privacy & Security**, scroll to **Certificates** and
+       click **View Certificates**.
+    2. On **Your Certificates**, click **Import** and choose `admin-client.p12`.
+    3. Enter the password you chose in setup.
+    4. Open `https://ts1.example.com/` and pick **ntp-admin** when asked.
+
+If you get a connection error instead of the certificate question, close every
+window of the browser and open it again. Browsers remember a "no certificate"
+choice until they restart.
+
 ## Running it again
 
 If setup stops, fix the problem it describes and run it again:

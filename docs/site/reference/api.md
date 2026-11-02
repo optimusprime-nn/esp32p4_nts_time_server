@@ -122,7 +122,7 @@ production certificate operation or a TLS hand-over is in progress.
 |---|---|---|---|
 | GET | `/api/v1/config` | Current settings: hostname, Cloudflare (without the token; `api_token_present` only), peer monitor, redundant server, network | |
 | PUT | `/api/v1/config/hostname` | Set the hostname | `{"hostname":"ts1"}` |
-| PUT | `/api/v1/config/network` | DHCP or static IPv4. Applies at the next reboot | `{"static_ipv4_enabled":true,"address":"192.0.2.10","netmask":"255.255.255.0","gateway":"192.0.2.1","dns":"192.0.2.1"}`. With `false`, the other fields are ignored |
+| PUT | `/api/v1/config/network` | DHCP or static IPv4. Applies at the next reboot | `{"static_ipv4_enabled":true,"address":"192.0.2.10","netmask":"255.255.255.0","gateway":"192.0.2.1","dns":"192.0.2.1, 1.1.1.1"}`. `dns` holds up to two addresses separated by a comma (names are refused). With `false`, the other fields are ignored. `GET /api/v1/config` returns them as `network.dns`, and the servers in use now (including from DHCP) as `network.dns_in_use` |
 | PUT | `/api/v1/config/peer-monitor` | General peer monitoring | `enabled`, `poll_interval_seconds` (4–3600), `response_timeout_ms` (250–10000), and `peer0_enabled`/`peer0` to `peer2_enabled`/`peer2` (all six required) |
 | PUT | `/api/v1/config/redundant-server` | The redundant time server | `{"enabled":true,"server":"ts2.example.com","warning_ns":100000,"critical_ns":1000000}` |
 | PUT | `/api/v1/config/cloudflare` | Store the Cloudflare token and zone | `{"api_token":"...","zone_name":"example.com","zone_id":"<32 hex>"}`. `zone_id` is optional: if it is left out the board looks it up with the token (needs Zone:Read), which also checks the token works from the board. A supplied `zone_id` is stored without that check |
