@@ -222,5 +222,16 @@ class Firmware(unittest.TestCase):
             self.assertEqual(core.find_firmware(d), p)
 
 
+
+
+class ProductionFingerprint(unittest.TestCase):
+    def test_server_certificate_line_is_pinned_upper_case(self):
+        info = BootInfo()
+        core.parse_console_line("I (900) OWNERSHIP: Management ownership is provisioned; mTLS", info)
+        core.parse_console_line("I (4000) ETH: DHCP IPv4 acquired: 192.0.2.12", info)
+        core.parse_console_line("W (5000) WEB: Server certificate SHA-256: " + "ef" * 32, info)
+        self.assertTrue(info.complete())
+        self.assertEqual(info.fingerprint, "EF" * 32)
+
 if __name__ == "__main__":
     unittest.main()

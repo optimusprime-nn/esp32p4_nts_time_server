@@ -47,7 +47,9 @@ class SetupError(Exception):
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RE_CODE = re.compile(r"enrollment code:\s*([0-9A-F]{32})\b")
-RE_FINGERPRINT = re.compile(r"Bootstrap certificate SHA-256:\s*([0-9A-F]{64})\b")
+# The certificate the board is serving: its bootstrap certificate, or (on a
+# claimed board that already has one) its production certificate.
+RE_FINGERPRINT = re.compile(r"(?:Bootstrap|Server) certificate SHA-256:\s*([0-9A-Fa-f]{64})\b")
 RE_IPV4 = re.compile(r"(?:DHCP|Static) IPv4 acquired:\s*(\d{1,3}(?:\.\d{1,3}){3})")
 RE_PROVISIONED = re.compile(r"Management ownership is provisioned")
 RE_VERSION = re.compile(r"App version:\s*(\S+)")
@@ -74,7 +76,7 @@ def parse_console_line(line: str, info: BootInfo) -> None:
     if (m := RE_CODE.search(text)):
         info.enrollment_code = m.group(1)
     if (m := RE_FINGERPRINT.search(text)):
-        info.fingerprint = m.group(1)
+        info.fingerprint = m.group(1).upper()
     if (m := RE_IPV4.search(text)):
         info.ip = m.group(1)
     if RE_PROVISIONED.search(text):

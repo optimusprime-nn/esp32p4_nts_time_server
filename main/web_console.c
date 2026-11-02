@@ -5641,6 +5641,10 @@ static esp_err_t start_https_server(web_tls_source_t source)
              * Let's Encrypt certificate. */
             ESP_LOGW(TAG, "Bootstrap certificate SHA-256: %s", fingerprint);
         }
+    } else if (source == WEB_TLS_PRODUCTION && s_active_server_leaf_sha256[0] != '\0') {
+        /* Lets the setup tool pin a claimed board that already holds a
+         * production certificate, for example after a settings reset. */
+        ESP_LOGW(TAG, "Server certificate SHA-256: %s", s_active_server_leaf_sha256);
     }
     return ESP_OK;
 }

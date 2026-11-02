@@ -78,6 +78,16 @@ class Session:
             self.log("Claiming the board...")
             Board(b.ip, pin=b.fingerprint).claim(b.enrollment_code, creds.ca_cert.read_bytes())
             self.log("Claimed. The board restarts with management locked to your certificate.")
+            # Read the restart: a board that kept a production certificate from an
+            # earlier claim switches to it now, and prints that certificate's
+            # fingerprint instead.
+            try:
+                after = core.read_boot(self.port, reset=False, timeout=90, log=self.log)
+                if after.fingerprint:
+                    self.boot = after
+                    b = after
+            except SetupError as exc:
+                self.log(f"Could not read the restart ({exc}); using the enrollment fingerprint.")
         self.board = self._connect(b.ip)
         self.board.wait_ready(log=self.log)
         rec = self._rec()
