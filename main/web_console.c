@@ -3769,6 +3769,11 @@ static esp_err_t acme_production_certificate_export_handler(httpd_req_t *request
 
 static bool tls_transition_try_claim(void)
 {
+    /* Every HTTPS credential change passes through here. An unclaimed board
+     * stays on its bootstrap certificate, whose fingerprint is on the serial
+     * console for the setup tool to pin; switching it to a production
+     * certificate that survived a settings reset would defeat that. */
+    if (!management_ownership_is_provisioned()) return false;
     bool claimed = false;
     taskENTER_CRITICAL(&s_tls_transition_lock);
     if (!s_tls_transition_pending) {
