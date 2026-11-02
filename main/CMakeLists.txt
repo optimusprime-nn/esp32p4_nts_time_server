@@ -55,7 +55,4 @@ idf_component_register(
         log
         espressif__ip101
 
-    EMBED_TXTFILES
-        "servercert.pem"
-        "serverkey.pem"
 )

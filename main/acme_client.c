@@ -2091,6 +2091,246 @@ void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials)
     memset(credentials, 0, sizeof(*credentials));
 }
 
+/* ---------------------------------------------------------------------------
+ * Per-board bootstrap TLS identity.
+ *
+ * Used for HTTPS until the board has a production certificate: during
+ * enrollment and first commissioning. It is created on the board at first
+ * boot, so published firmware images carry no private key. The SHA-256 of the
+ * certificate is printed on the serial console next to the enrollment code;
+ * the setup tool pins it, which is what makes the enrollment TLS session
+ * trustworthy. Stored in the encrypted nvs_certs partition so it is stable
+ * across reboots and OTA updates.
+ * ------------------------------------------------------------------------- */
+#define BOOTSTRAP_NVS_NAMESPACE "boot_tls"
+#define BOOTSTRAP_NVS_CERT_KEY  "crt"
+#define BOOTSTRAP_NVS_KEY_KEY   "key"
+#define BOOTSTRAP_CERT_MAX      768U
+
+static uint8_t s_bootstrap_der[BOOTSTRAP_CERT_MAX];
+static size_t s_bootstrap_der_len;
+static uint8_t s_bootstrap_key[32];
+static bool s_bootstrap_ready;
+
+static esp_err_t build_bootstrap_cert_der(const uint8_t private_key[32], const uint8_t public_key[65],
+                                          uint8_t *out, size_t out_size, size_t *out_len)
+{
+    static const char common_name[] = "esp32p4-ntp-bootstrap";
+    static const uint8_t oid_cn[] = {0x06,0x03,0x55,0x04,0x03};
+    static const uint8_t oid_ec_pub[] = {0x06,0x07,0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01};
+    static const uint8_t oid_p256[] = {0x06,0x08,0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07};
+    static const uint8_t oid_ecdsa_sha256[] = {0x06,0x08,0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02};
+    static const uint8_t oid_san[] = {0x06,0x03,0x55,0x1D,0x11};
+    /* [0] { INTEGER 2 }: X.509 v3. */
+    static const uint8_t version3[] = {0xA0,0x03,0x02,0x01,0x02};
+    /* Validity 2024-01-01 to 2049-12-31 (UTCTime). The board's clock is
+     * irrelevant: the setup tool trusts this certificate by fingerprint. */
+    static const uint8_t validity[] = {
+        0x30,0x1E,
+        0x17,0x0D,0x32,0x34,0x30,0x31,0x30,0x31,0x30,0x30,0x30,0x30,0x30,0x30,0x5A,
+        0x17,0x0D,0x34,0x39,0x31,0x32,0x33,0x31,0x32,0x33,0x35,0x39,0x35,0x39,0x5A};
+    uint8_t a[768], b[768], c[768]; size_t al, bl, cl;
+
+    /* Name: CN=common_name (issuer and subject are the same). */
+    esp_err_t err = der_wrap(0x0CU, (const uint8_t *)common_name, strlen(common_name), a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_concat2(oid_cn, sizeof(oid_cn), a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x31U, a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, c, sizeof(c), &cl);
+    if (err != ESP_OK) return err;
+    uint8_t name[96]; size_t name_len = cl;
+    if (cl > sizeof(name)) return ESP_ERR_INVALID_SIZE;
+    memcpy(name, c, cl);
+
+    /* SubjectPublicKeyInfo. */
+    err = der_concat2(oid_ec_pub, sizeof(oid_ec_pub), oid_p256, sizeof(oid_p256), a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl);
+    uint8_t bitpub[66]; bitpub[0] = 0U; memcpy(bitpub + 1U, public_key, 65U);
+    if (err == ESP_OK) err = der_wrap(0x03U, bitpub, sizeof(bitpub), c, sizeof(c), &cl);
+    if (err == ESP_OK) err = der_concat2(b, bl, c, cl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl);
+    if (err != ESP_OK) return err;
+    uint8_t spki[128]; size_t spki_len = bl;
+    if (bl > sizeof(spki)) return ESP_ERR_INVALID_SIZE;
+    memcpy(spki, b, bl);
+
+    /* Extensions [3]: subjectAltName dNSName=common_name. */
+    err = der_wrap(0x82U, (const uint8_t *)common_name, strlen(common_name), a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x04U, b, bl, c, sizeof(c), &cl);
+    if (err == ESP_OK) err = der_concat2(oid_san, sizeof(oid_san), c, cl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, b, sizeof(b), &bl);
+    if (err == ESP_OK) err = der_wrap(0x30U, b, bl, c, sizeof(c), &cl);
+    if (err == ESP_OK) err = der_wrap(0xA3U, c, cl, a, sizeof(a), &al);
+    if (err != ESP_OK) return err;
+    uint8_t exts[96]; size_t exts_len = al;
+    if (al > sizeof(exts)) return ESP_ERR_INVALID_SIZE;
+    memcpy(exts, a, al);
+
+    /* Positive 16-byte random serial number. */
+    uint8_t serial_value[16];
+    esp_fill_random(serial_value, sizeof(serial_value));
+    serial_value[0] = (uint8_t)((serial_value[0] & 0x7FU) | 0x01U);
+    uint8_t serial[18]; size_t serial_len = 0U;
+    err = der_wrap(0x02U, serial_value, sizeof(serial_value), serial, sizeof(serial), &serial_len);
+    uint8_t sig_alg[16]; size_t sig_alg_len = 0U;
+    if (err == ESP_OK) err = der_wrap(0x30U, oid_ecdsa_sha256, sizeof(oid_ecdsa_sha256), sig_alg, sizeof(sig_alg), &sig_alg_len);
+    if (err != ESP_OK) return err;
+
+    /* TBSCertificate. */
+    size_t used = 0U;
+    const struct { const uint8_t *p; size_t n; } parts[] = {
+        {version3, sizeof(version3)}, {serial, serial_len}, {sig_alg, sig_alg_len},
+        {name, name_len}, {validity, sizeof(validity)}, {name, name_len},
+        {spki, spki_len}, {exts, exts_len},
+    };
+    for (size_t i = 0U; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+        if (used + parts[i].n > sizeof(a)) return ESP_ERR_INVALID_SIZE;
+        memcpy(a + used, parts[i].p, parts[i].n);
+        used += parts[i].n;
+    }
+    err = der_wrap(0x30U, a, used, b, sizeof(b), &bl);
+    if (err != ESP_OK) return err;
+
+    uint8_t digest[32], raw_sig[64], der_sig[80]; size_t der_sig_len = 0U;
+    err = sha256_bytes(b, bl, digest);
+    if (err == ESP_OK) err = sign_es256(private_key, digest, raw_sig);
+    memset(digest, 0, sizeof(digest));
+    if (err == ESP_OK) err = ecdsa_raw_to_der(raw_sig, der_sig, sizeof(der_sig), &der_sig_len);
+    memset(raw_sig, 0, sizeof(raw_sig));
+    if (err != ESP_OK) return err;
+    uint8_t sigbits[81];
+    if (der_sig_len + 1U > sizeof(sigbits)) return ESP_ERR_INVALID_SIZE;
+    sigbits[0] = 0U; memcpy(sigbits + 1U, der_sig, der_sig_len);
+    err = der_wrap(0x03U, sigbits, der_sig_len + 1U, c, sizeof(c), &cl);
+    if (err == ESP_OK) err = der_concat3(b, bl, sig_alg, sig_alg_len, c, cl, a, sizeof(a), &al);
+    if (err == ESP_OK) err = der_wrap(0x30U, a, al, out, out_size, out_len);
+    return err;
+}
+
+static esp_err_t pem_encode_certificate(const uint8_t *der, size_t der_len, char **out_pem, size_t *out_length)
+{
+    static const char begin[] = "-----BEGIN CERTIFICATE-----\n";
+    static const char end[] = "-----END CERTIFICATE-----\n";
+    const size_t b64_len = ((der_len + 2U) / 3U) * 4U;
+    const size_t total = sizeof(begin) - 1U + b64_len + b64_len / 64U + 1U + sizeof(end) - 1U + 1U;
+    char *pem = calloc(1U, total);
+    if (pem == NULL) return ESP_ERR_NO_MEM;
+    size_t o = sizeof(begin) - 1U;
+    memcpy(pem, begin, o);
+    size_t line = 0U;
+    for (size_t i = 0U; i < der_len; i += 3U) {
+        const uint32_t x = der[i];
+        const uint32_t y = i + 1U < der_len ? der[i + 1U] : 0U;
+        const uint32_t z = i + 2U < der_len ? der[i + 2U] : 0U;
+        const uint32_t v = (x << 16) | (y << 8) | z;
+        pem[o++] = s_b64[(v >> 18) & 63U];
+        pem[o++] = s_b64[(v >> 12) & 63U];
+        pem[o++] = i + 1U < der_len ? s_b64[(v >> 6) & 63U] : '=';
+        pem[o++] = i + 2U < der_len ? s_b64[v & 63U] : '=';
+        line += 4U;
+        if (line == 64U) { pem[o++] = '\n'; line = 0U; }
+    }
+    if (line != 0U) pem[o++] = '\n';
+    memcpy(pem + o, end, sizeof(end) - 1U);
+    o += sizeof(end) - 1U;
+    pem[o] = '\0';
+    *out_pem = pem;
+    *out_length = o + 1U;
+    return ESP_OK;
+}
+
+static esp_err_t bootstrap_ensure(void)
+{
+    if (s_bootstrap_ready) return ESP_OK;
+    nvs_handle_t handle = 0;
+    bool have_handle = false;
+    bool stored = false;
+    if (acme_storage_init() == ESP_OK &&
+        nvs_open_from_partition("nvs_certs", BOOTSTRAP_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        have_handle = true;
+        size_t der_len = sizeof(s_bootstrap_der), key_len = sizeof(s_bootstrap_key);
+        if (nvs_get_blob(handle, BOOTSTRAP_NVS_CERT_KEY, s_bootstrap_der, &der_len) == ESP_OK &&
+            nvs_get_blob(handle, BOOTSTRAP_NVS_KEY_KEY, s_bootstrap_key, &key_len) == ESP_OK &&
+            key_len == sizeof(s_bootstrap_key) && der_len > 0U) {
+            s_bootstrap_der_len = der_len;
+            stored = true;
+        }
+    }
+
+    if (!stored) {
+        uint8_t public_key[65];
+        esp_err_t err = generate_certificate_key(s_bootstrap_key, public_key);
+        if (err == ESP_OK) {
+            err = build_bootstrap_cert_der(s_bootstrap_key, public_key, s_bootstrap_der,
+                                           sizeof(s_bootstrap_der), &s_bootstrap_der_len);
+        }
+        memset(public_key, 0, sizeof(public_key));
+        if (err == ESP_OK) {
+            /* Never store or serve a certificate mbedTLS cannot parse. */
+            mbedtls_x509_crt check;
+            mbedtls_x509_crt_init(&check);
+            if (mbedtls_x509_crt_parse_der(&check, s_bootstrap_der, s_bootstrap_der_len) != 0) err = ESP_ERR_INVALID_RESPONSE;
+            mbedtls_x509_crt_free(&check);
+        }
+        if (err != ESP_OK) {
+            memset(s_bootstrap_key, 0, sizeof(s_bootstrap_key));
+            if (have_handle) nvs_close(handle);
+            ESP_LOGE(TAG, "Bootstrap TLS certificate generation failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        esp_err_t store_err = ESP_ERR_INVALID_STATE;
+        if (have_handle) {
+            store_err = nvs_set_blob(handle, BOOTSTRAP_NVS_CERT_KEY, s_bootstrap_der, s_bootstrap_der_len);
+            if (store_err == ESP_OK) store_err = nvs_set_blob(handle, BOOTSTRAP_NVS_KEY_KEY, s_bootstrap_key, sizeof(s_bootstrap_key));
+            if (store_err == ESP_OK) store_err = nvs_commit(handle);
+        }
+        if (store_err == ESP_OK) {
+            ESP_LOGI(TAG, "Generated this board's bootstrap TLS certificate");
+        } else {
+            /* Still usable for this boot; a new one is made at the next. */
+            ESP_LOGW(TAG, "Bootstrap TLS certificate not persisted (%s); it will change at the next boot",
+                     esp_err_to_name(store_err));
+        }
+    }
+    if (have_handle) nvs_close(handle);
+    s_bootstrap_ready = true;
+    return ESP_OK;
+}
+
+esp_err_t acme_client_load_bootstrap_tls_credentials(acme_tls_credentials_t *out_credentials)
+{
+    if (out_credentials == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out_credentials, 0, sizeof(*out_credentials));
+    esp_err_t err = bootstrap_ensure();
+    if (err != ESP_OK) return err;
+    err = pem_encode_certificate(s_bootstrap_der, s_bootstrap_der_len,
+                                 &out_credentials->certificate_pem, &out_credentials->certificate_pem_length);
+    if (err == ESP_OK) {
+        err = pem_encode_ec_private_key(s_bootstrap_key, &out_credentials->private_key_pem,
+                                        &out_credentials->private_key_pem_length);
+    }
+    if (err != ESP_OK) acme_client_free_tls_credentials(out_credentials);
+    return err;
+}
+
+esp_err_t acme_client_bootstrap_certificate_sha256(char out_hex[65])
+{
+    if (out_hex == NULL) return ESP_ERR_INVALID_ARG;
+    out_hex[0] = '\0';
+    esp_err_t err = bootstrap_ensure();
+    uint8_t digest[32];
+    if (err == ESP_OK) err = sha256_bytes(s_bootstrap_der, s_bootstrap_der_len, digest);
+    if (err != ESP_OK) return err;
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0U; i < sizeof(digest); ++i) {
+        out_hex[i * 2U] = hex[digest[i] >> 4];
+        out_hex[i * 2U + 1U] = hex[digest[i] & 0x0FU];
+    }
+    out_hex[64] = '\0';
+    return ESP_OK;
+}
+
 static esp_err_t load_tls_credentials(bool production, acme_tls_credentials_t *out_credentials)
 {
     if (out_credentials == NULL) return ESP_ERR_INVALID_ARG;

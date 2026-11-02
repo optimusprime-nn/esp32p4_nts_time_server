@@ -209,10 +209,10 @@ static const char *tls_source_name(web_tls_source_t source)
     }
 }
 
-extern const unsigned char servercert_pem_start[] asm("_binary_servercert_pem_start");
-extern const unsigned char servercert_pem_end[] asm("_binary_servercert_pem_end");
-extern const unsigned char serverkey_pem_start[] asm("_binary_serverkey_pem_start");
-extern const unsigned char serverkey_pem_end[] asm("_binary_serverkey_pem_end");
+/* The bootstrap credential (WEB_TLS_EMBEDDED) is generated per board; see
+ * acme_client_load_bootstrap_tls_credentials(). It is loaded once and kept
+ * for the life of the process, because the HTTPS server references it. */
+static acme_tls_credentials_t s_bootstrap_credentials;
 
 static const char *clock_state_to_string(app_clock_state_t state)
 {
@@ -5587,10 +5587,14 @@ static esp_err_t start_https_server(web_tls_source_t source)
         config.prvtkey_pem = (const uint8_t *)candidate.private_key_pem;
         config.prvtkey_len = candidate.private_key_pem_length;
     } else {
-        config.servercert = servercert_pem_start;
-        config.servercert_len = (size_t)(servercert_pem_end - servercert_pem_start);
-        config.prvtkey_pem = serverkey_pem_start;
-        config.prvtkey_len = (size_t)(serverkey_pem_end - serverkey_pem_start);
+        if (s_bootstrap_credentials.certificate_pem == NULL) {
+            esp_err_t err = acme_client_load_bootstrap_tls_credentials(&s_bootstrap_credentials);
+            if (err != ESP_OK) return err;
+        }
+        config.servercert = (const uint8_t *)s_bootstrap_credentials.certificate_pem;
+        config.servercert_len = s_bootstrap_credentials.certificate_pem_length;
+        config.prvtkey_pem = (const uint8_t *)s_bootstrap_credentials.private_key_pem;
+        config.prvtkey_len = s_bootstrap_credentials.private_key_pem_length;
     }
 
     httpd_handle_t server = NULL;
@@ -5627,6 +5631,15 @@ static esp_err_t start_https_server(web_tls_source_t source)
     } else {
         ESP_LOGW(TAG, "UNPROVISIONED enrollment-only HTTPS active on TCP/%u; normal management handlers are disabled",
                  APP_WEB_CONSOLE_PORT);
+    }
+    if (source == WEB_TLS_EMBEDDED) {
+        char fingerprint[65];
+        if (acme_client_bootstrap_certificate_sha256(fingerprint) == ESP_OK) {
+            /* The setup tool reads this from the serial console and pins it,
+             * for enrollment and for commissioning before the board has a
+             * Let's Encrypt certificate. */
+            ESP_LOGW(TAG, "Bootstrap certificate SHA-256: %s", fingerprint);
+        }
     }
     return ESP_OK;
 }

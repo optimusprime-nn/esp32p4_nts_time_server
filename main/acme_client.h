@@ -135,6 +135,13 @@ esp_err_t acme_client_load_stored_tls_credentials(acme_tls_credentials_t *out_cr
 esp_err_t acme_client_load_production_tls_credentials(acme_tls_credentials_t *out_credentials);
 void acme_client_free_tls_credentials(acme_tls_credentials_t *credentials);
 
+/* This board's own bootstrap TLS identity (see acme_client.c), created on the
+ * board at first boot and kept in encrypted storage. Used for HTTPS until a
+ * production certificate exists. Free with acme_client_free_tls_credentials(). */
+esp_err_t acme_client_load_bootstrap_tls_credentials(acme_tls_credentials_t *out_credentials);
+/* Upper-case hex SHA-256 of the bootstrap certificate (DER): 64 chars + NUL. */
+esp_err_t acme_client_bootstrap_certificate_sha256(char out_hex[65]);
+
 /* Persisted boot TLS selection. Only production may be selected persistently. */
 esp_err_t acme_client_get_production_boot_selected(bool *out_selected);
 esp_err_t acme_client_set_production_boot_selected(bool selected);
