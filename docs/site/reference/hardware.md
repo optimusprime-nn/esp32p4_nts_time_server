@@ -6,9 +6,14 @@
 |---|---|
 | SoC | ESP32-P4, silicon revision v1.x or v3.x |
 | Memory | 16 MB flash, 32 MB PSRAM |
-| GNSS | u-blox LEA-M8T with an outdoor or clear-sky antenna |
+| GNSS | Any u-blox receiver with a timepulse (PPS) output, tested with the LEA-M8T. An outdoor or clear-sky antenna |
 | Ethernet | IP101 PHY over RMII, PHY address 1 |
 | SD | 4-bit SDMMC on GPIO39–44 (optional, for the log archive) |
+
+The firmware configures the receiver itself over UART and reads the UBX
+NAV-PVT, NAV-TIMELS and TIM-TP messages and NMEA ZDA, alongside the timepulse
+on the PPS pin. It has been tested with the LEA-M8T; a timing model (an "-T"
+part) gives the most accurate pulse.
 
 The ESP32-C6 found on some carrier boards is not used. All traffic is over
 Ethernet.
