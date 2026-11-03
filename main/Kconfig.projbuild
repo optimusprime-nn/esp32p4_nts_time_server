@@ -39,6 +39,16 @@ config APP_GNSS_UART_BAUD
     range 9600 921600
     default 115200
 
+config APP_GNSS_TEST_RECEIVER_RESET_AFTER_S
+    int "Test only: reset the GNSS receiver once after this many seconds"
+    range 0 86400
+    default 0
+    help
+        Test builds only; leave at 0 in production. When above 0, the board
+        sends the receiver UBX-CFG-RST (controlled software reset, hot start)
+        once, this many seconds after boot, to exercise receiver-reset
+        recovery without power-cycling the board.
+
 config APP_NTP_PORT
     int "NTP UDP port"
     range 1 65535
