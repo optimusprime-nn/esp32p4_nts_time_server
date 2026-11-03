@@ -19,6 +19,11 @@ themselves every few seconds; a refresh pauses while you are typing in a form.
 
 ## Dashboard (`/`)
 
+<figure markdown="span">
+  ![The Dashboard page](../assets/images/dashboard.png){ loading=lazy }
+  <figcaption>The Dashboard of a synchronized board. Names and addresses are examples.</figcaption>
+</figure>
+
 | Card | What it shows |
 |---|---|
 | Clock and Time | State, whether the clock is disciplined, current UTC, phase error, frequency correction, accepted and rejected samples, seconds in holdover |
@@ -30,6 +35,11 @@ themselves every few seconds; a refresh pauses while you are typing in a form.
 | Peer Monitoring | General peer monitor state and one box per configured peer |
 
 ## System (`/system`)
+
+<figure markdown="span">
+  ![The System page](../assets/images/system.png){ loading=lazy }
+  <figcaption>System: actions, reset history, SD card storage and the certificate.</figcaption>
+</figure>
 
 | Card | What it shows and does |
 |---|---|
@@ -60,6 +70,11 @@ The SD card is for logs only. Timing never depends on it.
 
 ## Management (`/management`)
 
+<figure markdown="span">
+  ![The Management page](../assets/images/management.png){ loading=lazy }
+  <figcaption>Management: peers, the redundant server, identity and network, backup, and hardware.</figcaption>
+</figure>
+
 | Section | What it does |
 |---|---|
 | Peer Monitoring — Configuration | Turn general peer monitoring on or off, set poll interval and timeout, and up to three peers |
@@ -84,6 +99,11 @@ Notes:
 
 ## Diagnostics (`/diagnostics`)
 
+<figure markdown="span">
+  ![The Diagnostics page](../assets/images/diagnostics.png){ loading=lazy }
+  <figcaption>Diagnostics: the GNSS receiver, timing capture, every NTP and NTS counter, and recent events.</figcaption>
+</figure>
+
 | Card | What it shows |
 |---|---|
 | GNSS Receiver — Diagnostics | Receiver model and versions, UTC source and validity, fix type, satellites used, leap-second state and offset, timing pulse state and quantization error, message and error counters, receiver configuration state |
@@ -93,6 +113,11 @@ Notes:
 | Recent Faults / State Changes | The last 20 events, with **Refresh Now**, **Download Diagnostic Bundle** and **Copy Summary** |
 
 ## Firmware (`/management/firmware`)
+
+<figure markdown="span">
+  ![The Firmware page](../assets/images/firmware.png){ loading=lazy }
+  <figcaption>Firmware: status, staging an image, activation and rollback.</figcaption>
+</figure>
 
 | Section | What it shows and does |
 |---|---|
