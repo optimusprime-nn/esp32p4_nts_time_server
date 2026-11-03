@@ -6,7 +6,7 @@
 |---|---|
 | SoC | ESP32-P4, silicon revision v1.x or v3.x |
 | Memory | 16 MB flash, 32 MB PSRAM |
-| GNSS | Any u-blox receiver with a timepulse (PPS) output, tested with the LEA-M8T. An outdoor or clear-sky antenna |
+| GNSS | A u-blox M8 receiver with a timepulse (PPS) output, tested with the LEA-M8T. An outdoor or clear-sky antenna |
 | Ethernet | IP101 PHY over RMII, PHY address 1 |
 | SD | 4-bit SDMMC on GPIO39–44 (optional, for the log archive) |
 
@@ -15,8 +15,15 @@ Ethernet.
 
 ## GNSS receiver
 
-Any u-blox receiver with a timepulse output works. It has been tested with the
+Use a u-blox M8 receiver with a timepulse output. It has been tested with the
 LEA-M8T; a timing model (a "-T" part) gives the most accurate pulse.
+
+!!! note "u-blox M10 receivers are not supported yet"
+    M10 receivers, such as the u-blox M10050 in the Beitian BE-882, are set up
+    with a newer configuration interface and refuse the commands below. On
+    this release, Diagnostics shows *UBX Config Complete* `NO` with a NAK count
+    above 0, and the clock does not synchronize. Support is planned for a later
+    release.
 
 At every boot the firmware sends the receiver `UBX-CFG-MSG` commands, and waits
 for each to be acknowledged, to output these once a second on its UART1:

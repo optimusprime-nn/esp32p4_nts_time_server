@@ -1,6 +1,6 @@
 # ESP32-P4 GNSS Stratum-1 NTP/NTS Time Server
 
-A stratum-1 network time server built on the ESP32-P4. A u-blox GNSS receiver
+A stratum-1 network time server built on the ESP32-P4. A u-blox M8 GNSS receiver
 (tested with the LEA-M8T) disciplines the clock from GNSS and its PPS output, and the Ethernet
 MAC's hardware timestamps keep the served time accurate at the wire. It serves
 plain NTP and authenticated NTS, obtains its own Let's Encrypt certificate, and
@@ -81,7 +81,7 @@ zero-change event that previously caused a 5-hour outage.
 |---|---|
 | SoC | ESP32-P4, silicon revision v1.x (360 MHz) or v3.x (400 MHz); one firmware variant for each |
 | Memory | 16 MB flash, 32 MB PSRAM |
-| GNSS | Any u-blox receiver with a timepulse (PPS) output, tested with the LEA-M8T. An outdoor or clear-sky antenna |
+| GNSS | A u-blox M8 receiver with a timepulse (PPS) output, tested with the LEA-M8T. An outdoor or clear-sky antenna |
 | Ethernet | IP101 PHY over RMII |
 | SD | 4-bit SDMMC on GPIO39–44 (optional, for the log archive) |
 
