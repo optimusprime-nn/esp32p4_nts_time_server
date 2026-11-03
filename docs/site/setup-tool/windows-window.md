@@ -12,6 +12,11 @@
     The **ESP32-P4 Time Server Setup** window opens. The steps are listed on the
     left. Progress messages appear in the log at the bottom.
 
+    <figure markdown="span">
+      ![The setup window on its Connect step](../assets/images/setup-connect.png){ loading=lazy }
+      <figcaption>The setup window. The steps are listed on the left.</figcaption>
+    </figure>
+
 3. **Connect.** Choose the board's **Serial port** from the list (the most
    likely one is first). Press **Refresh** if you plugged it in after the
    window opened. Click **Next**.
@@ -26,12 +31,20 @@
     console. A first boot can take up to 4 minutes, because the board encrypts
     its flash and restarts.
 
+    <figure markdown="span">
+      ![The Firmware step](../assets/images/setup-firmware.png){ loading=lazy }
+    </figure>
+
 5. **Certificate.** Enter a **Short name for this board** (for example `ts1`).
    The folder updates to match. Choose a **Password** of at least 8 characters,
    enter it again, and click **Next**.
 6. **Claim.** The window shows the board's address and the start of its
    fingerprint. Click **Claim**. The board restarts, and the tool reconnects
    using your new certificate.
+
+    <figure markdown="span">
+      ![The Claim step, showing the board's address and fingerprint](../assets/images/setup-claim.png){ loading=lazy }
+    </figure>
 7. **Name.** Enter the **Hostname** (`ts1`) and **Full DNS name**
    (`ts1.example.com`). Leave the two fallback NTP servers as they are unless
    you need others. Click **Next**.
@@ -44,6 +57,10 @@
 9. **DNS.** Check the **Cloudflare zone** (your domain), paste the **API
    token**, and leave **Create or update the DNS record** ticked unless you
    manage DNS yourself. Click **Next**.
+
+    <figure markdown="span">
+      ![The DNS step, with the Cloudflare zone and token](../assets/images/setup-dns.png){ loading=lazy }
+    </figure>
 10. **Let's Encrypt.** Click **Get certificate**. This usually takes 1 to 3
     minutes. The log ends with the certificate's expiry date.
 11. **Finish.** Leave **Install the administrator certificate in Windows**

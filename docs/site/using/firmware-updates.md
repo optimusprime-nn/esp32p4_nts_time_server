@@ -25,6 +25,11 @@ NTP and NTS stop for about a minute while the board reboots. With
 
 ## Update from the console
 
+<figure markdown="span">
+  ![The Firmware page](../assets/images/firmware.png){ loading=lazy }
+  <figcaption>The Firmware page, at <code>/management/firmware</code>.</figcaption>
+</figure>
+
 1. Open **OTA** (the Firmware page, `/management/firmware`).
 2. Under **Stage Firmware**, choose the `.bin` file and click
    **Upload & Validate**. Wait for *Staged successfully*.
