@@ -89,7 +89,7 @@ hide:
 <section class="start">
   <h2>Start in an afternoon</h2>
   <ol>
-    <li>Get the <a href="getting-started/what-you-need/">parts</a>: an ESP32-P4 board, a LEA-M8T receiver and an antenna with a view of the sky.</li>
+    <li>Get the <a href="getting-started/what-you-need/">parts</a>: an ESP32-P4 board, a u-blox M8 receiver such as the LEA-M8T and an antenna with a view of the sky.</li>
     <li><a href="getting-started/download/">Download</a> the release and run the setup tool.</li>
     <li>Point your computers at it and <a href="getting-started/verify/">check that it works</a>.</li>
   </ol>
