@@ -148,6 +148,13 @@ static size_t s_nmea_length;
 static int64_t s_last_utc_rx_us;
 static int64_t s_last_pvt_rx_us;
 static int64_t s_last_tim_tp_rx_us;
+/* Receiver-reset recovery. s_last_pvt_rx_us only moves with valid UTC, so
+ * it also goes stale without a fix; any NAV-PVT frame shows the receiver
+ * still has its configuration. */
+static int64_t s_last_pvt_frame_us;
+static int64_t s_last_byte_rx_us;
+static int64_t s_service_start_us;
+static int64_t s_last_reconfigure_us;
 /* Independently receiver-validated leap seconds from NAV-TIMEGPS. */
 static int64_t s_last_timegps_leap_rx_us;
 static int8_t s_timegps_leap_seconds;
@@ -485,6 +492,7 @@ static void handle_ubx_nav_pvt(const uint8_t *payload,
     portENTER_CRITICAL(&s_gnss_lock);
 
     s_status.ubx_nav_pvt_messages++;
+    s_last_pvt_frame_us = now_us;
     s_status.gnss_fix_valid = fix_valid;
     s_status.gnss_time_fully_resolved = fully_resolved;
     s_status.fix_type = fix_type;
@@ -1371,6 +1379,87 @@ static void gnss_update_staleness(void)
     }
 }
 
+/* The receiver setup lives only in the receiver's RAM. A receiver that resets
+ * on its own (its watchdog, a supply glitch, a reset from u-center) comes back
+ * without it, NAV-PVT stops, and the clock fails closed after holdover until
+ * the board reboots. Runs on the GNSS task, which owns the UART, so the
+ * command and acknowledgement exchange does not race the reader. */
+static void gnss_recover_receiver_if_reset(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_gnss_lock);
+    const int64_t last_byte_us =
+        s_last_byte_rx_us > 0 ? s_last_byte_rx_us : s_service_start_us;
+    const int64_t last_pvt_us =
+        s_last_pvt_frame_us > 0 ? s_last_pvt_frame_us : s_service_start_us;
+    const bool silent =
+        now_us - last_byte_us > (int64_t)APP_GNSS_UART_SILENT_SECONDS * 1000000LL;
+    const bool was_silent = s_status.uart_silent;
+    s_status.uart_silent = silent;
+    const bool identity_valid = s_status.receiver_identity_valid;
+    portEXIT_CRITICAL(&s_gnss_lock);
+
+    if (silent != was_silent) {
+        if (silent) {
+            ESP_LOGW(TAG, "GNSS UART silent for over %d s: check the receiver's power and wiring",
+                     APP_GNSS_UART_SILENT_SECONDS);
+        } else {
+            ESP_LOGI(TAG, "GNSS UART receiving again");
+        }
+    }
+
+    if (!APP_GNSS_CONFIGURE_UBX_ON_BOOT || silent ||
+        now_us - last_pvt_us <= (int64_t)APP_GNSS_RECONFIGURE_AFTER_SECONDS * 1000000LL ||
+        (s_last_reconfigure_us > 0 &&
+         now_us - s_last_reconfigure_us <
+             (int64_t)APP_GNSS_RECONFIGURE_INTERVAL_SECONDS * 1000000LL)) {
+        return;
+    }
+
+    s_last_reconfigure_us = now_us;
+    ESP_LOGW(TAG,
+             "No UBX-NAV-PVT for %lld s while the receiver is sending; "
+             "it has probably reset, re-sending its configuration",
+             (long long)((now_us - last_pvt_us) / 1000000LL));
+
+    gnss_configure_receiver();
+
+    portENTER_CRITICAL(&s_gnss_lock);
+    s_status.ubx_reconfigurations++;
+    s_status.last_reconfiguration_uptime_s = (uint32_t)(now_us / 1000000LL);
+    portEXIT_CRITICAL(&s_gnss_lock);
+
+    if (!identity_valid) {
+        ubx_poll_mon_ver();
+    }
+}
+
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+/* Test builds only: turn the configured messages off once, the state of a
+ * receiver that reset and lost its settings, to exercise
+ * gnss_recover_receiver_if_reset(). A real reset is not used because a
+ * receiver with saved settings keeps sending NAV-PVT through it. */
+static void gnss_test_drop_receiver_config(void)
+{
+    static bool s_done;
+
+    if (s_done ||
+        esp_timer_get_time() <
+            (int64_t)APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S * 1000000LL) {
+        return;
+    }
+
+    s_done = true;
+    ESP_LOGW(TAG, "TEST BUILD: turning the receiver's UBX and ZDA output off");
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_PVT, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_TIMEGPS, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_TIMELS, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_TIM, UBX_ID_TIM_TP, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NMEA, UBX_ID_NMEA_ZDA, 0U);
+}
+#endif
+
 static void gnss_task(void *arg)
 {
     (void)arg;
@@ -1385,8 +1474,11 @@ static void gnss_task(void *arg)
                                              pdMS_TO_TICKS(250U));
 
         if (received > 0) {
+            const int64_t now_us = esp_timer_get_time();
+
             portENTER_CRITICAL(&s_gnss_lock);
             s_status.uart_bytes_received += (uint32_t)received;
+            s_last_byte_rx_us = now_us;
             portEXIT_CRITICAL(&s_gnss_lock);
 
             for (int index = 0; index < received; ++index) {
@@ -1395,6 +1487,10 @@ static void gnss_task(void *arg)
         }
 
         gnss_update_staleness();
+        gnss_recover_receiver_if_reset();
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+        gnss_test_drop_receiver_config();
+#endif
     }
 }
 
@@ -1463,6 +1559,9 @@ esp_err_t gnss_service_init(void)
     s_last_timegps_leap_rx_us = 0;
     s_timegps_leap_seconds = 0;
     s_timegps_leap_valid = false;
+    s_last_pvt_frame_us = 0;
+    s_last_byte_rx_us = 0;
+    s_last_reconfigure_us = 0;
 
     s_ack_waiting = false;
     s_ack_expected_class = 0U;
@@ -1477,6 +1576,15 @@ esp_err_t gnss_service_init(void)
 
     /* MON-VER is a read-only poll and does not alter receiver configuration. */
     ubx_poll_mon_ver();
+
+    /* Recovery and silence are timed from here until the first byte and the
+     * first NAV-PVT frame arrive. */
+    s_service_start_us = esp_timer_get_time();
+
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+    ESP_LOGW(TAG, "TEST BUILD: the receiver's messages will be turned off %d s after boot",
+             APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S);
+#endif
 
     const BaseType_t task_created = xTaskCreate(
         gnss_task,

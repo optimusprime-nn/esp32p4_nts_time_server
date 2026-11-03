@@ -1686,7 +1686,10 @@ static esp_err_t send_status_json(httpd_req_t *request)
         "\"ubx_tim_tp_messages\":%" PRIu32 ","
         "\"valid_zda_messages\":%" PRIu32 ","
         "\"invalid_messages\":%" PRIu32 ","
-        "\"uart_bytes_received\":%" PRIu32
+        "\"uart_bytes_received\":%" PRIu32 ","
+        "\"ubx_reconfigurations\":%" PRIu32 ","
+        "\"last_reconfiguration_uptime_s\":%" PRIu32 ","
+        "\"uart_silent\":%s"
         "},"
         "\"pps\":{"
         "\"valid\":%s,"
@@ -1813,6 +1816,9 @@ static esp_err_t send_status_json(httpd_req_t *request)
         gnss_status.valid_zda_messages,
         gnss_status.invalid_messages,
         gnss_status.uart_bytes_received,
+        gnss_status.ubx_reconfigurations,
+        gnss_status.last_reconfiguration_uptime_s,
+        gnss_status.uart_silent ? "true" : "false",
 
         pps_status.interval_valid ? "true" : "false",
         pps_status.period_us,
@@ -2018,6 +2024,12 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         "# HELP esp32_ntp_gnss_satellites Satellites used.\n"
         "# TYPE esp32_ntp_gnss_satellites gauge\n"
         "esp32_ntp_gnss_satellites %u\n"
+        "# HELP esp32_ntp_gnss_receiver_reconfigurations_total Receiver setup re-sent after a receiver reset.\n"
+        "# TYPE esp32_ntp_gnss_receiver_reconfigurations_total counter\n"
+        "esp32_ntp_gnss_receiver_reconfigurations_total %" PRIu32 "\n"
+        "# HELP esp32_ntp_gnss_uart_silent No bytes from the GNSS receiver for over 10 s.\n"
+        "# TYPE esp32_ntp_gnss_uart_silent gauge\n"
+        "esp32_ntp_gnss_uart_silent %d\n"
         "# HELP esp32_ntp_pps_valid PPS validity.\n"
         "# TYPE esp32_ntp_pps_valid gauge\n"
         "esp32_ntp_pps_valid %d\n"
@@ -2094,6 +2106,8 @@ static esp_err_t send_metrics_response(httpd_req_t *request)
         clock_status.holdover_seconds,
         gnss_status.utc_valid ? 1 : 0,
         gnss_status.satellites_used,
+        gnss_status.ubx_reconfigurations,
+        gnss_status.uart_silent ? 1 : 0,
         pps_status.interval_valid ? 1 : 0,
         pps_status.jitter_us,
         eth_status.ipv4_ready ? 1 : 0,
@@ -4187,7 +4201,7 @@ static esp_err_t management_handler(httpd_req_t *request)
         "   row('Uptime',duration(d.system.uptime_seconds)),row('Last Reset',hst(d.system.boot_time_unix,d.system.boot_time_valid)),\n"
         "   row('Reset Reason',d.system.reset_reason),row('Management TLS',d.console.mode),row('Renewal Eligible Now',yesNo(sched.eligible))\n"
         "  ],'<div class=\"actions\"><button id=\"renewbtn\" onclick=\"renew()\">Renew Certificate</button><button id=\"rebootbtn\" class=\"danger\" onclick=\"reboot()\">Reboot Device</button></div><div id=\"actionmsg\" class=\"actionmsg\">Actions require this authenticated mTLS session.</div>'));\n"
-        "  const gn=d.gnss||{};const diagGnss=card('GNSS Receiver — Diagnostics',[row('Receiver Model',gn.receiver_model||'--'),row('Receiver SW',gn.receiver_software_version||'--'),row('Receiver HW',gn.receiver_hardware_version||'--'),row('Identity Valid',yesNo(!!gn.receiver_identity_valid)),row('UTC Source',gn.utc_from_ubx_pvt?'UBX-NAV-PVT':'Fallback / unavailable'),row('UTC Valid',yesNo(!!gn.utc_valid)),row('UTC Age',gn.utc_age_us>=0?gn.utc_age_us+' us':'--'),row('Fix Valid',yesNo(!!gn.fix_valid)),row('Fix Type',gn.fix_type),row('Satellites Used',gn.satellites),row('Fully Resolved',yesNo(!!gn.fully_resolved)),row('Leap State',gn.leap),row('Leap Offset',gn.current_leap_seconds+' s'),row('Timing Pulse Valid',yesNo(!!gn.timing_pulse_valid)),row('TIM-TP Age',gn.timing_pulse_age_us>=0?gn.timing_pulse_age_us+' us':'--'),row('TIM-TP qErr',gn.timing_qerr_ps+' ps'),row('UART Bytes',gn.uart_bytes_received||0),row('UBX Frames Valid',gn.ubx_frames_valid||0),row('Bad Checksums',gn.ubx_frames_invalid_checksum||0),row('Bad Lengths',gn.ubx_frames_invalid_length||0),row('Unsupported UBX',gn.ubx_frames_unsupported||0),row('NAV-PVT Messages',gn.ubx_nav_pvt_messages||0),row('NAV-TIMELS Messages',gn.ubx_nav_timels_messages||0),row('TIM-TP Messages',gn.ubx_tim_tp_messages||0),row('Valid ZDA',gn.valid_zda_messages||0),row('Invalid Messages',gn.invalid_messages||0),row('UBX Config Complete',yesNo(!!gn.ubx_configuration_complete)),row('Timepulse Config Complete',yesNo(!!gn.ubx_timepulse_configuration_complete)),row('UBX ACK / NAK',(gn.ubx_ack_count||0)+' / '+(gn.ubx_nak_count||0)),row('Config Failures',gn.ubx_configuration_failures||0)]);\n"
+        "  const gn=d.gnss||{};const diagGnss=card('GNSS Receiver — Diagnostics',[row('Receiver Model',gn.receiver_model||'--'),row('Receiver SW',gn.receiver_software_version||'--'),row('Receiver HW',gn.receiver_hardware_version||'--'),row('Identity Valid',yesNo(!!gn.receiver_identity_valid)),row('UTC Source',gn.utc_from_ubx_pvt?'UBX-NAV-PVT':'Fallback / unavailable'),row('UTC Valid',yesNo(!!gn.utc_valid)),row('UTC Age',gn.utc_age_us>=0?gn.utc_age_us+' us':'--'),row('Fix Valid',yesNo(!!gn.fix_valid)),row('Fix Type',gn.fix_type),row('Satellites Used',gn.satellites),row('Fully Resolved',yesNo(!!gn.fully_resolved)),row('Leap State',gn.leap),row('Leap Offset',gn.current_leap_seconds+' s'),row('Timing Pulse Valid',yesNo(!!gn.timing_pulse_valid)),row('TIM-TP Age',gn.timing_pulse_age_us>=0?gn.timing_pulse_age_us+' us':'--'),row('TIM-TP qErr',gn.timing_qerr_ps+' ps'),row('UART Bytes',gn.uart_bytes_received||0),row('UBX Frames Valid',gn.ubx_frames_valid||0),row('Bad Checksums',gn.ubx_frames_invalid_checksum||0),row('Bad Lengths',gn.ubx_frames_invalid_length||0),row('Unsupported UBX',gn.ubx_frames_unsupported||0),row('NAV-PVT Messages',gn.ubx_nav_pvt_messages||0),row('NAV-TIMELS Messages',gn.ubx_nav_timels_messages||0),row('TIM-TP Messages',gn.ubx_tim_tp_messages||0),row('Valid ZDA',gn.valid_zda_messages||0),row('Invalid Messages',gn.invalid_messages||0),row('UBX Config Complete',yesNo(!!gn.ubx_configuration_complete)),row('Timepulse Config Complete',yesNo(!!gn.ubx_timepulse_configuration_complete)),row('UBX ACK / NAK',(gn.ubx_ack_count||0)+' / '+(gn.ubx_nak_count||0)),row('Config Failures',gn.ubx_configuration_failures||0),row('Receiver Reconfigurations',(gn.ubx_reconfigurations||0)+(gn.last_reconfiguration_uptime_s?' (last at uptime '+gn.last_reconfiguration_uptime_s+' s)':'')),row('UART Silent',gn.uart_silent?'YES: check receiver power and wiring':'NO')]);\n"
         "  const diagTiming=card('Timing Capture — Diagnostics',[row('Clock State',d.clock.state),row('Solution Valid',yesNo(d.clock.solution_valid)),row('Phase Error',d.clock.phase_error_ns+' ns'),row('Frequency',d.clock.frequency_ppm+' ppm'),row('Accepted / Rejected',d.clock.accepted_samples+' / '+d.clock.rejected_samples),row('Holdover',d.clock.holdover_seconds+' s'),row('PPS Valid',yesNo(d.pps.valid)),row('PPS Period',d.pps.period_us+' us'),row('PPS Jitter',d.pps.jitter_us+' us'),row('PPS Age',d.pps.age_us+' us'),row('PPS Edges',d.pps.edge_count),row('PPS Queue Drops',d.pps.queue_drops)]);\n"
         "  const diagServices=card('NTP / NTS — Diagnostics',[row('NTP Requests',d.ntp.requests),row('NTP Responses',d.ntp.responses),row('Invalid NTP',d.ntp.invalid_requests),row('Unsync Drops',d.ntp.unsynchronized_drops),row('RATE KoD',d.ntp.rate_kod),row('Send Failures',d.ntp.send_failures),row('Socket Failures',d.ntp.socket_failures),row('NTS-KE Exchanges',d.nts.ke_exchanges),row('NTS-KE Failures',d.nts.ke_exchange_failures),row('NTS TLS Failures',d.nts.ke_tls_handshake_failures),row('NTS Verify Failures',d.nts.verification_failures),row('NTS Protection Failures',d.nts.protection_failures),row('NTS NAKs Sent',d.nts.naks_sent),row('Rate-Limited Drops',d.ntp.rate_limited_drops),row('HW RX Drops',d.ntp.hw_rx_drops),row('NTS-KE Deadline Expiries',d.nts.ke_deadline_expirations),row('NTS-KE Rejected (per client / busy / memory)',d.nts.ke_per_client_rejections+' / '+d.nts.ke_busy_rejections+' / '+d.nts.ke_low_memory_rejections),row('NTS-KE Active',d.nts.ke_active_connections),row('TLS Certificate Reloads',d.nts.ke_certificate_reloads),row('TX Compensation',(d.ntp.tx_compensation_ns/1000).toFixed(1)+' \\u00b5s'),row('NTS T3 Bias',(d.ntp.nts_tx_bias_ns/1000).toFixed(1)+' \\u00b5s')]);\n"
         "  const recentDiag=(ops&&ops.events?ops.events.slice(-20).reverse():[]);let recentHtml='<div class=\"peers\">';for(const e of recentDiag){recentHtml+='<div class=\"peerbox diag-event\"><div class=\"peerhead\"><span class=\"peername\">'+esc(e.type)+' #'+e.sequence+'</span><span class=\"event-time\">'+esc(e.unix_time_valid?new Date(e.unix_time*1000).toISOString():'uptime '+e.uptime_seconds+'s')+'</span></div><div class=\"event-detail\">'+esc(e.detail||'')+'</div></div>';}recentHtml+='</div><div class=\"actions\"><button onclick=\"refresh()\">Refresh Now</button><button onclick=\"downloadStorageDiagnostics()\">Download Diagnostic Bundle</button><button onclick=\"copyDiagnosticSummary()\">Copy Summary</button></div>';const diagRecent=card('Recent Faults / State Changes',[row('Events retained',ops?ops.event_count:'--'),row('Overwritten',ops?ops.overwritten_events:'--')],recentHtml);\n"

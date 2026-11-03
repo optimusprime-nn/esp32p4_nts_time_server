@@ -8,7 +8,7 @@ and membership of the `dialout` group. See
 2. **Start the tool** from a terminal in the unpacked release:
 
     ```sh
-    cd esp32p4-time-server-3.1.11/setup
+    cd esp32p4-time-server-3.1.12/setup
     ./setup.sh
     ```
 

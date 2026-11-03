@@ -68,6 +68,10 @@
 #define CONFIG_APP_GNSS_CONFIGURE_TIMEPULSE     0
 #endif
 
+#ifndef CONFIG_APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S
+#define CONFIG_APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S 0
+#endif
+
 #ifndef CONFIG_APP_GNSS_TIMEOUT_SECONDS
 #define CONFIG_APP_GNSS_TIMEOUT_SECONDS         5
 #endif
@@ -81,6 +85,7 @@
 #define APP_GNSS_CONFIGURE_UBX_ON_BOOT          CONFIG_APP_GNSS_CONFIGURE_UBX_ON_BOOT
 #define APP_GNSS_CONFIGURE_TIMEPULSE            CONFIG_APP_GNSS_CONFIGURE_TIMEPULSE
 #define APP_GNSS_TIMEOUT_SECONDS                CONFIG_APP_GNSS_TIMEOUT_SECONDS
+#define APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S CONFIG_APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S
 
 /* --------------------------------------------------------------------------
  * Clock quality and holdover
@@ -140,6 +145,12 @@
 #define APP_GNSS_UBX_MAX_PAYLOAD_LENGTH         128U
 #define APP_GNSS_TP1_FREQUENCY_HZ               1U
 #define APP_GNSS_TP1_PULSE_LENGTH_US            100000U
+/* Re-send the receiver setup when no UBX-NAV-PVT frame (valid fix or not)
+ * has arrived for this long while bytes are still arriving, at most once per
+ * interval. No bytes at all for the silent period is reported, not retried. */
+#define APP_GNSS_RECONFIGURE_AFTER_SECONDS      10
+#define APP_GNSS_RECONFIGURE_INTERVAL_SECONDS   60
+#define APP_GNSS_UART_SILENT_SECONDS            10
 
 #define APP_CLOCK_TASK_STACK_SIZE               4096U
 #define APP_CLOCK_TASK_PRIORITY                 15U

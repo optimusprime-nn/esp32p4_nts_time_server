@@ -70,6 +70,14 @@ typedef struct {
     uint32_t invalid_messages;
     uint32_t uart_bytes_received;
 
+    /* Receiver-reset recovery. The configuration above is not saved in the
+     * receiver, so a receiver that resets on its own stops sending UBX
+     * messages. The setup is re-sent when NAV-PVT stops while bytes still
+     * arrive. A silent UART (power or wiring) is reported, not retried. */
+    uint32_t ubx_reconfigurations;
+    uint32_t last_reconfiguration_uptime_s;
+    bool uart_silent;
+
     /* UBX-MON-VER receiver identity. Empty strings mean not reported yet. */
     bool receiver_identity_valid;
     char receiver_model[32];

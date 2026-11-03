@@ -32,6 +32,8 @@ more often than you need; every scrape is a TLS handshake on the board.
 | `esp32_ntp_clock_holdover_seconds` | gauge | Time in holdover, s |
 | `esp32_ntp_gnss_utc_valid` | gauge | 1 when the receiver reports valid UTC |
 | `esp32_ntp_gnss_satellites` | gauge | Satellites used |
+| `esp32_ntp_gnss_receiver_reconfigurations_total` | counter | Times the receiver setup was re-sent after the receiver reset on its own (3.1.12) |
+| `esp32_ntp_gnss_uart_silent` | gauge | 1 when no bytes have come from the receiver for over 10 s (3.1.12) |
 | `esp32_ntp_pps_valid` | gauge | 1 when the PPS interval is valid |
 | `esp32_ntp_pps_jitter_us` | gauge | PPS jitter, µs |
 

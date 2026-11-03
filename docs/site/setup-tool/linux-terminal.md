@@ -7,7 +7,7 @@ Use this on a server without a desktop, or over SSH. Needs Python 3.10 or newer,
 2. **Start the tool:**
 
     ```sh
-    cd esp32p4-time-server-3.1.11/setup
+    cd esp32p4-time-server-3.1.12/setup
     ./setup.sh --cli
     ```
 

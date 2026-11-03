@@ -106,7 +106,7 @@ Notes:
 
 | Card | What it shows |
 |---|---|
-| GNSS Receiver — Diagnostics | Receiver model and versions, UTC source and validity, fix type, satellites used, leap-second state and offset, timing pulse state and quantization error, message and error counters, receiver configuration state |
+| GNSS Receiver — Diagnostics | Receiver model and versions, UTC source and validity, fix type, satellites used, leap-second state and offset, timing pulse state and quantization error, message and error counters, receiver configuration state, *Receiver Reconfigurations* (setup re-sent after the receiver reset on its own) and *UART Silent* (no bytes from the receiver: power or wiring) |
 | Timing Capture — Diagnostics | Clock state, phase error, frequency, sample counts, holdover, PPS validity, period, jitter, age, edges, drops |
 | NTP / NTS — Diagnostics | All NTP and NTS counters, including rate-limit and hardware receive drops, NTS-KE rejections by reason, active key-exchange connections, certificate reloads, learned transmit compensation and NTS transmit bias |
 | Redundant Time Server — Diagnostics | The redundant peer, with delay, jitter, reference ID and poll counts |
