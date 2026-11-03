@@ -8,6 +8,7 @@
 | Claim returns 403 or 429 | Wrong code, or locked after five wrong codes. Reboot the board and use the new code |
 | Console will not connect | Certificate not imported, or the wrong one chosen. Close the browser completely and try again; browsers remember a "no certificate" choice |
 | Browser warns the certificate is not trusted | Normal until the Let's Encrypt certificate is issued, and when you connect by IP address. Connect by DNS name after setup |
+| Diagnostics shows *UBX Config Complete* `NO` | The receiver is not at 115200 baud. Set it in u-center and save; see [GNSS receiver](../reference/hardware.md#gnss-receiver) |
 | Clock stays `ACQUIRING` | Check the antenna, the PPS wire and the GNSS fix on **Diagnostics → GNSS Receiver — Diagnostics**. Allow 12.5 minutes after a cold start |
 | Stratum 16 | Clock not synchronized. This is correct behaviour, not a fault |
 | Certificate request fails | Check **Save/Test Cloudflare**, the token's permissions (Zone:Read, DNS:Edit), that the board has internet access, and that management time is valid (**Sync Management Time**) |

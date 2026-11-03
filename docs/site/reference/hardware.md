@@ -10,13 +10,38 @@
 | Ethernet | IP101 PHY over RMII, PHY address 1 |
 | SD | 4-bit SDMMC on GPIO39–44 (optional, for the log archive) |
 
-The firmware configures the receiver itself over UART and reads the UBX
-NAV-PVT, NAV-TIMELS and TIM-TP messages and NMEA ZDA, alongside the timepulse
-on the PPS pin. It has been tested with the LEA-M8T; a timing model (an "-T"
-part) gives the most accurate pulse.
-
 The ESP32-C6 found on some carrier boards is not used. All traffic is over
 Ethernet.
+
+## GNSS receiver
+
+Any u-blox receiver with a timepulse output works. It has been tested with the
+LEA-M8T; a timing model (a "-T" part) gives the most accurate pulse.
+
+At every boot the firmware sends the receiver `UBX-CFG-MSG` commands, and waits
+for each to be acknowledged, to output these once a second on its UART1:
+
+- UBX NAV-PVT, NAV-TIMEGPS, NAV-TIMELS and TIM-TP;
+- NMEA ZDA.
+
+These settings are not saved in the receiver, so they are sent again at each
+boot. The timepulse is left as the receiver is set: the default 1 pulse per
+second, rising edge on the second, is what the firmware expects.
+
+!!! warning "Set the receiver's baud rate first"
+    The firmware talks to the receiver at **115200 baud** and does not change the
+    receiver's baud rate. u-blox receivers start at 9600 baud, so before first
+    use, connect the receiver to a computer and in u-blox u-center:
+
+    1. In **View → Configuration View → PRT (Ports)**, choose **UART1**, set
+       **Baudrate** to `115200`, leave **Protocol in** and **Protocol out** as
+       **UBX+NMEA**, and click **Send**.
+    2. Reconnect u-center at 115200 baud.
+    3. In **CFG (Configuration)**, choose **Save current configuration** (with the
+       BBR and Flash devices selected) and click **Send**.
+
+    If the rate does not match, **Diagnostics → GNSS Receiver** shows
+    *UBX Config Complete* `NO` and *UBX Frames Valid* stays at 0.
 
 ## Silicon variants
 

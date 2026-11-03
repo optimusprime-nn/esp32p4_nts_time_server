@@ -8,7 +8,7 @@ build from source.
 | Item | Notes |
 |---|---|
 | ESP32-P4 board | Silicon revision v1.x or v3.x, 16 MB flash, 32 MB PSRAM, IP101 Ethernet PHY. See [Hardware and pins](../reference/hardware.md) |
-| u-blox GNSS receiver | Any u-blox receiver with a timepulse (PPS) output; tested with the LEA-M8T. Wired to the board as in [Hardware and pins](../reference/hardware.md) |
+| u-blox GNSS receiver | Any u-blox receiver with a timepulse (PPS) output; tested with the LEA-M8T. Set its UART1 to 115200 baud in u-center first (it starts at 9600), as in [GNSS receiver](../reference/hardware.md#gnss-receiver). Wired to the board as in [Hardware and pins](../reference/hardware.md) |
 | GNSS antenna | Outdoor, or with a clear view of the sky |
 | Ethernet connection | With DHCP and internet access |
 | USB cable | To the board's serial port, for the first setup |
