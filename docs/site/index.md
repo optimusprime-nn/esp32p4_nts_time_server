@@ -16,7 +16,7 @@ hide:
     <a class="md-button md-button--primary" href="https://github.com/optimusprime-nn/esp32p4_nts_time_server/releases/latest">Download</a>
     <a class="md-button" href="getting-started/what-you-need/">Get started</a>
   </p>
-  <p class="note">Release 3.1.11 · Setup tool for Windows and Linux · ESP32-P4 silicon v1.x and v3.x</p>
+  <p class="note">Release 3.1.12 · Setup tool for Windows and Linux · ESP32-P4 silicon v1.x and v3.x</p>
   <img src="assets/images/hero.png" width="1440" height="900" alt="The web console's dashboard, showing a synchronized clock, PPS capture, NTP and NTS counters and peer monitoring">
 </section>
 
@@ -101,7 +101,7 @@ hide:
 ## Measured performance
 
 From a 91-hour soak of two boards on 3.1.8, with no reboots. Later releases up to
-3.1.11 do not change timing code.
+3.1.12 do not change the clock discipline code.
 
 | Measure | Result |
 |---|---|

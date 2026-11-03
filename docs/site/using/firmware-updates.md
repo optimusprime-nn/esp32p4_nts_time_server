@@ -73,7 +73,7 @@ Firmware older than 3.1.4 has no rollback button.
     ```powershell
     .\tools\ota-update.ps1 -HostName ts1.example.com `
         -CertificateThumbprint <thumbprint> `
-        -FirmwareBin .\esp32p4_nts_time_server-3.1.11-silicon-v1.bin
+        -FirmwareBin .\esp32p4_nts_time_server-3.1.12-silicon-v1.bin
     ```
 
     It uploads and stages the image and prints the command that activates it.
@@ -86,7 +86,7 @@ Firmware older than 3.1.4 has no rollback button.
     C="--cert admin-client.crt.pem --key admin-client.key.pem --pass $KEYPASS"
 
     curl -sS $C -X POST -H 'Content-Type: application/octet-stream' \
-         --data-binary @esp32p4_nts_time_server-3.1.11-silicon-v1.bin $B/api/v1/ota/image
+         --data-binary @esp32p4_nts_time_server-3.1.12-silicon-v1.bin $B/api/v1/ota/image
     curl -sS $C -X POST $B/api/v1/system/reboot
     curl -sS $C $B/api/v1/ota/status
     ```

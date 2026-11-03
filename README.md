@@ -6,7 +6,7 @@ MAC's hardware timestamps keep the served time accurate at the wire. It serves
 plain NTP and authenticated NTS, obtains its own Let's Encrypt certificate, and
 is managed over mutual-TLS HTTPS.
 
-**Current release: 3.1.11.** This is the final planned release of this line;
+**Current release: 3.1.12.** This is the final planned release of this line;
 further changes are bug fixes only.
 
 **Documentation: <https://optimusprime-nn.github.io/esp32p4_nts_time_server/>**

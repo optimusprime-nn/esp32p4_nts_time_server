@@ -1,6 +1,6 @@
 # Security model
 
-This page describes what protects the board in release 3.1.11, and what does
+This page describes what protects the board in release 3.1.12, and what does
 not.
 
 ## Ownership and management access

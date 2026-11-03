@@ -2,6 +2,24 @@
 
 The 3.1 line receives bug fixes only.
 
+## 3.1.12
+
+- **Recovery when the GNSS receiver resets on its own.** The board's receiver
+  setup is not saved in the receiver, so after a receiver-only reset (its
+  watchdog, a supply glitch, a reset from u-center) the UBX messages stopped,
+  and the clock failed closed after 5 minutes of holdover until the board was
+  rebooted. The board now notices NAV-PVT stopping while the receiver is still
+  sending, and re-sends the setup within about 10 s (at most once a minute),
+  well inside holdover.
+- **A silent receiver UART is reported.** No bytes for more than 10 s means a
+  power or wiring problem; it is shown on Diagnostics and logged, not retried.
+- New fields in the `gnss` section of `GET /api/v1/status`:
+  `ubx_reconfigurations`, `last_reconfiguration_uptime_s` and `uart_silent`.
+  New metrics: `esp32_ntp_gnss_receiver_reconfigurations_total` and
+  `esp32_ntp_gnss_uart_silent`. Nothing is removed or renamed.
+- Diagnostics, **GNSS Receiver**: new *Receiver Reconfigurations* and *UART
+  Silent* rows.
+
 ## 3.1.11
 
 - Each board now creates its own bootstrap TLS key and self-signed certificate

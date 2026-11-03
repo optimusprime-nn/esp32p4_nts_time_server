@@ -16,7 +16,7 @@ Each release has these files:
 === "Windows (PowerShell)"
 
     ```powershell
-    Get-FileHash .\esp32p4-time-server-3.1.11.zip -Algorithm SHA256
+    Get-FileHash .\esp32p4-time-server-3.1.12.zip -Algorithm SHA256
     ```
 
 === "Linux"
@@ -33,7 +33,7 @@ Extract the zip anywhere you can write to, for example your Documents folder. It
 contains:
 
 ```text
-esp32p4-time-server-3.1.11/
+esp32p4-time-server-3.1.12/
   README.txt
   firmware/
     silicon-v1/      images for chip revisions v1.x: four .bin files,
