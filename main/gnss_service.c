@@ -53,7 +53,6 @@ static const char *TAG = "GNSS";
 
 #define UBX_ID_CFG_MSG                          0x01U
 #define UBX_ID_CFG_TP5                          0x31U
-#define UBX_ID_CFG_RST                          0x04U
 
 #define UBX_ID_NMEA_ZDA                         0x08U
 
@@ -1436,25 +1435,28 @@ static void gnss_recover_receiver_if_reset(void)
     }
 }
 
-#if APP_GNSS_TEST_RECEIVER_RESET_AFTER_S > 0
-/* Test builds only: reset the receiver once, without power-cycling the board,
- * to exercise gnss_recover_receiver_if_reset(). UBX-CFG-RST is not
- * acknowledged. */
-static void gnss_test_receiver_reset(void)
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+/* Test builds only: turn the configured messages off once, the state of a
+ * receiver that reset and lost its settings, to exercise
+ * gnss_recover_receiver_if_reset(). A real reset is not used because a
+ * receiver with saved settings keeps sending NAV-PVT through it. */
+static void gnss_test_drop_receiver_config(void)
 {
     static bool s_done;
 
     if (s_done ||
         esp_timer_get_time() <
-            (int64_t)APP_GNSS_TEST_RECEIVER_RESET_AFTER_S * 1000000LL) {
+            (int64_t)APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S * 1000000LL) {
         return;
     }
 
     s_done = true;
-    /* navBbrMask 0 (hot start), resetMode 0x01 (controlled software reset). */
-    const uint8_t payload[4] = {0x00U, 0x00U, 0x01U, 0x00U};
-    ESP_LOGW(TAG, "TEST BUILD: resetting the GNSS receiver (UBX-CFG-RST)");
-    (void)ubx_write_frame(UBX_CLASS_CFG, UBX_ID_CFG_RST, payload, sizeof(payload));
+    ESP_LOGW(TAG, "TEST BUILD: turning the receiver's UBX and ZDA output off");
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_PVT, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_TIMEGPS, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NAV, UBX_ID_NAV_TIMELS, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_TIM, UBX_ID_TIM_TP, 0U);
+    (void)ubx_configure_message_rate(UBX_CLASS_NMEA, UBX_ID_NMEA_ZDA, 0U);
 }
 #endif
 
@@ -1486,8 +1488,8 @@ static void gnss_task(void *arg)
 
         gnss_update_staleness();
         gnss_recover_receiver_if_reset();
-#if APP_GNSS_TEST_RECEIVER_RESET_AFTER_S > 0
-        gnss_test_receiver_reset();
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+        gnss_test_drop_receiver_config();
 #endif
     }
 }
@@ -1579,9 +1581,9 @@ esp_err_t gnss_service_init(void)
      * first NAV-PVT frame arrive. */
     s_service_start_us = esp_timer_get_time();
 
-#if APP_GNSS_TEST_RECEIVER_RESET_AFTER_S > 0
-    ESP_LOGW(TAG, "TEST BUILD: the GNSS receiver will be reset %d s after boot",
-             APP_GNSS_TEST_RECEIVER_RESET_AFTER_S);
+#if APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S > 0
+    ESP_LOGW(TAG, "TEST BUILD: the receiver's messages will be turned off %d s after boot",
+             APP_GNSS_TEST_DROP_RECEIVER_CONFIG_AFTER_S);
 #endif
 
     const BaseType_t task_created = xTaskCreate(
