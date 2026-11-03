@@ -43,6 +43,8 @@ jobs:
             sdkconfig
           if-no-files-found: error
 
-  # Public firmware releases are disabled: the image embeds the console's TLS key and
-  # management CA, which must not come from CI or be published. Build files from CI runs
-  # are kept as run artifacts (built with throwaway certs) for verification only.
+  # CI verifies the build only; it does not publish firmware. Releases are packaged with
+  # tools/release/make_release.py from tested local builds (both silicon variants) and
+  # attached to the GitHub release by hand. Since 3.1.11 the image embeds no TLS key or
+  # management CA (each board creates its bootstrap key at first boot), so the throwaway
+  # files generated above are no longer used by the build.
