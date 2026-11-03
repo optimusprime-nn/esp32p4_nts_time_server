@@ -82,8 +82,8 @@ def main(out: Path, builds: list[Path]) -> None:
         for entry, dest in IMAGES.items():
             shutil.copy2(build / entry, fw / dest)
         args = (build / "flash_args").read_text().split()
-        (fw / "flash_args").write_text(" ".join(IMAGES.get(a, a) for a in args) + "\n")
-        (fw / "variant.json").write_text(json.dumps(v, indent=2) + "\n")
+        (fw / "flash_args").write_text(" ".join(IMAGES.get(a, a) for a in args) + "\n", newline="\n")
+        (fw / "variant.json").write_text(json.dumps(v, indent=2) + "\n", newline="\n")
         ota = out / f"esp32p4_nts_time_server-{version}-{v['name']}.bin"
         shutil.copy2(build / "esp32p4_nts_time_server.bin", ota)
         otas.append((ota, v))
@@ -106,7 +106,7 @@ def main(out: Path, builds: list[Path]) -> None:
                      f" to v{v['max_rev'] // 100}.{v['max_rev'] % 100:02d}, {v['cpu_mhz']} MHz"
                      + (" (preview: not yet tested on this silicon)" if v.get("preview") else ""))
     lines += ["", "Documentation: https://optimusprime-nn.github.io/esp32p4_nts_time_server/", ""]
-    (stage / "README.txt").write_text("\n".join(lines))
+    (stage / "README.txt").write_text("\n".join(lines), newline="\n")
 
     zip_path = out / f"{name}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -123,7 +123,8 @@ def main(out: Path, builds: list[Path]) -> None:
     shutil.rmtree(stage)
 
     files = [zip_path] + [o for o, _ in otas]
-    (out / "SHA256SUMS.txt").write_text("".join(f"{sha256(p)}  {p.name}\n" for p in files))
+    # LF on every OS: with CRLF, `sha256sum -c` on Linux cannot find the files.
+    (out / "SHA256SUMS.txt").write_text("".join(f"{sha256(p)}  {p.name}\n" for p in files), newline="\n")
     print(f"Release {version} written to {out}")
     for p in files:
         print(f"  {p.name}  {p.stat().st_size} bytes  sha256 {sha256(p)}")
